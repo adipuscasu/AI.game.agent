@@ -34,6 +34,16 @@ dev = [
     "ruff>=0.4",
     "Pillow>=10.0",
 ]
+# Phase 2 perception. ``vision`` backs template matching / blob detection
+# (OpenCV + numpy). ``ocr`` wraps the Tesseract binary. Both are optional: the
+# core package and its contract tests import and run with neither installed.
+vision = [
+    "opencv-python-headless>=4.9",
+    "numpy>=1.26",
+]
+ocr = [
+    "pytesseract>=0.3.10",
+]
 
 [project.scripts]
 ai-game-agent = "ai_game_agent.__main__:main"

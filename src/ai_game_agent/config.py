@@ -123,6 +123,101 @@ class _LoggingConfig(BaseModel):
         return value.upper()
 
 
+_VALID_UI_CHECKS = frozenset({"presence", "brightness", "color_present"})
+
+
+class _UiZoneConfig(BaseModel):
+    """A configured UI region to inspect (Phase 2).
+
+    ``check`` is a small closed set of deterministic heuristics (presence,
+    brightness, color_present). Unknown values must fail at load, not silently
+    disable the zone.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    check: str
+
+    @field_validator("check")
+    @classmethod
+    def _check_is_known(cls, value: str) -> str:
+        if value not in _VALID_UI_CHECKS:
+            allowed = ", ".join(sorted(_VALID_UI_CHECKS))
+            raise ValueError(f"invalid ui zone check {value!r}; expected one of: {allowed}")
+        return value
+
+
+class _OcrRegionConfig(BaseModel):
+    """A configured text region to OCR (Phase 2)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    name: str
+
+
+class _OcrConfig(BaseModel):
+    """OCR settings (Phase 2). Default off: needs the ``ocr`` extra + binary."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = False
+    engine: str = "pytesseract"
+    regions: tuple[_OcrRegionConfig, ...] = ()
+
+
+class _ObjectColorConfig(BaseModel):
+    """A reference color for blob detection (Phase 2)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    rgb: tuple[int, int, int]
+    tolerance: int = Field(default=40, ge=0)
+
+    @field_validator("rgb")
+    @classmethod
+    def _check_rgb_range(cls, value: tuple[int, int, int]) -> tuple[int, int, int]:
+        if any(not 0 <= c <= 255 for c in value):
+            raise ValueError(f"rgb channels must be in [0, 255], got {value!r}")
+        return value
+
+
+class _ObjectConfig(BaseModel):
+    """Basic object-detection settings (Phase 2). Default off."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = False
+    colors: tuple[_ObjectColorConfig, ...] = ()
+
+
+class _PerceptionConfig(BaseModel):
+    """Perception settings (Phase 2).
+
+    ``enabled`` defaults to true — the CLI ``--no-*`` flags are opt-outs — but
+    with no templates, no zones, and ocr/objects off, the shipped default has
+    the net effect of an empty observation (Phase 1 behavior preserved).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = True
+    template_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
+    templates: dict[str, str] = {}
+    ui_zones: tuple[_UiZoneConfig, ...] = ()
+    ocr: _OcrConfig = Field(default_factory=_OcrConfig)
+    objects: _ObjectConfig = Field(default_factory=_ObjectConfig)
+
+
 class _Config(BaseModel):
     """Top-level configuration object for the agent."""
 
@@ -132,6 +227,7 @@ class _Config(BaseModel):
     capture: _CaptureConfig = Field(default_factory=_CaptureConfig)
     safety: _SafetyConfig = Field(default_factory=_SafetyConfig)
     logging: _LoggingConfig = Field(default_factory=_LoggingConfig)
+    perception: _PerceptionConfig = Field(default_factory=_PerceptionConfig)
 
 
 class Region:
@@ -165,6 +261,53 @@ class Region:
 
     def __hash__(self) -> int:
         return hash((self.x, self.y, self.width, self.height))
+
+
+class UiZone:
+    """A configured UI region to inspect (Phase 2).
+
+    Immutable public view over the validated ``_UiZoneConfig``. ``check`` is
+    one of the closed set (presence, brightness, color_present).
+    """
+
+    __slots__ = ("name", "x", "y", "width", "height", "check")
+
+    def __init__(
+        self, name: str, x: int, y: int, width: int, height: int, check: str
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("ui zone width and height must be positive")
+        if check not in _VALID_UI_CHECKS:
+            allowed = ", ".join(sorted(_VALID_UI_CHECKS))
+            raise ValueError(f"invalid ui zone check {check!r}; expected one of: {allowed}")
+        # object.__setattr__ bypasses the immutability guard below (same
+        # pattern as _FrozenConfig); post-construction writes raise AttributeError.
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "x", x)
+        object.__setattr__(self, "y", y)
+        object.__setattr__(self, "width", width)
+        object.__setattr__(self, "height", height)
+        object.__setattr__(self, "check", check)
+
+    def __setattr__(self, name: str, value: object) -> None:  # pragma: no cover
+        raise AttributeError("UiZone is immutable")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"UiZone(name={self.name!r}, x={self.x}, y={self.y}, "
+            f"width={self.width}, height={self.height}, check={self.check!r})"
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, UiZone):
+            return NotImplemented
+        return (
+            (self.name, self.x, self.y, self.width, self.height, self.check)
+            == (other.name, other.x, other.y, other.width, other.height, other.check)
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.name, self.x, self.y, self.width, self.height, self.check))
 
 
 class _FrozenConfig:
@@ -325,10 +468,108 @@ class LoggingConfig(_FrozenConfig):
         return self._m.directory
 
 
+class PerceptionConfig(_FrozenConfig):
+    """Perception settings (Phase 2)."""
+
+    __slots__ = ()
+
+    def __init__(
+        self,
+        enabled: bool = True,
+        template_threshold: float = 0.8,
+        templates: dict[str, str] | None = None,
+        ui_zones: tuple[UiZone, ...] = (),
+        ocr_enabled: bool = False,
+        ocr_regions: tuple[dict[str, object], ...] = (),
+        objects_enabled: bool = False,
+        object_colors: tuple[dict[str, object], ...] = (),
+    ) -> None:
+        ui_zone_models = tuple(
+            _UiZoneConfig(
+                name=z.name, x=z.x, y=z.y, width=z.width, height=z.height, check=z.check
+            )
+            for z in ui_zones
+        )
+        ocr_regions_models = tuple(
+            _OcrRegionConfig(
+                x=int(r["x"]), y=int(r["y"]), width=int(r["width"]),
+                height=int(r["height"]), name=str(r.get("name", "")),
+            )
+            for r in ocr_regions
+        )
+        object_color_models = tuple(
+            _ObjectColorConfig(
+                name=str(c["name"]),
+                rgb=(int(c["rgb"][0]), int(c["rgb"][1]), int(c["rgb"][2])),
+                tolerance=int(c.get("tolerance", 40)),
+            )
+            for c in object_colors
+        )
+        super().__init__(
+            _PerceptionConfig(
+                enabled=enabled,
+                template_threshold=template_threshold,
+                templates=dict(templates or {}),
+                ui_zones=ui_zone_models,
+                ocr=_OcrConfig(
+                    enabled=ocr_enabled,
+                    regions=ocr_regions_models,
+                ),
+                objects=_ObjectConfig(
+                    enabled=objects_enabled,
+                    colors=object_color_models,
+                ),
+            )
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self._m.enabled
+
+    @property
+    def template_threshold(self) -> float:
+        return self._m.template_threshold
+
+    @property
+    def templates(self) -> dict[str, str]:
+        return dict(self._m.templates)
+
+    @property
+    def ui_zones(self) -> tuple[UiZone, ...]:
+        return tuple(
+            UiZone(
+                z.name, z.x, z.y, z.width, z.height, z.check
+            )
+            for z in self._m.ui_zones
+        )
+
+    @property
+    def ocr_enabled(self) -> bool:
+        return self._m.ocr.enabled
+
+    @property
+    def ocr_regions(self) -> list[dict[str, object]]:
+        """Configured OCR regions as JSON-shaped dicts (lists, not tuples)."""
+        return [r.model_dump(mode="json") for r in self._m.ocr.regions]
+
+    @property
+    def ocr_engine(self) -> str:
+        return self._m.ocr.engine
+
+    @property
+    def objects_enabled(self) -> bool:
+        return self._m.objects.enabled
+
+    @property
+    def object_colors(self) -> list[dict[str, object]]:
+        """Configured object-detection colors as JSON-shaped dicts."""
+        return [c.model_dump(mode="json") for c in self._m.objects.colors]
+
+
 class Config:
     """Top-level configuration object for the agent."""
 
-    __slots__ = ("ai", "capture", "safety", "logging")
+    __slots__ = ("ai", "capture", "safety", "logging", "perception")
 
     def __init__(
         self,
@@ -336,16 +577,19 @@ class Config:
         capture: CaptureConfig | None = None,
         safety: SafetyConfig | None = None,
         logging: LoggingConfig | None = None,
+        perception: PerceptionConfig | None = None,
     ) -> None:
         self.ai = ai if ai is not None else AIConfig()
         self.capture = capture if capture is not None else CaptureConfig()
         self.safety = safety if safety is not None else SafetyConfig()
         self.logging = logging if logging is not None else LoggingConfig()
+        self.perception = perception if perception is not None else PerceptionConfig()
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
             f"Config(ai={self.ai!r}, capture={self.capture!r}, "
-            f"safety={self.safety!r}, logging={self.logging!r})"
+            f"safety={self.safety!r}, logging={self.logging!r}, "
+            f"perception={self.perception!r})"
         )
 
 
@@ -374,6 +618,19 @@ def _config_from_model(model: _Config) -> Config:
             model.safety.max_consecutive_actions,
         ),
         logging=LoggingConfig(model.logging.level, model.logging.directory),
+        perception=PerceptionConfig(
+            enabled=model.perception.enabled,
+            template_threshold=model.perception.template_threshold,
+            templates=dict(model.perception.templates),
+            ui_zones=tuple(
+                UiZone(z.name, z.x, z.y, z.width, z.height, z.check)
+                for z in model.perception.ui_zones
+            ),
+            ocr_enabled=model.perception.ocr.enabled,
+            ocr_regions=tuple(r.model_dump() for r in model.perception.ocr.regions),
+            objects_enabled=model.perception.objects.enabled,
+            object_colors=tuple(c.model_dump() for c in model.perception.objects.colors),
+        ),
     )
 
 
