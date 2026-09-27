@@ -147,6 +147,18 @@ uv run pytest -v --tb=short
 uv run pytest -x
 ```
 
+### End-to-end tests
+
+```powershell
+uv run pytest -m e2e       # only E2E
+uv run pytest -m "not e2e" # unit + integration only
+```
+
+The E2E suite (`tests/e2e/`) spawns the real CLI (`python -m ai_game_agent`) as
+a subprocess and asserts on exit codes, stdout/stderr routing, and files on
+disk — the observable contract a user or CI job experiences. It is headless
+(`--backend mock --fps 0`), so it runs in CI without a desktop session.
+
 Notes:
 
 * Tests are deterministic and headless — they use the `mock` capture backend and injected clocks, so they run in CI without a display, a game, or Ollama.

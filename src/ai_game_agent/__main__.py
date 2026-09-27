@@ -121,7 +121,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):
-        parser.print_help()
+        # No subcommand: usage goes to stderr (argparse convention), exit 2.
+        parser.print_help(sys.stderr)
         return 2
     try:
         return int(args.func(args))

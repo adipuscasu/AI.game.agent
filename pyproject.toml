@@ -49,6 +49,9 @@ packages = ["src/ai_game_agent"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-ra"
+markers = [
+    "e2e: end-to-end CLI tests that spawn the real entry point as a subprocess",
+]
 
 [tool.ruff]
 line-length = 100
