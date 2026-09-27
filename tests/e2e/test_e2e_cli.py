@@ -106,6 +106,23 @@ def test_observe_record_rotation(tmp_path: Path) -> None:
 
 
 @pytest.mark.e2e
+def test_capture_logs_to_stderr_not_stdout(tmp_path: Path) -> None:
+    """Contract: stdout carries only ``saved: ...``; log lines never reach stdout."""
+    out = tmp_path / "shots"
+    result = run_cli("capture", "--backend", "mock", "--out", str(out))
+    assert result.returncode == 0, result.stderr
+    assert "capture: saved frame" not in result.stdout
+
+
+@pytest.mark.e2e
+def test_observe_logs_to_stderr_not_stdout() -> None:
+    """Contract: stdout is only ``frames=N fps=...``; log lines never reach stdout."""
+    result = run_cli("observe", "--backend", "mock", "--frames", "3", "--fps", "0")
+    assert result.returncode == 0, result.stderr
+    assert "observe: frames=" not in result.stdout
+
+
+@pytest.mark.e2e
 def test_invalid_region_reports_error(tmp_path: Path) -> None:
     out = tmp_path / "shots"
     result = run_cli("capture", "--backend", "mock", "--region", "1,2,3", "--out", str(out))

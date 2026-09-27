@@ -100,6 +100,50 @@ def test_frame_region_out_of_bounds_raises():
         frame.region(3, 0, 3, 2)  # x + width > frame width
 
 
+def test_frame_region_rejects_non_positive_dimensions():
+    # M5: zero/negative width or height must be rejected up front instead of
+    # producing an empty (or garbage) frame.
+    frame = make_frame(width=4, height=2)
+    with pytest.raises(CaptureError):
+        frame.region(0, 0, 0, 2)
+    with pytest.raises(CaptureError):
+        frame.region(0, 0, 2, 0)
+    with pytest.raises(CaptureError):
+        frame.region(0, 0, -1, 2)
+    with pytest.raises(CaptureError):
+        frame.region(0, 0, 2, -1)
+
+
+def test_capture_owns_recording_when_enabled(tmp_path):
+    # M2: when the config enables recording, the Capture facade must write
+    # frames to the configured directory as a side effect of grab() — the
+    # record_* config fields should be live, not dead.
+    cfg = CaptureConfig(
+        backend="mock",
+        record_enabled=True,
+        record_directory=str(tmp_path),
+        record_max_files=10,
+    )
+    with Capture(cfg, backend=MockBackend(width=4, height=2)) as cap:
+        for _ in range(3):
+            cap.grab()
+    pngs = list(tmp_path.glob("*.png"))
+    assert len(pngs) == 3
+
+
+def test_capture_recording_disabled_writes_nothing(tmp_path):
+    # OBSERVE/default-off behavior: with record_enabled False, grab() must not
+    # create any files in the configured record directory.
+    cfg = CaptureConfig(
+        backend="mock",
+        record_enabled=False,
+        record_directory=str(tmp_path),
+    )
+    with Capture(cfg, backend=MockBackend(width=4, height=2)) as cap:
+        cap.grab()
+    assert list(tmp_path.glob("*.png")) == []
+
+
 def _gradient_frame(width: int, height: int) -> Frame:
     """A 4x2 frame where every pixel is a unique, easily identifiable color.
 

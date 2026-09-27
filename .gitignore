@@ -18,6 +18,8 @@ venv/
 
 # Agent runtime artifacts (never commit)
 recordings/
+screenshots/
+shots/
 logs/
 *.sqlite3
 

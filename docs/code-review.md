@@ -1,142 +1,192 @@
-# Code Review — Phase 1 (Screen Observation)
+# Code Review — `ai-game-agent` (Phase 1: Screen Observation)
 
-**Date:** 2026-09-27
-**Scope:** Uncommitted changes implementing Phase 1 of the high-level development plan:
-`README.md`, `pyproject.toml`, `uv.lock`, `src/ai_game_agent/capture.py`,
-`src/ai_game_agent/__main__.py`, and the new test files
-(`test_mss_backend.py`, `test_recorder.py`, `test_fps_meter.py`, `test_save_frame.py`, `test_cli.py`).
+Scope: `src/ai_game_agent/` (`capture.py`, `config.py`, `__main__.py`) and `tests/`.
+Every finding below was verified against the current tree on **Windows / PowerShell**
+with `uv` (Python 3.11+). Line numbers reference the state of the tree at review time.
 
-**Verdict:** Solid, well-structured implementation. Tests are headless and deterministic,
-the backend abstraction is clean, and the layering respects `AGENTS.md`. There is
-**one real bug** (a documented CLI feature that crashes at runtime) and a handful of
-minor issues.
+## How to reproduce the verification
 
----
-
-## 🔴 Bug
-
-### 1. `--region` CLI option crashes at runtime (documented in README)
-
-`README.md` and the `__main__.py` docstring both advertise:
+Original state at review time:
 
 ```powershell
-ai-game-agent capture --backend mss --region 0,0,1920,1080
+uv run ruff check src tests     # -> 5 errors, all in tests/test_recorder.py
+uv run pytest -q                # -> 1 failed, 75 passed, 1 skipped
 ```
 
-But `_build_capture()` passes the raw string straight into the config:
+Current state (after the fixes in this review were addressed):
 
-```python
-cfg = CaptureConfig(
-    backend=args.backend,
-    region=args.region,   # <- a string like "0,0,1920,1080"
-    ...
-)
+```powershell
+uv run ruff check src tests     # -> All checks passed!
+uv run pytest -q                # -> 77 passed, 1 skipped
 ```
 
-In `config.py`, the `_coerce_region` validator only handles `None`, a `_Region`
-instance, a dict, and objects with `.x/.width` attributes. A **string matches none
-of these**, so it is returned as-is and pydantic v2 (which does not perform
-string→model coercion) raises a `ValidationError`. There is no test covering
-`--region`, so this gap went uncaught.
-
-**Fix:** parse `"x,y,w,h"` into a `Region` in `_build_capture()` (or add a string
-branch to `_coerce_region`), and add a regression test:
-
-```python
-def _parse_region(value: str | None) -> Region | None:
-    if value is None:
-        return None
-    x, y, w, h = (int(v) for v in value.split(","))
-    return Region(x, y, w, h)
-```
-
-**Test to add (red first):**
-
-```python
-def test_cli_capture_with_region(tmp_path):
-    out = tmp_path / "shots"
-    rc = main(["capture", "--backend", "mock", "--region", "10,20,32,16", "--out", str(out)])
-    assert rc == 0
-    from PIL import Image
-    assert Image.open(next(out.glob("*.png"))).size == (32, 16)
-```
+(The one skip is the environment-blocked e2e console-script test, not a failure.)
 
 ---
 
-## 🟡 Minor issues
+## Resolution (2026-09-27)
 
-### 2. `Recorder._rotate` uses lexicographic sort — breaks after >9 same-microsecond collisions
+All four findings were addressed in the tree:
 
-`save_frame()` appends `-1`, `-2`, … suffixes on timestamp collision. Lexicographically,
-`frame_X-10.png` sorts *before* `frame_X-2.png`, so rotation can delete a newer file
-before an older one once a timestamp collides more than 9 times.
-
-**Risk:** Low (requires >10 frames captured within the same microsecond).
-
-**Suggested fix:** sort by `Path.stat().st_mtime_ns` (or parse the numeric suffix)
-instead of plain lexicographic order.
-
-### 3. Untyped `clock` parameter in `Capture.__init__`
-
-```python
-def __init__(self, config: CaptureConfig, backend: CaptureBackend | None = None, clock=None):
-```
-
-`clock` has no annotation while `AGENTS.md` asks for type hints. It should be:
-
-```python
-clock: Callable[[float], float] | None = None
-```
-
-### 4. Dead code in `MockBackend`
-
-`self._frame_index` is incremented in `grab()` but never read. Either remove it,
-or use it to vary synthetic frames (e.g., shift the pixel color per frame) so
-replay fixtures are more meaningful.
-
-### 5. Redundant import in `MockBackend.grab()`
-
-The inner `from datetime import datetime` shadows the module-level import at the
-top of `capture.py`. Delete the inner line.
-
-### 6. `fps=0` workaround is a slight design smell
-
-`CaptureConfig` enforces `fps > 0` (pydantic `Field(gt=0)`), so the CLI does
-`fps=max(args.fps, 1)` plus a `_noop_clock` to disable pacing. It works, but
-reading `cap.config.fps` back gives `1`, not the intended "no pacing" value —
-the two sources of truth disagree.
-
-**Suggested fix (preferred):** relax the model to `fps: int = Field(default=30, ge=0)`
-and treat `0` as "no pacing" in `wait_next_frame()` (which it already does).
-This removes the `_noop_clock`, the `max(args.fps, 1)` clamp, and the divergence.
+| ID | Status | What was done |
+|----|--------|---------------|
+| **H1** | ✅ Fixed (test) | `test_recorder_rotation_ignores_unrelated_pngs` now writes `screenshot.png` to disk (`unrelated.write_bytes(b"\x00")`) and the unused `base` line was dropped. Test passes. |
+| **M1** | ✅ Fixed | The four dead imports (`pytest`, `Capture`, `MockBackend`, `CaptureConfig`) were removed from `tests/test_recorder.py`; dropping `base` also cleared the F841. `ruff check src tests` is clean. |
+| **N1** | ✅ Documented | `--fps` is now documented as a **ceiling, not a guarantee** in the module docstring, the `observe --fps` help text, and an inline comment at the pacing loop. Behavior is unchanged (deliberate). |
+| **N2** | ✅ Fixed (source) | `main()` now catches `OSError` alongside `(ValueError, CaptureError)`, so genuine I/O failures during recording surface as a clean `error: …` line with exit code 1 instead of a raw traceback. Covered by the new regression test `test_cli_capture_oserror_is_clean_error`. |
 
 ---
 
-## ✅ What's good
+## Verdict
 
-- **TDD followed** — 22 new tests across five test files; full suite is 38 passing
-  with `ruff check src tests` clean.
-- **Clean dependency injection** — `mss_factory`, `clock`, and `backend` are all
-  injectable, so the test suite runs headless and stays deterministic
-  (AGENTS.md requirement: "Tests must be deterministic, independent, and
-  runnable in CI without a desktop session or a live game").
-- **`MssBackend`** correctly uses `bytes(shot.rgb)` (stride-stripped RGB) and
-  validates frame size against `width * height * 3` — good defensive choice.
-- **Error containment** — `Capture.grab()` wraps all backend exceptions into
-  `CaptureError` (the PERCEPTION_ERROR class per AGENTS.md) while re-raising
-  `CaptureError` unchanged; `save_frame()` uses collision-safe timestamped naming.
-- **Config** — `config/default.yaml` already documents the schema; `Pillow` and
-  `mss` are correctly gated behind the `capture`/`dev` extras so the core stays
-  dependency-light (AGENTS.md: "Keep dependencies minimal").
-- **Backend swap is trivial** — `create_backend()` is the single factory; adding
-  DXGI or a replay backend later requires no changes to `Capture`, `Recorder`,
-  or the CLI.
+The Phase 1 capture layer is **in good shape**: it is layered, deterministic,
+headless-testable, and the security-relevant paths (config validation, file
+claiming, rotation isolation) are correctly implemented. The one failing test is a
+**test bug, not a source bug**, and the lint errors are all dead imports in one test
+file. No production-code defects were found.
 
 ---
 
-## Suggested follow-up work (in priority order)
+## Findings
 
-1. Fix the `--region` crash with a regression test (TDD: red → green).
-2. Annotate `Capture.clock` and remove the dead `_frame_index` / redundant import.
-3. Decide on the `fps=0` semantics and consolidate (model-level `ge=0` preferred).
-4. Harden `Recorder._rotate` against numeric-suffix ordering.
+### 🔴 H1 — One failing test is a test bug (`tests/test_recorder.py`)
+
+`test_recorder_rotation_ignores_unrelated_pngs` fails, but the source is correct.
+
+`tests/test_recorder.py:67-78`:
+
+```python
+base = "frame_20260101T000000000000"          # F841: assigned, never used
+unrelated = tmp_path / "screenshot.png"       # Path object, never written to disk
+(tmp_path / "reference.png").write_bytes(b"\x00")
+(tmp_path / "frame_not_a_timestamp.png").write_bytes(b"\x00")
+...
+assert unrelated.exists()                     # FAILS: file was never created
+```
+
+`screenshot.png` is only constructed as a `Path`; it is never written, so
+`unrelated.exists()` is `False`. The other two unrelated files *are* written and
+are correctly preserved by rotation — which is exactly what the source is designed to
+do (`Recorder._rotate()` filters via `_FRAME_FILE_RE`, `capture.py:28`, and therefore
+never deletes unrelated PNGs).
+
+**Fix** (test, not source): write the file so it matches its own intent:
+
+```python
+unrelated = tmp_path / "screenshot.png"
+unrelated.write_bytes(b"\x00")
+```
+
+### 🟠 M1 — 5 lint errors, all in `tests/test_recorder.py`
+
+```
+F401  pytest            imported but unused   tests/test_recorder.py:3
+F401  Capture           imported but unused   tests/test_recorder.py:5
+F401  MockBackend       imported but unused   tests/test_recorder.py:5
+F401  CaptureConfig     imported but unused   tests/test_recorder.py:6
+F841  base              assigned but unused   tests/test_recorder.py:67
+```
+
+All are in a single file and are auto-fixable:
+
+```powershell
+uv run ruff check src tests --fix    # clears the 4 F401s; F841 needs the H1 fix above
+```
+
+Note the coupling: fixing H1 by *removing* the unused `base` line also clears the F841.
+
+### 🟡 N1 — Achieved FPS is structurally below target (`src/ai_game_agent/__main__.py`)
+
+The `observe` loop sleeps *after* the work, so each iteration costs
+`grab() + record() + sleep(1/fps)` — the measured rate is therefore a little under the
+requested one:
+
+`__main__.py` `_observe`:
+
+```python
+for _ in range(max(0, args.frames)):
+    cap.grab()                                  # work
+    meter.record(time.perf_counter())
+    cap.wait_next_frame()                       # sleep(1/fps)
+```
+
+A probe with `fps=30` and ~1 ms of work measured **28.4 fps** (expected: `30 / (1 + 30·t_work)`).
+This is not a correctness bug — `FpsMeter` honestly reports the real rate — but it is a
+worth-noting design fact: the CLI never *reaches* the requested FPS, it asymptotically
+approaches it from below. If hitting the target matters, either subtract the measured
+work time from the sleep, or document that `--fps` is a ceiling, not a guarantee.
+
+### 🟡 N2 — `OSError` during recording surfaces as an unhandled traceback
+
+`main()` only converts `(ValueError, CaptureError)` into a clean `error:` line:
+
+`__main__.py` `main`:
+
+```python
+try:
+    return int(args.func(args))
+except (ValueError, CaptureError) as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    return 1
+```
+
+`save_frame` (which `Recorder.record` calls) opens/claims/writes real files. A
+permission error, full disk, or a read-only target raises `OSError`, which is
+**not** in the caught set, so the CLI exits with a raw traceback rather than a clean
+`error:` message. Config and validation errors are fine (verified: pydantic
+`ValidationError` is a subclass of `ValueError`, so `main()` catches it). The only
+uncaught path is genuine I/O failure. Consider catching `OSError` alongside, or
+wrapping the write in `save_frame` into a `CaptureError`.
+
+---
+
+## Verified-correct (checked, not assumed)
+
+- **Rotation never deletes unrelated files.** `Recorder._rotate()` filters with
+  `_FRAME_FILE_RE` (`capture.py:28`), so only `frame_<timestamp>[-N].png` files are
+  candidates. Covered by `test_recorder_rotation_prefers_oldest_on_suffix_collision`
+  and the (currently broken) `test_recorder_rotation_ignores_unrelated_pngs`.
+- **Collision-safe writes.** `save_frame` claims the name with
+  `os.O_CREAT | os.O_EXCL` and appends `-N` on `FileExistsError`, closing the
+  exists-then-write TOCTOU window.
+- **Config fail-fast.** `_CaptureConfig` uses `extra="forbid"` so typos like
+  `backends:` raise instead of silently defaulting; `logging.level` is validated
+  against the allowed set; `region` is validated (`width`/`height > 0`).
+- **`fps = 0` is an intentional, handled feature** (headless/CI "no pacing"):
+  documented at `config.py:46`, bounded `ge=0` at `config.py:47`, and short-circuited
+  in `Capture.wait_next_frame` (`capture.py`, `if self.config.fps <= 0: return 0.0`).
+- **Artifact dirs are git-ignored.** `.gitignore` covers `recordings/`, `screenshots/`,
+  `shots/`, and `logs/`; `git ls-files shots logs recordings` returns nothing.
+- **Headless determinism.** `MockBackend` precomputes its pixel buffer once; `Clock`
+  is injectable; `Frame` is a frozen dataclass of raw `bytes`, so pixel math needs no
+  image library and `to_pil()` defers the optional Pillow import.
+
+## Blocked in this environment (not a code defect)
+
+- The one **skipped** test is the e2e CLI test:
+  `tests/e2e/test_e2e_cli.py:174` — skipped because
+  `[WinError 4551] An Application Control policy has blocked this file`, i.e. the
+  `uv run` console entry-point cannot be executed here. It is not a test failure.
+
+---
+
+## Strengths
+
+- **Clean layering.** `CaptureBackend` interface → `MockBackend`/`MssBackend` →
+  `Capture` facade → `Recorder`. Tests inject a mock backend and clock, so the whole
+  pipeline runs headless.
+- **Backend-agnostic frame model.** `Frame` carries raw RGB `bytes` plus dims/timestamp;
+  `region()` and `resize()` are pure-Python (no PIL required), and `to_pil()` keeps
+  Pillow optional.
+- **Thoughtful edge cases.** Numeric (not lexicographic) ordering of collision suffixes
+  in `_rotation_key`; mss 9-vs-≥10 `shot.size` dict/Size handling; `extra="forbid"`
+  config.
+- **Testable by construction.** `MockBackend`, injectable `clock`, and `FpsMeter` are
+  all seams that let the suite assert exact behavior without a display.
+
+## Suggested order of fixes
+
+1. Fix the H1 test (write `screenshot.png`) — this also removes the F841.
+2. `uv run ruff check src tests --fix` for the four dead imports.
+3. Optionally broaden `main()`'s `except` to include `OSError` (N2).
+4. Optionally document/adjust the FPS-ceiling behavior (N1).

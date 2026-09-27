@@ -112,3 +112,70 @@ def test_region_validates_positive_dimensions():
 
     with pytest.raises(ValidationError):
         Region(x=0, y=0, width=0, height=10)
+
+
+def test_load_config_rejects_unknown_capture_key(tmp_path):
+    # M3: a typo like ``backends:`` must raise ConfigError, not silently
+    # fall back to the default backend.
+    bad = tmp_path / "unknown-key.yaml"
+    bad.write_text("capture:\n  backends: mss\n", encoding="utf-8")
+    try:
+        load_config(str(bad))
+    except ConfigError as exc:
+        assert "backends" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for unknown capture key")
+
+
+def test_load_config_rejects_unknown_top_level_key(tmp_path):
+    bad = tmp_path / "unknown-top.yaml"
+    bad.write_text("cature:\n  backend: mock\n", encoding="utf-8")
+    try:
+        load_config(str(bad))
+    except ConfigError as exc:
+        assert "cature" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for unknown top-level key")
+
+
+def test_load_config_rejects_unknown_logging_key(tmp_path):
+    bad = tmp_path / "unknown-logging.yaml"
+    bad.write_text("logging:\n  level: INFO\n  verbos: true\n", encoding="utf-8")
+    try:
+        load_config(str(bad))
+    except ConfigError as exc:
+        assert "verbos" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for unknown logging key")
+
+
+def test_capture_config_record_block_still_accepted(tmp_path):
+    # The nested ``record:`` form is supported; it must keep working while
+    # unknown keys are rejected.
+    path = tmp_path / "record-block.yaml"
+    path.write_text(
+        "capture:\n  backend: mock\n  record:\n    enabled: true\n    max_files: 50\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(str(path))
+    assert cfg.capture.record_enabled is True
+    assert cfg.capture.record_max_files == 50
+
+
+def test_logging_level_must_be_known_level(tmp_path):
+    # L2: "LOUD" must be rejected at config load, not fail later (or never).
+    bad = tmp_path / "bad-level.yaml"
+    bad.write_text("logging:\n  level: LOUD\n", encoding="utf-8")
+    try:
+        load_config(str(bad))
+    except ConfigError as exc:
+        assert "level" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for unknown logging level")
+
+
+def test_logging_level_accepts_valid_levels(tmp_path):
+    path = tmp_path / "levels.yaml"
+    path.write_text("logging:\n  level: debug\n", encoding="utf-8")
+    cfg = load_config(str(path))
+    assert cfg.logging.level.upper() in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}

@@ -37,7 +37,9 @@ class _Region(BaseModel):
 class _CaptureConfig(BaseModel):
     """Screen capture settings (Phase 1)."""
 
-    model_config = ConfigDict(frozen=True, extra="ignore")
+    # ``extra="forbid"`` (M3): a typo such as ``backends:`` must surface as a
+    # ConfigError instead of silently falling back to the default backend.
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     backend: str = "mss"
     region: _Region | None = None
@@ -82,7 +84,7 @@ class _CaptureConfig(BaseModel):
 class _AIConfig(BaseModel):
     """AI provider settings (Phase 5+). Local-first via Ollama."""
 
-    model_config = ConfigDict(frozen=True, extra="ignore")
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     provider: str = "ollama"
     model: str = "qwen3.8:27b"
@@ -92,26 +94,39 @@ class _AIConfig(BaseModel):
 class _SafetyConfig(BaseModel):
     """Safety / emergency-stop settings (Phase 3+)."""
 
-    model_config = ConfigDict(frozen=True, extra="ignore")
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     emergency_stop_keys: tuple[str, ...] = ("F12",)
     max_action_duration_ms: int = Field(default=5000, gt=0)
     max_consecutive_actions: int = Field(default=50, gt=0)
 
 
+_VALID_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"})
+
+
 class _LoggingConfig(BaseModel):
     """Logging settings."""
 
-    model_config = ConfigDict(frozen=True, extra="ignore")
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     level: str = "INFO"
     directory: str = "logs"
+
+    @field_validator("level")
+    @classmethod
+    def _check_level(cls, value: str) -> str:
+        # L2: reject unknown levels at load time so a typo fails fast instead
+        # of silently producing the wrong verbosity at runtime.
+        if value.upper() not in _VALID_LOG_LEVELS:
+            allowed = ", ".join(sorted(_VALID_LOG_LEVELS))
+            raise ValueError(f"invalid logging level {value!r}; expected one of: {allowed}")
+        return value.upper()
 
 
 class _Config(BaseModel):
     """Top-level configuration object for the agent."""
 
-    model_config = ConfigDict(frozen=True, extra="ignore")
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     ai: _AIConfig = Field(default_factory=_AIConfig)
     capture: _CaptureConfig = Field(default_factory=_CaptureConfig)

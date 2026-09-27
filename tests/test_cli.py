@@ -70,3 +70,56 @@ def test_cli_capture_with_invalid_scale_returns_nonzero(tmp_path):
 
 def test_cli_no_command_returns_nonzero(capsys):
     assert main([]) == 2
+
+
+def test_cli_capture_oserror_is_clean_error(capsys, monkeypatch):
+    # N2: a genuine I/O failure (permission, full disk, read-only target)
+    # surfaces as OSError from save_frame; main() must translate it into a
+    # clean "error:" line on stderr with exit code 1, not a raw traceback.
+    import ai_game_agent.__main__ as cli
+
+    def _boom(frame, directory):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(cli, "save_frame", _boom)
+    rc = main(["capture", "--backend", "mock", "--out", "ignored"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.err.startswith("error: ")
+    assert "Permission denied" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_capture_writes_log_file(tmp_path, monkeypatch, capsys):
+    # Logging must go to the configured file (default: logs/agent.log), not
+    # to stdout or stderr, so the CLI stream/exit-code contract is preserved.
+    monkeypatch.chdir(tmp_path)
+    rc = main(["capture", "--backend", "mock", "--out", str(tmp_path / "shots")])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "capture: saved frame" not in captured.out
+    assert "capture: saved frame" not in captured.err
+    log_file = tmp_path / "logs" / "agent.log"
+    assert log_file.is_file()
+    assert "capture: saved frame" in log_file.read_text(encoding="utf-8")
+
+
+def test_cli_capture_logs_to_stderr_not_stdout(tmp_path, capsys):
+    # Contract: stdout carries only program output (the ``saved: ...`` line);
+    # log lines must go to the log file, never stdout.
+    out = tmp_path / "shots"
+    rc = main(["capture", "--backend", "mock", "--out", str(out)])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "saved: " in captured.out
+    assert "capture: saved frame" not in captured.out
+
+
+def test_cli_observe_logs_to_stderr_not_stdout(capsys):
+    # Contract: stdout carries only ``frames=N fps=...``; the observe log
+    # line goes to the log file, never stdout.
+    rc = main(["observe", "--backend", "mock", "--frames", "3", "--fps", "0"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert captured.out.startswith("frames=3 fps=")
+    assert "observe: frames=" not in captured.out

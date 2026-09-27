@@ -55,3 +55,24 @@ def test_recorder_rotation_prefers_oldest_on_suffix_collision(tmp_path):
     stems = {f.stem for f in tmp_path.glob("*.png")}
     # Suffix "1" (the numeric oldest) is dropped, not "-10".
     assert stems == {f"{base}-2", f"{base}-10"}
+
+
+def test_recorder_rotation_ignores_unrelated_pngs(tmp_path):
+    # M1: _rotate() must only consider files it recorded itself. Unrelated
+    # PNGs in the directory (e.g. a user's own screenshots) must never be
+    # deleted, even if they sort as "older" than the recorded frames.
+    unrelated = tmp_path / "screenshot.png"
+    unrelated.write_bytes(b"\x00")
+    (tmp_path / "reference.png").write_bytes(b"\x00")
+    (tmp_path / "frame_not_a_timestamp.png").write_bytes(b"\x00")
+
+    rec = Recorder(tmp_path, max_files=2, enabled=True)
+    for second in (1, 2):
+        rec.record(frame_at(second))
+
+    files = {f.name for f in tmp_path.glob("*.png")}
+    # The recorded frames remain and the unrelated files are untouched.
+    assert unrelated.exists()
+    assert "reference.png" in files
+    assert "frame_not_a_timestamp.png" in files
+    assert len(files) >= 3

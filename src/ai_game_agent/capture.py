@@ -14,12 +14,19 @@ Design rules:
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 from ai_game_agent.config import CaptureConfig
+
+# M1: the exact filename shape produced by ``save_frame`` (``frame_`` +
+# ``YYYYMMDDTHHMMSS`` + microseconds, an optional ``-N`` collision suffix,
+# ``.png``). Rotation must only ever consider files matching this pattern so
+# it never deletes unrelated PNGs sharing the directory.
+_FRAME_FILE_RE = re.compile(r"^frame_\d{8}T\d{12}(?:-\d+)?\.png$")
 
 
 class CaptureError(Exception):
@@ -48,7 +55,16 @@ class Frame:
         return Image.frombytes("RGB", (self.width, self.height), self.pixels)
 
     def region(self, x: int, y: int, width: int, height: int) -> Frame:
-        """Extract a sub-region of this frame as a new frame."""
+        """Extract a sub-region of this frame as a new frame.
+
+        Raises:
+            CaptureError: if the region dimensions are not positive, or the
+                region extends beyond the frame bounds.
+        """
+        if width <= 0 or height <= 0:
+            raise CaptureError(
+                f"region dimensions must be positive, got width={width}, height={height}"
+            )
         if not (0 <= x and 0 <= y and x + width <= self.width and y + height <= self.height):
             raise CaptureError(
                 f"region ({x}, {y}, {width}, {height}) exceeds frame "
@@ -122,7 +138,9 @@ class MockBackend(CaptureBackend):
     ) -> None:
         self._width = width
         self._height = height
-        self._pixel = bytes(rgb)  # one RGB triple per pixel
+        # L3: precompute the full pixel buffer once instead of reallocating it
+        # on every grab() call.
+        self._full_pixels = bytes(rgb) * (width * height)
         self.opened = False
 
     def open(self) -> None:
@@ -135,7 +153,7 @@ class MockBackend(CaptureBackend):
         return Frame(
             width=self._width,
             height=self._height,
-            pixels=self._pixel * (self._width * self._height),
+            pixels=self._full_pixels,
             captured_at=datetime.now(UTC),
             source=self.name,
         )
@@ -189,7 +207,7 @@ class MssBackend(CaptureBackend):
             else:
                 import mss
 
-                factory = mss.mss
+                factory = mss.MSS  # mss.mss is deprecated since mss 10
             self._screen = factory()
 
     def close(self) -> None:
@@ -200,9 +218,15 @@ class MssBackend(CaptureBackend):
     def grab(self) -> Frame:
         if self._screen is None:
             raise CaptureError("mss backend not opened; call open() first")
-        shot = self._screen.grab()
-        width = shot.size["width"]
-        height = shot.size["height"]
+        # mss >= 10 requires an explicit monitor; monitors[0] is the whole
+        # virtual screen (same as the legacy no-argument grab).
+        shot = self._screen.grab(self._screen.monitors[0])
+        size = shot.size
+        # mss 9 exposes shot.size as a dict; mss >= 10 as a Size object.
+        if isinstance(size, dict):
+            width, height = size["width"], size["height"]
+        else:
+            width, height = size.width, size.height
         raw = bytes(shot.rgb)
         if len(raw) != width * height * 3:
             raise CaptureError(
@@ -213,6 +237,12 @@ class MssBackend(CaptureBackend):
 
 class Capture:
     """Capture facade: fps pacing, region extraction, and optional recording.
+
+    When ``config.record_enabled`` is set, the facade owns a :class:`Recorder`
+    and writes each grabbed frame to ``config.record_directory`` as a side
+    effect of :meth:`grab`. This keeps the ``record_*`` config fields live in
+    the capture layer (M2) instead of leaving them to be re-read ad hoc by
+    callers.
 
     Args:
         config: Capture configuration.
@@ -231,6 +261,12 @@ class Capture:
         self.backend = backend if backend is not None else create_backend(config)
         self._clock = clock if clock is not None else _default_clock
         self._opened = False
+        # M2: the facade owns recording, driven by the config's record_* fields.
+        self.recorder = Recorder(
+            Path(config.record_directory),
+            enabled=config.record_enabled,
+            max_files=config.record_max_files,
+        )
     
 
     def start(self) -> None:
@@ -255,6 +291,9 @@ class Capture:
     def grab(self) -> Frame:
         """Capture one frame, applying region and scaling from config.
 
+        When recording is enabled, the processed frame is also written to the
+        configured record directory as a side effect of this call.
+
         Raises:
             CaptureError: if :meth:`start` was not called or the backend fails.
         """
@@ -275,6 +314,8 @@ class Capture:
             )
         if self.config.scale != 1.0:
             frame = frame.resize(self.config.scale)
+        if self.recorder.enabled:
+            self.recorder.record(frame)
         return frame
 
     def wait_next_frame(self) -> float:
@@ -297,16 +338,28 @@ def save_frame(frame: Frame, directory: Path) -> Path:
     The directory is created if missing. Filenames embed the timestamp so
     order is stable for replay. A collision-safe suffix is appended if a file
     with the same timestamp already exists.
+
+    The candidate name is *claimed* with ``O_CREAT | O_EXCL`` so two writers
+    can never pick the same name (L4: closes the exists()-then-write TOCTOU
+    window).
     """
+    import os
+
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     base = f"frame_{frame.captured_at:%Y%m%dT%H%M%S%f}"
-    candidate = directory / f"{base}.png"
-    suffix = 1
-    while candidate.exists():
-        candidate = directory / f"{base}-{suffix}.png"
-        suffix += 1
-    frame.to_pil().save(candidate, format="PNG")
+    suffix = 0
+    while True:
+        name = f"{base}.png" if suffix == 0 else f"{base}-{suffix}.png"
+        candidate = directory / name
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            suffix += 1
+            continue
+        break
+    with os.fdopen(fd, "wb") as handle:
+        frame.to_pil().save(handle, format="PNG")
     return candidate
 
 
@@ -371,7 +424,10 @@ class Recorder:
     def _rotate(self) -> None:
         if self.max_files is None or self.max_files <= 0:
             return
-        files = sorted(self.directory.glob("*.png"), key=_rotation_key)
+        # M1: only consider files we recorded ourselves (matching the
+        # save_frame naming pattern), never unrelated PNGs in the directory.
+        files = [p for p in self.directory.glob("*.png") if _FRAME_FILE_RE.match(p.name)]
+        files.sort(key=_rotation_key)
         excess = len(files) - self.max_files
         for stale in files[:excess] if excess > 0 else []:
             stale.unlink()
