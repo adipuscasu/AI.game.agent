@@ -100,6 +100,77 @@ def test_frame_region_out_of_bounds_raises():
         frame.region(3, 0, 3, 2)  # x + width > frame width
 
 
+def _gradient_frame(width: int, height: int) -> Frame:
+    """A 4x2 frame where every pixel is a unique, easily identifiable color.
+
+    Pixel (col, row) is encoded as RGB (col, row, 0) so any downsampled
+    output value can be traced back to the exact source pixel it came from.
+    """
+    from datetime import datetime
+
+    pixels = bytearray()
+    for row in range(height):
+        for col in range(width):
+            pixels += bytes((col % 256, row % 256, 0))
+    return Frame(width, height, bytes(pixels), datetime(2026, 1, 1), "test")
+
+
+def test_frame_resize_half_picks_expected_nearest_neighbors():
+    # 4x2 -> scale 0.5 -> 2x1. Nearest-neighbor sampling maps output column i
+    # to source column int(i / 0.5): 0 -> 0, 1 -> 2.
+    frame = _gradient_frame(4, 2)
+    resized = frame.resize(0.5)
+    assert (resized.width, resized.height) == (2, 1)
+    assert resized.pixels[:3] == bytes((0, 0, 0))  # source pixel (col 0, row 0)
+    assert resized.pixels[3:6] == bytes((2, 0, 0))  # source pixel (col 2, row 0)
+
+
+def test_frame_resize_one_is_identity():
+    frame = _gradient_frame(4, 2)
+    resized = frame.resize(1.0)
+    assert (resized.width, resized.height) == (4, 2)
+    assert resized.pixels == frame.pixels
+
+
+def test_frame_resize_upscale_clamps_source_pixel():
+    # 2x2 -> scale 2.0 -> 4x4. Output column i -> source column int(i / 2.0).
+    frame = _gradient_frame(2, 2)
+    resized = frame.resize(2.0)
+    assert (resized.width, resized.height) == (4, 4)
+    # All four pixels in output row 0 must sample source row 0.
+    for i in range(4):
+        assert resized.pixels[i * 3 : i * 3 + 2] == frame.pixels[(i // 2) * 3 : (i // 2) * 3 + 2]
+
+
+def test_frame_resize_min_size_and_invalid_scale():
+    # Even a tiny downscale must produce at least a 1x1 frame.
+    frame = _gradient_frame(2, 2)
+    assert (frame.resize(0.1).width, frame.resize(0.1).height) == (1, 1)
+    with pytest.raises(CaptureError):
+        frame.resize(0.0)
+    with pytest.raises(CaptureError):
+        frame.resize(-1.0)
+
+
+def test_capture_applies_scale_after_region():
+    full = _gradient_frame(4, 2)
+    backend = StaticBackend(full)
+    cfg = CaptureConfig(backend="mock", region=Region(x=0, y=0, width=4, height=2), scale=0.5)
+    with Capture(cfg, backend=backend) as cap:
+        frame = cap.grab()
+    assert (frame.width, frame.height) == (2, 1)
+
+
+def test_capture_scale_one_is_noop():
+    full = _gradient_frame(4, 2)
+    backend = StaticBackend(full)
+    cfg = CaptureConfig(backend="mock", scale=1.0)
+    with Capture(cfg, backend=backend) as cap:
+        frame = cap.grab()
+    assert (frame.width, frame.height) == (4, 2)
+    assert frame.pixels == full.pixels
+
+
 class StaticBackend(CaptureBackend):
     """Returns a fixed frame on every grab; records open/close state."""
 

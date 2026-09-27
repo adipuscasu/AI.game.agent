@@ -78,6 +78,8 @@ section 15) ships with this release:
   supports CI and replay.
 * **Configurable capture region** — `capture.region: {x, y, width, height}`
   in `config/default.yaml` selects a sub-rectangle.
+* **Optional downscaling** — `capture.scale` (1.0 = no scaling) resizes each
+  frame with deterministic nearest-neighbor sampling after region extraction.
 * **FPS pacing + measurement** — `Capture.wait_next_frame()` paces the loop
   per `capture.fps`; `FpsMeter` reports the measured rate over a run.
 * **Recording** — `Recorder` writes each frame as PNG to `record.directory`,

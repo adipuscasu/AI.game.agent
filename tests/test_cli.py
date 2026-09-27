@@ -52,5 +52,21 @@ def test_cli_capture_with_invalid_region_returns_nonzero(tmp_path):
     assert rc != 0
 
 
+def test_cli_capture_with_scale(tmp_path):
+    # Mock backend defaults to 128x72; scale 0.5 -> 64x36.
+    out = tmp_path / "shots"
+    rc = main(["capture", "--backend", "mock", "--scale", "0.5", "--out", str(out)])
+    assert rc == 0
+    from PIL import Image
+
+    assert Image.open(next(out.glob("*.png"))).size == (64, 36)
+
+
+def test_cli_capture_with_invalid_scale_returns_nonzero(tmp_path):
+    out = tmp_path / "shots"
+    rc = main(["capture", "--backend", "mock", "--scale", "0", "--out", str(out)])
+    assert rc != 0
+
+
 def test_cli_no_command_returns_nonzero(capsys):
     assert main([]) == 2

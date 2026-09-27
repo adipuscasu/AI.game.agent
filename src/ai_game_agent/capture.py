@@ -61,6 +61,31 @@ class Frame:
             out[dst : dst + width * 3] = self.pixels[src : src + width * 3]
         return Frame(width, height, bytes(out), self.captured_at, self.source)
 
+    def resize(self, scale: float) -> Frame:
+        """Return a nearest-neighbor scaled copy of this frame.
+
+        ``scale`` multiplies both dimensions (``1.0`` = identity, ``< 1.0``
+        downscales, ``> 1.0`` upscales). Each output pixel samples the nearest
+        source pixel, so the result is deterministic and needs no image library.
+
+        Raises:
+            CaptureError: if ``scale`` is not a positive finite number.
+        """
+        if not scale > 0:
+            raise CaptureError(f"scale must be > 0, got {scale!r}")
+        new_w = max(1, int(self.width * scale))
+        new_h = max(1, int(self.height * scale))
+        out = bytearray(new_w * new_h * 3)
+        for dst_row in range(new_h):
+            src_row = min(self.height - 1, int(dst_row / scale))
+            src_base = src_row * self.width * 3
+            for dst_col in range(new_w):
+                src_col = min(self.width - 1, int(dst_col / scale))
+                src = src_base + src_col * 3
+                dst = (dst_row * new_w + dst_col) * 3
+                out[dst : dst + 3] = self.pixels[src : src + 3]
+        return Frame(new_w, new_h, bytes(out), self.captured_at, self.source)
+
 
 class CaptureBackend:
     """Interface for frame acquisition backends.
@@ -248,6 +273,8 @@ class Capture:
                 self.config.region.width,
                 self.config.region.height,
             )
+        if self.config.scale != 1.0:
+            frame = frame.resize(self.config.scale)
         return frame
 
     def wait_next_frame(self) -> float:

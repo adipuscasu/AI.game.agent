@@ -42,11 +42,23 @@ def _parse_region(value: str | None) -> Region | None:
     return Region(x, y, width, height)
 
 
+def _parse_scale(value: str | None) -> float | None:
+    """Parse a CLI scale factor string; ``None`` leaves the config default."""
+    if value is None:
+        return None
+    scale = float(value)
+    if not scale > 0:
+        raise ValueError("scale must be a positive number")
+    return scale
+
+
 def _build_capture(args: argparse.Namespace, *, record_enabled: bool, record_dir: Path) -> Capture:
+    scale = _parse_scale(getattr(args, "scale", None))
     cfg = CaptureConfig(
         backend=args.backend,
         region=_parse_region(args.region),
         fps=args.fps,  # fps=0 is a valid "no pacing" value in the config model
+        scale=1.0 if scale is None else scale,
         record_enabled=record_enabled,
         record_directory=str(record_dir),
     )
@@ -87,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cap = sub.add_parser("capture", help="Grab one screenshot and save it as PNG.")
     p_cap.add_argument("--backend", default="mss", help="capture backend (mss | mock)")
     p_cap.add_argument("--region", default=None, help="x,y,width,height (integers)")
+    p_cap.add_argument("--scale", default=None, help="downscale factor (e.g. 0.5)")
     p_cap.add_argument("--out", default="screenshots", help="output directory")
     p_cap.add_argument("--fps", type=int, default=0, help="0 = no pacing (CLI default)")
     p_cap.set_defaults(func=_capture)
@@ -94,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_obs = sub.add_parser("observe", help="Run a capture loop and print measured FPS.")
     p_obs.add_argument("--backend", default="mss")
     p_obs.add_argument("--region", default=None, help="x,y,width,height (integers)")
+    p_obs.add_argument("--scale", default=None, help="downscale factor (e.g. 0.5)")
     p_obs.add_argument("--frames", type=int, default=30)
     p_obs.add_argument("--fps", type=int, default=0, help="0 = no pacing (headless/CI)")
     p_obs.add_argument("--record", action="store_true", help="write each frame to --out")
