@@ -85,6 +85,27 @@ capture:
         raise AssertionError("expected ConfigError for invalid values")
 
 
+def test_capture_config_allows_fps_zero():
+    # fps=0 is a documented "no pacing" value (CLI headless mode); it must be
+    # representable in the config model rather than clamped to 1.
+    from ai_game_agent.config import CaptureConfig
+
+    cfg = CaptureConfig(backend="mock", fps=0)
+    assert cfg.fps == 0
+
+
+
+
+def test_capture_config_rejects_negative_fps():
+    import pytest
+    from pydantic import ValidationError
+
+    from ai_game_agent.config import CaptureConfig
+
+    with pytest.raises(ValidationError):
+        CaptureConfig(backend="mock", fps=-1)
+
+
 def test_region_validates_positive_dimensions():
     import pytest
     from pydantic import ValidationError

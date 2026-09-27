@@ -41,7 +41,8 @@ class _CaptureConfig(BaseModel):
 
     backend: str = "mss"
     region: _Region | None = None
-    fps: int = Field(default=30, gt=0)
+    # fps=0 is a valid "no pacing" value used by the CLI for headless/CI runs.
+    fps: int = Field(default=30, ge=0)
     scale: float = Field(default=1.0, gt=0)
     record_enabled: bool = False
     record_directory: str = "recordings"

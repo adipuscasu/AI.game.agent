@@ -14,6 +14,7 @@ Design rules:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -97,7 +98,6 @@ class MockBackend(CaptureBackend):
         self._width = width
         self._height = height
         self._pixel = bytes(rgb)  # one RGB triple per pixel
-        self._frame_index = 0
         self.opened = False
 
     def open(self) -> None:
@@ -107,18 +107,13 @@ class MockBackend(CaptureBackend):
         self.opened = False
 
     def grab(self) -> Frame:
-        from datetime import datetime
-
-        frame = Frame(
+        return Frame(
             width=self._width,
             height=self._height,
             pixels=self._pixel * (self._width * self._height),
             captured_at=datetime.now(UTC),
             source=self.name,
         )
-        self._frame_index += 1
-        return frame
-
 
 def create_backend(config: CaptureConfig):
     """Factory: return the capture backend named in config.
@@ -131,18 +126,64 @@ def create_backend(config: CaptureConfig):
     if name == "mock":
         return MockBackend()
     if name == "mss":
-        try:
-            import mss  # noqa: F401  (import check only)
-        except ImportError as exc:
+        if not _mss_available():
             raise CaptureError(
                 "the 'mss' backend is not installed; "
                 "install it with 'pip install mss' or set capture.backend to 'mock'"
-            ) from exc
-        raise CaptureError(
-            "the 'mss' backend is not yet implemented in this build; "
-            "use 'mock' for headless/CI use"
-        )
+            )
+        return MssBackend()
     raise CaptureError(f"unknown capture backend: {config.backend!r}")
+
+
+def _mss_available() -> bool:
+    try:
+        import mss  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+class MssBackend(CaptureBackend):
+    """mss-backed capture (Phase 1 real screen capture).
+
+    Requires a display. Not used by the test suite; tests inject a fake screen
+    via ``mss_factory`` to keep the pipeline deterministic and headless.
+    """
+
+    name = "mss"
+
+    def __init__(self, mss_factory: Callable[[], object] | None = None) -> None:
+        self._factory = mss_factory
+        self._screen: object | None = None
+
+    def open(self) -> None:
+        if self._screen is None:
+            if self._factory is not None:
+                factory = self._factory
+            else:
+                import mss
+
+                factory = mss.mss
+            self._screen = factory()
+
+    def close(self) -> None:
+        if self._screen is not None:
+            self._screen.close()
+            self._screen = None
+
+    def grab(self) -> Frame:
+        if self._screen is None:
+            raise CaptureError("mss backend not opened; call open() first")
+        shot = self._screen.grab()
+        width = shot.size["width"]
+        height = shot.size["height"]
+        raw = bytes(shot.rgb)
+        if len(raw) != width * height * 3:
+            raise CaptureError(
+                f"unexpected mss frame size: {len(raw)} bytes for {width}x{height}"
+            )
+        return Frame(width, height, raw, datetime.now(UTC), self.name)
 
 
 class Capture:
@@ -155,11 +196,17 @@ class Capture:
         clock: Monotonic clock callable for timing. Injectable for tests.
     """
 
-    def __init__(self, config: CaptureConfig, backend: CaptureBackend | None = None, clock=None):
+    def __init__(
+        self,
+        config: CaptureConfig,
+        backend: CaptureBackend | None = None,
+        clock: Callable[[float], float] | None = None,
+    ) -> None:
         self.config = config
         self.backend = backend if backend is not None else create_backend(config)
         self._clock = clock if clock is not None else _default_clock
         self._opened = False
+    
 
     def start(self) -> None:
         """Open the backend and begin capturing."""
@@ -221,6 +268,100 @@ def save_frame(frame: Frame, directory: Path) -> Path:
     """Persist a frame as PNG. Returns the written path.
 
     The directory is created if missing. Filenames embed the timestamp so
-    order is stable for replay.
+    order is stable for replay. A collision-safe suffix is appended if a file
+    with the same timestamp already exists.
     """
-    raise NotImplementedError("to be implemented in the green step")
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    base = f"frame_{frame.captured_at:%Y%m%dT%H%M%S%f}"
+    candidate = directory / f"{base}.png"
+    suffix = 1
+    while candidate.exists():
+        candidate = directory / f"{base}-{suffix}.png"
+        suffix += 1
+    frame.to_pil().save(candidate, format="PNG")
+    return candidate
+
+
+class FpsMeter:
+    """Measures frames-per-second over a sliding window of recorded timestamps.
+
+    FPS is defined as ``frames / elapsed`` using the first and last recorded
+    samples, so a single frame (zero elapsed) reports ``0.0``. Non-monotonic
+    timestamps are tolerated; the first and last samples bound the window.
+    """
+
+    def __init__(self) -> None:
+        self._first: float | None = None
+        self._last: float | None = None
+        self._count = 0
+
+    def record(self, timestamp: float) -> None:
+        if self._first is None:
+            self._first = timestamp
+        self._last = timestamp
+        self._count += 1
+
+    @property
+    def frame_count(self) -> int:
+        return self._count
+
+    @property
+    def fps(self) -> float:
+        if self._count < 2:
+            return 0.0
+        elapsed = self._last - self._first
+        if elapsed <= 0:
+            return 0.0
+        return (self._count - 1) / elapsed
+
+    def reset(self) -> None:
+        self._first = None
+        self._last = None
+        self._count = 0
+
+
+class Recorder:
+    """Records frames to disk and rotates out the oldest beyond ``max_files``.
+
+    ``max_files <= 0`` disables rotation (unbounded). Recording is a no-op
+    (returns ``None``) while ``enabled`` is False, satisfying OBSERVE-only and
+    default-off behavior.
+    """
+
+    def __init__(self, directory: Path, enabled: bool = True, max_files: int = 0) -> None:
+        self.directory = Path(directory)
+        self.enabled = enabled
+        self.max_files = max_files
+
+    def record(self, frame: Frame) -> Path | None:
+        if not self.enabled:
+            return None
+        path = save_frame(frame, self.directory)
+        self._rotate()
+        return path
+
+    def _rotate(self) -> None:
+        if self.max_files is None or self.max_files <= 0:
+            return
+        files = sorted(self.directory.glob("*.png"), key=_rotation_key)
+        excess = len(files) - self.max_files
+        for stale in files[:excess] if excess > 0 else []:
+            stale.unlink()
+
+
+def _rotation_key(path: Path) -> tuple[str, int]:
+    """Ordering key for rotation: timestamp stem, then numeric collision suffix.
+
+    ``save_frame`` appends ``-1``, ``-2``, ... on same-timestamp collisions.
+    A plain lexicographic sort would rank ``-10`` before ``-2``, so the key
+    parses the suffix numerically to keep oldest-written files first.
+    """
+    stem = path.stem
+    suffix = 0
+    if "-" in stem:
+        base, _, tail = stem.rpartition("-")
+        if tail.isdigit():
+            suffix = int(tail)
+            stem = base
+    return (stem, suffix)

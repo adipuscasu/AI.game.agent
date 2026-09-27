@@ -21,13 +21,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Phase 1 capture backend. Not required for the test suite (a mock backend is used).
-capture = ["mss>=9.0"]
+# Phase 1 capture backend + image persistence. Not required for the test suite
+# (a mock backend and injected fakes are used), but needed for real capture and
+# PNG frame saving. Pillow backs Frame.to_pil() and save_frame().
+capture = [
+    "mss>=9.0",
+    "Pillow>=10.0",
+]
 dev = [
     "pytest>=8.0",
     "freezegun>=1.4",
     "ruff>=0.4",
+    "Pillow>=10.0",
 ]
+
+[project.scripts]
+ai-game-agent = "ai_game_agent.__main__:main"
 
 [build-system]
 requires = ["hatchling"]

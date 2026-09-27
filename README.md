@@ -68,6 +68,43 @@ uv sync --extra dev
 
 `uv sync` installs the project in editable mode into `.venv/` and activates it for all `uv run` commands below.
 
+## Phase 1 — Screen Observation
+
+The first milestone of the project (see `docs/high-level-development-plan.md`,
+section 15) ships with this release:
+
+* **Screen capture** — `Capture` facade over a swappable backend. The `mss`
+  backend captures real screens on Windows; a deterministic `mock` backend
+  supports CI and replay.
+* **Configurable capture region** — `capture.region: {x, y, width, height}`
+  in `config/default.yaml` selects a sub-rectangle.
+* **FPS pacing + measurement** — `Capture.wait_next_frame()` paces the loop
+  per `capture.fps`; `FpsMeter` reports the measured rate over a run.
+* **Recording** — `Recorder` writes each frame as PNG to `record.directory`,
+  rotating out the oldest files beyond `record.max_files`.
+* **Screenshot viewer (CLI)** — `ai-game-agent` exposes two subcommands:
+  `capture` (single frame) and `observe` (loop + measured FPS).
+
+### CLI usage
+
+```powershell
+# One screenshot from the primary monitor, saved to ./screenshots
+uv run ai-game-agent capture --backend mss --out shots/
+
+# A 30-frame capture loop with measured FPS (no recording)
+uv run ai-game-agent observe --backend mss --frames 30 --fps 30
+
+# Headless / CI: mock backend, no pacing, record 5 frames
+uv run ai-game-agent observe --backend mock --frames 5 --fps 0 --record --out rec/
+
+# Region of interest (x,y,width,height)
+uv run ai-game-agent capture --backend mss --region 0,0,1920,1080 --out shots/
+```
+
+`--fps 0` disables pacing (no sleeps) and is the right choice for tests,
+CI, and fast debug runs. All CLI options default to the values in
+`config/default.yaml` where applicable.
+
 ## Running the Unit Tests
 
 All commands are run from the repository root.
