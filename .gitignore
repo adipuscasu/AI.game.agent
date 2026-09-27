@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Agent runtime artifacts (never commit)
+recordings/
+screenshots/
+shots/
+logs/
+*.sqlite3
+
+# OS
+Thumbs.db
+.DS_Store

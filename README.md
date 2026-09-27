@@ -57,4 +57,116 @@ The project aims to explore how modern multimodal AI and local computer-use agen
 
 The architecture is intended to remain generic enough to support additional games and GUI applications beyond the initial World of Warcraft implementation.
 
+## Development Setup
+
+The project is managed with [uv](https://docs.astral.sh/uv/) and requires Python 3.11+.
+
+```powershell
+# Create the virtual environment and install the package with dev dependencies
+uv sync --extra dev
+```
+
+`uv sync` installs the project in editable mode into `.venv/` and activates it for all `uv run` commands below.
+
+## Phase 1 — Screen Observation
+
+The first milestone of the project (see `docs/high-level-development-plan.md`,
+section 15) ships with this release:
+
+* **Screen capture** — `Capture` facade over a swappable backend. The `mss`
+  backend captures real screens on Windows; a deterministic `mock` backend
+  supports CI and replay.
+* **Configurable capture region** — `capture.region: {x, y, width, height}`
+  in `config/default.yaml` selects a sub-rectangle.
+* **Optional downscaling** — `capture.scale` (1.0 = no scaling) resizes each
+  frame with deterministic nearest-neighbor sampling after region extraction.
+* **FPS pacing + measurement** — `Capture.wait_next_frame()` paces the loop
+  per `capture.fps`; `FpsMeter` reports the measured rate over a run.
+* **Recording** — `Recorder` writes each frame as PNG to `record.directory`,
+  rotating out the oldest files beyond `record.max_files`.
+* **Screenshot viewer (CLI)** — `ai-game-agent` exposes two subcommands:
+  `capture` (single frame) and `observe` (loop + measured FPS).
+
+### CLI usage
+
+```powershell
+# One screenshot from the primary monitor, saved to ./screenshots
+uv run ai-game-agent capture --backend mss --out shots/
+
+# A 30-frame capture loop with measured FPS (no recording)
+uv run ai-game-agent observe --backend mss --frames 30 --fps 30
+
+# Headless / CI: mock backend, no pacing, record 5 frames
+uv run ai-game-agent observe --backend mock --frames 5 --fps 0 --record --out rec/
+
+# Region of interest (x,y,width,height)
+uv run ai-game-agent capture --backend mss --region 0,0,1920,1080 --out shots/
+```
+
+`--fps 0` disables pacing (no sleeps) and is the right choice for tests,
+CI, and fast debug runs. All CLI options default to the values in
+`config/default.yaml` where applicable.
+
+## Running the Unit Tests
+
+All commands are run from the repository root.
+
+### Run the full test suite
+
+```powershell
+uv run pytest
+```
+
+### Run a single test file
+
+```powershell
+uv run pytest tests/test_config.py
+```
+
+### Run a single test by node ID
+
+```powershell
+uv run pytest tests/test_capture.py::test_capture_applies_region
+```
+
+### Run only tests matching a keyword
+
+```powershell
+uv run pytest -k region
+```
+
+### Verbose output with traceback detail
+
+```powershell
+uv run pytest -v --tb=short
+```
+
+### Stop at the first failure (TDD red/green loop)
+
+```powershell
+uv run pytest -x
+```
+
+### End-to-end tests
+
+```powershell
+uv run pytest -m e2e       # only E2E
+uv run pytest -m "not e2e" # unit + integration only
+```
+
+The E2E suite (`tests/e2e/`) spawns the real CLI (`python -m ai_game_agent`) as
+a subprocess and asserts on exit codes, stdout/stderr routing, and files on
+disk — the observable contract a user or CI job experiences. It is headless
+(`--backend mock --fps 0`), so it runs in CI without a desktop session.
+
+Notes:
+
+* Tests are deterministic and headless — they use the `mock` capture backend and injected clocks, so they run in CI without a display, a game, or Ollama.
+* The package is laid out as `src/ai_game_agent`; pytest picks this up automatically via `pythonpath = ["src"]` in `pyproject.toml`, so no manual `pip install` step is required when using `uv run`.
+* If you are not using uv, the equivalent flow is: `python -m venv .venv`, activate the venv, `pip install -e ".[dev]"`, then `pytest`.
+
+## Configuration
+
+Runtime configuration lives in `config/` (YAML) and is loaded through `ai_game_agent.config.load_config()`. See `config/default.yaml` for the full schema with comments.
+
 > **Note:** Automated interaction with online games may violate the terms of service of the game being controlled. This project is primarily intended as an exploration of local AI agents, computer vision, multimodal reasoning, and GUI automation.
