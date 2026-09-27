@@ -57,4 +57,65 @@ The project aims to explore how modern multimodal AI and local computer-use agen
 
 The architecture is intended to remain generic enough to support additional games and GUI applications beyond the initial World of Warcraft implementation.
 
+## Development Setup
+
+The project is managed with [uv](https://docs.astral.sh/uv/) and requires Python 3.11+.
+
+```powershell
+# Create the virtual environment and install the package with dev dependencies
+uv sync --extra dev
+```
+
+`uv sync` installs the project in editable mode into `.venv/` and activates it for all `uv run` commands below.
+
+## Running the Unit Tests
+
+All commands are run from the repository root.
+
+### Run the full test suite
+
+```powershell
+uv run pytest
+```
+
+### Run a single test file
+
+```powershell
+uv run pytest tests/test_config.py
+```
+
+### Run a single test by node ID
+
+```powershell
+uv run pytest tests/test_capture.py::test_capture_applies_region
+```
+
+### Run only tests matching a keyword
+
+```powershell
+uv run pytest -k region
+```
+
+### Verbose output with traceback detail
+
+```powershell
+uv run pytest -v --tb=short
+```
+
+### Stop at the first failure (TDD red/green loop)
+
+```powershell
+uv run pytest -x
+```
+
+Notes:
+
+* Tests are deterministic and headless — they use the `mock` capture backend and injected clocks, so they run in CI without a display, a game, or Ollama.
+* The package is laid out as `src/ai_game_agent`; pytest picks this up automatically via `pythonpath = ["src"]` in `pyproject.toml`, so no manual `pip install` step is required when using `uv run`.
+* If you are not using uv, the equivalent flow is: `python -m venv .venv`, activate the venv, `pip install -e ".[dev]"`, then `pytest`.
+
+## Configuration
+
+Runtime configuration lives in `config/` (YAML) and is loaded through `ai_game_agent.config.load_config()`. See `config/default.yaml` for the full schema with comments.
+
 > **Note:** Automated interaction with online games may violate the terms of service of the game being controlled. This project is primarily intended as an exploration of local AI agents, computer vision, multimodal reasoning, and GUI automation.

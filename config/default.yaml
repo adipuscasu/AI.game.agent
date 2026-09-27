@@ -1,0 +1,44 @@
+# Default configuration for ai-game-agent.
+#
+# Load with:  from ai_game_agent.config import load_config
+#             cfg = load_config()                 # resolves config/default.yaml
+#             cfg = load_config("development.yaml")  # relative to repo root
+#
+# Every value here is also a valid default in code (ai_game_agent.config.Config),
+# so this file documents the schema rather than defining it.
+
+# AI provider (Phase 5+; local-first via Ollama).
+ai:
+  provider: ollama
+  model: qwen3.8:27b
+  base_url: http://localhost:11434
+
+# Screen capture (Phase 1).
+capture:
+  # Capture backend. "mss" is the default Windows backend (requires the
+  # "capture" extra). Use "mock" for CI / replay without a desktop session.
+  backend: mss
+  # Optional region of interest in pixels: {x, y, width, height}.
+  # null = capture the full primary monitor.
+  region: null
+  # Target capture rate; frames closer together are dropped.
+  fps: 30
+  # Optional downscale factor applied after capture (1.0 = no scaling).
+  scale: 1.0
+  # Screenshot recording.
+  record:
+    enabled: false
+    directory: recordings
+    max_files: 1000
+
+# Safety (Phase 3+).
+safety:
+  emergency_stop_keys:
+    - F12
+  max_action_duration_ms: 5000
+  max_consecutive_actions: 50
+
+# Logging.
+logging:
+  level: INFO
+  directory: logs
