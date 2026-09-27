@@ -462,6 +462,24 @@ Replay testing should become the primary mechanism for regression testing percep
 
 # Testing
 
+## Test-Driven Development (TDD)
+
+This project is developed using **Test-Driven Development (TDD)**.
+
+TDD is mandatory for all new features and bug fixes, not optional:
+
+1. **Red** — write a failing test that describes the desired behavior before writing the implementation.
+2. **Green** — write the minimum code required to make the test pass.
+3. **Refactor** — improve the implementation while keeping all tests green.
+
+Additional TDD rules:
+
+* Do not write production code without a corresponding failing test first.
+* Do not commit an implementation without its tests passing.
+* Bug fixes require a regression test that fails before the fix and passes after it.
+* Tests define the expected behavior; production code must conform to the tests, not the other way around.
+* Tests must be deterministic, independent, and runnable in CI without a desktop session or a live game.
+
 ## Unit Tests
 
 Test independently:
@@ -665,17 +683,18 @@ Do not commit:
 
 # Development Workflow
 
-Before implementing a feature:
+Before implementing a feature (TDD):
 
 1. Understand the relevant architecture.
 2. Identify the correct layer.
 3. Check existing abstractions.
 4. Avoid duplicating functionality.
 5. Define the smallest useful change.
-6. Implement the change.
-7. Add or update tests.
-8. Run relevant checks.
-9. Update documentation if the architecture changed.
+6. Write a failing test for the desired behavior (red).
+7. Implement the minimum code to make the test pass (green).
+8. Refactor while keeping tests green.
+9. Run the full relevant test suite.
+10. Update documentation if the architecture changed.
 
 When debugging:
 
@@ -698,7 +717,7 @@ When modifying this repository, an AI coding agent should:
 * avoid unnecessary rewrites
 * keep changes localized
 * explain significant architectural changes
-* add tests for non-trivial behavior
+* follow TDD: write a failing test before implementation, then the minimum code to pass
 * never introduce credentials
 * never disable safety mechanisms to make a test pass
 * never bypass the action-executor abstraction
@@ -716,7 +735,8 @@ A feature is considered complete when:
 * the implementation is integrated into the correct architectural layer
 * public interfaces are documented
 * errors are handled
-* relevant tests exist
+* relevant tests exist, were written first (TDD), and pass
+* the full relevant test suite is green
 * safety requirements are satisfied
 * no secrets are introduced
 * logging is sufficient for debugging
