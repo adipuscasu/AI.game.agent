@@ -1,7 +1,8 @@
 # Phase 2 Implementation Plan — Basic Computer Vision
 
 **Date:** 2026-09-27
-**Status:** Approved
+**Status:** In progress — build steps 1–4 of §12 complete, 5–9 outstanding (see §14).
+        Template-asset policy (§13) is the one open decision gating the step 8 demo.
 **Scope:** Convert Phase 1 screenshots into structured information: template
 matching, UI-region detection, OCR, and (optional) basic object detection.
 
@@ -480,13 +481,116 @@ long before any heavy dependency is required.
 
 ## 13. Open questions (resolve before step 4)
 
-* **Template asset policy**: do we commit a small set of synthetic sample
-  templates under `assets/templates/` (recommended: yes, tiny PNGs, MIT), or
-  keep the repo asset-free and generate them in-test? Leaning: commit, so
-  `analyze` is demoable out of the box.
-* **OCR default**: keep `pytesseract` as the only engine in Phase 2 and
-  defer the "real" engine decision (easyocr vs paddleocr vs a VLM reading
-  text in Phase 5) to the Phase 5 review? Leaning: yes.
-* **`Observation` versioning**: add an explicit `schema_version: int = 1`
-  field now (cheap) so Phase 4/5 consumers can guard against shape drift?
-  Leaning: yes.
+* **Template asset policy** — *open; the only blocking decision.* Do we
+  commit a small set of synthetic sample templates under `assets/templates/`
+  (recommended: yes, tiny PNGs, MIT), or keep the repo asset-free and
+  generate them in-test? Leaning: commit, so `analyze` is demoable out of
+  the box. No `assets/` directory exists in the repo yet. This decision gates
+  the step 8 (`analyze`) demo and the §7.3 done-criteria, but steps 5–7 are
+  independent of it and can proceed in the meantime.
+* **OCR default** — *resolved: yes.* `pytesseract` is the default engine
+  (`perception.ocr.engine` default in `config.py`, `ocr` extra declared in
+  `pyproject.toml`); the "real" engine decision is deferred to the Phase 5
+  review. (The adapter in `ocr.py` is still pending — step 7.)
+* **`Observation` versioning** — *resolved: yes.* Implemented in step 1:
+  `Observation.schema_version` with `SCHEMA_VERSION = 1` in
+  `perception/observation.py`.
+
+---
+
+## 14. Status & remaining work (as of this update)
+
+Completion status of the §12 build order, verified against the code:
+
+| Step | Item | Status |
+|---|---|---|
+| 1 | `Observation` + sub-models + `to_dict`/`to_json` + `schema_version` | ✅ Done — `perception/observation.py`, `tests/test_observation.py` |
+| 2 | `PerceptionConfig` + `default.yaml` `perception:` block | ✅ Done — `config.py`, `config/default.yaml`, `tests/test_perception_config.py` |
+| 3 | `base.py` protocols + `Perception` pipeline (fake detectors) | ✅ Done — `perception/base.py`, `perception/pipeline.py`, `tests/test_pipeline.py` |
+| 4 | `template.py` — `CvTemplateMatcher` | ✅ Done — `perception/template.py`, `tests/test_template_matcher.py` (see note below) |
+| 5 | `ui.py` — zone checks | ❌ Not started — no `ui.py`, no `tests/test_ui_zones.py` |
+| 6 | `objects.py` — `ColorBlobsDetector` | ❌ Not started — no `objects.py`, no `tests/test_objects.py` |
+| 7 | `ocr.py` — `pytesseract` adapter | ❌ Not started — no `ocr.py`, no `tests/test_ocr.py` |
+| 8 | `analyze` CLI subcommand + e2e tests | ❌ Not started — `__main__.py` has only `capture`/`observe`; none of the §7.2 analyze e2e tests exist |
+| 9 | README + config example + `docs/` cross-links | ⚠️ Partial — `default.yaml` example block done; README has no Phase 2 section |
+
+### Next up (verified 2026-09-27 against the tree)
+
+1. **Decide §13 "Template asset policy"** — one-line decision; only it gates
+   the `analyze` out-of-the-box demo. Everything below can start without it.
+2. **Step 5 → 6 → 7** in that order (`ui.py`, `objects.py`, `ocr.py`): each is
+   TDD — write `tests/test_ui_zones.py` / `test_objects.py` / `test_ocr.py`
+   red first, then the minimal implementation green, then refactor. `ui.py`
+   and `objects.py` need the `vision` extra; `ocr.py` needs the `ocr` extra
+   only at runtime (tests inject fakes).
+3. **Step 8** (`analyze` CLI) — depends on 2 (wires the real detectors) and on
+   decision 1 (demoable templates). Includes the `main()` catch-tuple
+   extension for `ConfigError` + `PerceptionError` and the §7.2 e2e suite.
+4. **Step 9** (README Phase 2 section) — last, once `analyze` is stable.
+
+### Remaining work, item by item
+
+1. **`perception/ui.py` (step 5)** — `UiRegionDetector` implementing the
+   closed set of zone checks from §5.2 (`presence`, `brightness`,
+   `color_present`; the config side already validates this set in
+   `config.py`), emitting `TemplateHit(template=f"ui:{zone_name}")`. Wire it
+   into `Perception`'s injection point and add `tests/test_ui_zones.py`
+   (§7.1) first, per TDD.
+2. **`perception/objects.py` (step 6)** — `ColorBlobsDetector`
+   (`cv2.inRange` + `cv2.connectedComponents` per §5.4) implementing the
+   `ObjectDetector` protocol, plus `tests/test_objects.py` first.
+3. **`perception/ocr.py` (step 7)** — `TesseractEngine` behind the
+   `OcrEngine` protocol (lazy `pytesseract` import; missing
+   engine/binary → `"ocr: ..."` in `detector_errors`, never a pipeline
+   failure), plus `tests/test_ocr.py` using a `FakeOcrEngine`.
+4. **`analyze` subcommand (step 8)** — in `__main__.py`:
+   * one-frame capture via the existing `Capture` facade, run
+     `Perception.observe(frame)`, print `observation.to_json()` to stdout;
+   * `--config PATH` (default: `load_config()`'s own default) — first CLI
+     command to load a config file;
+   * `--no-templates` / `--no-ocr` / `--no-objects` / `--pretty` flags;
+   * extend `main()`'s catch tuple — currently
+     `(ValueError, CaptureError, OSError)` — to also catch `ConfigError`
+     and `PerceptionError` (neither is a `ValueError` subclass), and import
+     them;
+   * e2e tests per §7.2: `test_analyze_prints_json`,
+     `test_analyze_error_routing`, `test_analyze_disabled_subsystems`,
+     `test_analyze_config_file`, plus the §9 regression test
+     (`analyze --config <bad.yaml>` ⇒ exit 1, `error:` on stderr, empty
+     stdout).
+5. **README (step 9)** — add the Phase 2 section: install with extras
+   (`uv sync --extra dev --extra vision --extra ocr`), `analyze` usage,
+   and the `perception:` config example; cross-link from `docs/`.
+6. **Template assets** — decide §13's asset policy and, if committing,
+   add tiny synthetic PNGs under `assets/templates/` so `analyze` is
+   demoable out of the box.
+
+### Known cleanup
+
+* `CvTemplateMatcher.match()` in `perception/template.py` repeats the
+  template-size-vs-frame validation block verbatim (dead duplicated code);
+  remove the second copy when next touching this file.
+
+### Definition of done (§7.3) — remaining
+
+* Steps 1–4 deliverables satisfy the first three bullets (contract
+  importable and testable in a bare venv; `default.yaml` carries the
+  commented `perception:` block). Still outstanding:
+  * `uv run pytest` green *including* the new `ui`/`ocr`/`objects` unit
+    tests and the `analyze` e2e tests;
+  * `uv run ai-game-agent analyze --backend mock` printing valid JSON (needs
+    step 8);
+  * README Phase 2 section (needs step 9).
+
+Verification checklist when closing the phase:
+
+```text
+[ ] uv run pytest                        # unit + e2e green, no desktop needed
+[ ] uv run ruff check src tests          # clean
+[ ] uv run ai-game-agent analyze --backend mock            # valid JSON on stdout
+[ ] uv run ai-game-agent analyze --backend mock --pretty   # human-readable
+[ ] uv run ai-game-agent analyze --backend doesnotexist    # exit 1, "error:" on stderr, empty stdout
+[ ] uv run ai-game-agent analyze --backend mock --config <bad.yaml>  # same error contract
+[ ] assets/templates/ present with sample PNGs (if §13 decision = commit)
+[ ] README: Phase 2 section, extras install, analyze usage, perception: config example
+```

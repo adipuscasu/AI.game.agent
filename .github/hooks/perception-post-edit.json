@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "type": "command",
+        "command": "bash scripts/validate-perception.sh",
+        "windows": "powershell -NoProfile -File scripts/validate-perception.ps1",
+        "timeout": 120
+      }
+    ]
+  }
+}

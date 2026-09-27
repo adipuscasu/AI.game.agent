@@ -18,6 +18,20 @@ The initial target is **World of Warcraft**, with the long-term goal of providin
 * 🧠 Short-term and persistent agent memory
 * 🛑 Independent emergency-stop and safety mechanisms
 * 📊 Detailed decision and action logging
+
+## Testing and Development Workflow
+
+The project follows a strict Test-Driven Development (TDD) lifecycle.
+
+**Unit and Integration Testing:**
+The unit and integration test suite is managed by `pytest`. The stable command to run all tests is:
+
+\`\`\`bash
+uv run pytest
+\`\`\`
+
+The currently detected version of `pytest` is 9.1.1. Remember to run tests from the root directory of the workspace.
+
 * 🔬 Replay and testing of recorded sessions
 * 🧩 Game-independent core with pluggable game adapters
 * 🏠 Designed for local execution and privacy
