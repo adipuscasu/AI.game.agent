@@ -1,89 +1,164 @@
-from typing import List, Optional
-import cv2
-import numpy as np
+"""Color-blob object detection (Phase 2, step 6).
 
-from ai_game_agent.perception.base import ObjectDetector, Frame
-from ai_game_agent.perception.observation import Observation, BlobHit
+``ColorBlobsDetector`` implements the :class:`ai_game_agent.perception.base.
+ObjectDetector` protocol (structural — no base class needed)::
+
+    match(frame: Frame) -> list[ObjectHit]
+
+It finds blobs of a configured RGB color (within a per-channel tolerance)
+using OpenCV thresholding + contour analysis. Design rules:
+
+* ``cv2`` / ``numpy`` are imported at module top — they are required extras,
+  and this module is imported only when the subsystem is selected
+  (``PerceptionConfig.objects_enabled`` and the color list are non-empty),
+  so a bare venv without the extras never loads it.
+* A single configured color may produce multiple :class:`ObjectHit`
+  entries (one per detected blob) sharing the same ``kind``.
+* Per-blob failures are not raised; the pipeline records any exception in
+  ``Observation.detector_errors`` and continues.
+* Setup failures (missing dependency) raise :class:`PerceptionError` so the
+  CLI can fail fast with a clean ``error:`` line.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ai_game_agent.capture import Frame
+from ai_game_agent.perception.base import PerceptionError
+from ai_game_agent.perception.observation import BBox, ObjectHit
+
+try:
+    import cv2
+    import numpy as np
+except ImportError as exc:  # pragma: no cover - exercised only without extras
+    raise PerceptionError(
+        "color-blob detection requires OpenCV and NumPy; "
+        "install the 'vision' extra (pip install ai-game-agent[vision])"
+    ) from exc
+
+__all__ = ["ColorBlobsDetector", "MIN_BLOB_AREA"]
+
+# Contours smaller than this (in pixels^2) are treated as noise and dropped.
+MIN_BLOB_AREA = 16
+
+# Confidence ceiling: a blob that covers this fraction of the frame gets 1.0.
+_MAX_AREA_FRACTION = 256
+
 
 class ColorBlobsDetector:
+    """Detects colored blobs (e.g. loot glows, hit markers) in a frame.
+
+    Each configured color is an RGB triple with a per-channel tolerance;
+    the detector threshold-masks the frame in BGR space and reports every
+    contour whose area clears ``MIN_BLOB_AREA`` as an :class:`ObjectHit`.
+
+    Parameters
+    ----------
+    colors:
+        Sequence of color specs, each a dict with keys ``name`` (str),
+        ``rgb`` (3-element list/tuple of ints 0-255), and optional
+        ``tolerance`` (int, default 40). A ``None`` / empty sequence is
+        accepted and simply yields no hits.
+    min_area:
+        Minimum contour area (px^2) for a blob to count (default 16).
     """
-    Detects objects in a frame based on user-defined color ranges (blobs).
-    This implements the ObjectDetector protocol contract.
-    """
-    def __init__(self, config: dict):
-        """
-        Initializes the detector with color range configurations.
-        :param config: Dictionary containing color-specific detection configs.
-        """
-        if 'blobs' not in config:
-            raise ValueError("Configuration must include a 'blobs' section for color detection.")
-        self.blobs_config = config['blobs']
-        # The actual OpenCV/Numpy loading and setup for color space conversion happens here.
-        print("ColorBlobsDetector initialized successfully.")
 
-    def detect(self, frame: Frame) -> Optional[List[Observation]]:
-        """
-        Processes the frame to find color blobs and returns the structured observations.
-        :param frame: The captured frame data.
-        :return: A list of Observations, or None if no blobs are found.
-        """
-        # --- BEGIN GREEN PHASE IMPLEMENTATION ---
-        # 1. Convert frame to suitable color space (e.g., HSV for better color separation)
-        hsv_frame = cv2.cvtColor(frame.data, cv2.COLOR_RGB2HSV)
-        
-        detected_blobs: List[Observation] = []
+    def __init__(
+        self,
+        colors: Any,
+        *,
+        min_area: int = MIN_BLOB_AREA,
+    ) -> None:
+        if min_area < 1:
+            raise ValueError("min_area must be >= 1")
+        self._min_area = int(min_area)
+        self._colors = _normalize_colors(colors)
 
-        # 2. Iterate through defined blob colors and create masks
-        for blob_name, color_range in self.blobs_config.items():
-            # Placeholder: In a real implementation, we'd use cv2.inRange to create a mask
-            # Example simplified mask generation logic:
-            try:
-                # Assuming color_range has lower and upper bounds for HSV
-                lower_hsv = np.array([*color_range['lower']])
-                upper_hsv = np.array([*color_range['upper']])
-                
-                mask = cv2.inRange(hsv_frame, lower_hsv, upper_hsv)
-                
-                # 3. Find contours on the mask
-                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                for contour in contours:
-                    # Simple filtering based on minimum size (area)
-                    if cv2.contourArea(contour) > 50:
-                        # Calculate bounding box
-                        x, y, w, h = cv2.boundingRect(contour)
-                        
-                        # Create a detection result
-                        blob_hit = BlobHit(
-                            bbox=(x, y, w, h), 
-                            color=blob_name, 
-                            confidence=min(1.0, cv2.contourArea(contour) / 5000.0)
-                        )
-                        
-                        # Create Observation for the pipeline
-                        obs = Observation(
-                            type="BlobDetection",
-                            data={"hit": blob_hit},
-                            confidence=blob_hit.confidence
-                        )
-                        detected_blobs.append(obs)
-            except Exception as e:
-                print(f"Error processing blob {blob_name}: {e}")
-                continue
+    # -- protocol ------------------------------------------------------------
+    def match(self, frame: Frame) -> list[ObjectHit]:
+        """Return one :class:`ObjectHit` per detected blob (empty list if none)."""
+        img = _frame_to_bgr(frame)
+        hits: list[ObjectHit] = list()
+        for spec in self._colors:
+            hits.extend(_match_color(img, spec, self._min_area))
+        return hits
 
-        return detected_blobs if detected_blobs else None
-        # --- END GREEN PHASE IMPLEMENTATION ---
+    # -- introspection -------------------------------------------------------
+    @property
+    def colors(self) -> tuple[dict[str, object], ...]:
+        """The configured color specs (as plain dicts)."""
+        return tuple(dict(c) for c in self._colors)
 
-# Define necessary mocks/structs locally for the file to be self-contained/testable
-# These should ideally come from the imports, but are included here for structural completion.
-class MockBlobHit:
-    def __init__(self, bbox, color, confidence):
-        self.bbox = bbox
-        self.color = color
-        self.confidence = confidence
-    
-# We assume these imports are handled by the calling module structure
-# from ai_game_agent.perception.observation import Observation, BlobHit
-# from ai_game_agent.perception.base import ObjectDetector, Frame
-# We mock them here to allow the structure to exist.
 
+# -- helpers -------------------------------------------------------------
+
+def _normalize_colors(colors: Any) -> list[dict[str, object]]:
+    """Accept a dict, a list of dicts, or an empty value; return a list of
+    color-spec dicts with ``name`` / ``rgb`` / ``tolerance`` keys."""
+    if colors is None:
+        return []
+    if isinstance(colors, dict):
+        # Accept a mapping name -> spec, or name -> [r, g, b].
+        items: list[dict[str, object]] = []
+        for name, spec in colors.items():
+            items.append(_one_spec(name, spec))
+        return items
+    if isinstance(colors, (list, tuple)):
+        return [_one_spec(c.get("name", f"color_{i}"), c) for i, c in enumerate(colors)]
+    raise ValueError(f"unsupported color spec: {colors!r}")
+
+
+def _one_spec(name: object, spec: Any) -> dict[str, object]:
+    if isinstance(spec, (list, tuple)) and len(spec) == 3:
+        spec = {"rgb": list(spec)}
+    if not isinstance(spec, dict):
+        raise ValueError(f"color spec for {name!r} must be a dict or [r, g, b] list")
+    rgb = spec.get("rgb")
+    if rgb is None:
+        raise ValueError(f"color spec for {name!r} missing 'rgb'")
+    if not isinstance(rgb, (list, tuple)) or len(rgb) != 3:
+        raise ValueError(f"color spec for {name!r} has invalid 'rgb'")
+    tol = int(spec.get("tolerance", 40))
+    if tol < 0:
+        raise ValueError(f"color spec for {name!r} has negative tolerance")
+    return {
+        "name": str(name),
+        "rgb": [int(v) for v in rgb],
+        "tolerance": tol,
+    }
+
+
+def _frame_to_bgr(frame: Frame) -> "np.ndarray":
+    """Convert a :class:`Frame` (row-major RGB bytes) to a BGR ``uint8`` array."""
+    arr = np.frombuffer(frame.pixels, dtype=np.uint8).reshape(frame.height, frame.width, 3)
+    # RGB -> BGR (single conversion site; base types stay RGB).
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+
+def _match_color(img: "np.ndarray", spec: dict[str, object], min_area: int) -> list[ObjectHit]:
+    """Find all blobs of ``spec``'s color in ``img`` (BGR uint8)."""
+    rgb = spec["rgb"]  # [r, g, b] ints 0-255
+    tol = int(spec["tolerance"])
+    bgr = [int(rgb[2]), int(rgb[1]), int(rgb[0])]  # RGB -> BGR
+    lower = np.array([max(0, c - tol) for c in bgr], dtype=np.uint8)
+    upper = np.array([min(255, c + tol) for c in bgr], dtype=np.uint8)
+    mask = cv2.inRange(img, lower, upper)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    hits: list[ObjectHit] = []
+    frame_area = int(img.shape[0] * img.shape[1]) or 1
+    name = str(spec["name"])
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        confidence = min(1.0, area / max(1.0, frame_area / _MAX_AREA_FRACTION))
+        hits.append(
+            ObjectHit(
+                kind=name,
+                bbox=BBox(x=int(x), y=int(y), width=int(w), height=int(h)),
+                confidence=round(confidence, 4),
+            )
+        )
+    return hits

@@ -21,20 +21,50 @@ Usage::
     ai-game-agent capture --backend mss --out shots/
     ai-game-agent observe --backend mock --frames 30 --fps 0 --record --out rec/
 
+``analyze``
+    Run one capture and pass the frame through the perception pipeline
+    (template matching → UI zones → OCR → object blobs), printing the
+    resulting ``Observation`` as JSON. Detector failures are recorded in
+    the observation's ``detector_errors`` list rather than aborting. The
+    subsystems run based on ``config/default.yaml`` (or ``--config``) and
+    can be individually disabled with ``--no-templates`` / ``--no-ocr`` /
+    ``--no-objects``. With nothing configured, the observation is empty
+    (Phase 1 behavior).
+
+Usage::
+
+    ai-game-agent capture --backend mss --out shots/
+    ai-game-agent observe --backend mock --frames 30 --fps 0 --record --out rec/
+
     # region example (CLI-only):
     ai-game-agent capture --backend mss --region 0,0,1920,1080
+
+    # perception analysis (needs the "vision" / "ocr" extras to actually run)
+    ai-game-agent analyze --backend mock --no-ocr --no-objects --pretty
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import time
 from pathlib import Path
 
 from ai_game_agent.capture import Capture, CaptureError, FpsMeter, save_frame
-from ai_game_agent.config import CaptureConfig, LoggingConfig, Region
+from ai_game_agent.config import (
+    CaptureConfig,
+    ConfigError,
+    LoggingConfig,
+    PerceptionConfig,
+    Region,
+    load_config,
+)
+from ai_game_agent.perception import Perception, PerceptionError
+from ai_game_agent.perception.color_blobs import ColorBlobsDetector
+from ai_game_agent.perception.ocr import TesseractEngine
+from ai_game_agent.perception.template import CvTemplateMatcher
 
 log = logging.getLogger("ai_game_agent")
 
@@ -147,6 +177,84 @@ def _observe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_perception(args: argparse.Namespace, cfg) -> Perception:
+    """Assemble a :class:`Perception` from the loaded config and CLI flags.
+
+    Each subsystem is included only if the config enables it *and* the user
+    has not opted out via the matching ``--no-*`` flag. Detectors are
+    constructed lazily so a missing optional extra only surfaces when the
+    subsystem is actually selected (and only when it is selected does the
+    pipeline fail fast if the extra is absent).
+    """
+    perception = cfg.perception
+    templates_cfg = perception.templates or {}
+    if getattr(args, "no_templates", False):
+        templates_cfg = {}
+    template_matcher = (
+        CvTemplateMatcher(templates_cfg, threshold=perception.template_threshold)
+        if templates_cfg
+        else None
+    )
+    ui_zones = perception.ui_zones
+    if getattr(args, "no_templates", False):
+        # UI zones are gated by the same ``--no-templates`` flag; the flag is
+        # about "template-matching-ish vision subsystems" (templates + ui
+        # zones) versus text (OCR) versus blobs (objects).
+        ui_zones = ()
+    ocr_regions = list(perception.ocr_regions) if perception.ocr_enabled else []
+    if getattr(args, "no_ocr", False):
+        ocr_regions = []
+    ocr_engine = TesseractEngine() if ocr_regions else None
+    object_colors = (
+        list(perception.object_colors) if perception.objects_enabled else []
+    )
+    if getattr(args, "no_objects", False):
+        object_colors = []
+    object_detector = (
+        ColorBlobsDetector(object_colors)
+        if object_colors
+        else None
+    )
+    perception_cfg = PerceptionConfig(
+        enabled=perception.enabled,
+        template_threshold=perception.template_threshold,
+        templates=dict(templates_cfg),
+        ui_zones=ui_zones,
+        ocr_enabled=bool(ocr_regions),
+        ocr_regions=tuple(ocr_regions),
+        objects_enabled=bool(object_colors),
+        object_colors=tuple(object_colors),
+    )
+    return Perception(
+        perception_cfg,
+        template_matcher=template_matcher,
+        ui_detector=None,  # ui zones: no standalone detector in Phase 2
+        ocr_engine=ocr_engine,
+        object_detector=object_detector,
+    )
+
+
+def _analyze(args: argparse.Namespace) -> int:
+    cfg = load_config(getattr(args, "config", None))
+    cap = _build_capture(
+        args,
+        record_enabled=False,
+        record_dir=Path("screenshots"),
+        record_max_files=1000,
+    )
+    with cap:
+        frame = cap.grab()
+    perception = _build_perception(args, cfg)
+    observation = perception.observe(frame)
+    if getattr(args, "pretty", False):
+        text = json.dumps(observation.to_dict(), indent=2)
+    else:
+        text = json.dumps(observation.to_dict(), sort_keys=True)
+    print(text)
+    log.info("analyze: frame=%dx%d detectors=%d", frame.width, frame.height, len(observation.detector_errors))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ai-game-agent", description=__doc__)
     sub = parser.add_subparsers(dest="command")
@@ -174,6 +282,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_obs.add_argument("--record-max-files", type=int, default=1000)
     p_obs.add_argument("--out", default="recordings")
     p_obs.set_defaults(func=_observe)
+
+    p_an = sub.add_parser(
+        "analyze", help="Capture one frame and print the perception Observation as JSON."
+    )
+    p_an.add_argument("--backend", default="mss", help="capture backend (mss | mock)")
+    p_an.add_argument("--region", default=None, help="x,y,width,height (integers)")
+    p_an.add_argument("--scale", default=None, help="downscale factor (e.g. 0.5)")
+    p_an.add_argument("--fps", type=int, default=0, help="0 = no pacing (CLI default)")
+    p_an.add_argument("--config", default=None, help="YAML config file (default: config/default.yaml)")
+    p_an.add_argument("--no-templates", action="store_true",
+                      help="disable template matching and UI-zone checks")
+    p_an.add_argument("--no-ocr", action="store_true", help="disable OCR")
+    p_an.add_argument("--no-objects", action="store_true", help="disable color-blob object detection")
+    p_an.add_argument("--pretty", action="store_true", help="pretty-print JSON output")
+    p_an.set_defaults(func=_analyze)
     return parser
 
 
@@ -187,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging()
     try:
         return int(args.func(args))
-    except (ValueError, CaptureError, OSError) as exc:
+    except (ValueError, CaptureError, ConfigError, PerceptionError, OSError) as exc:
         # OSError covers genuine I/O failures (permission, full disk,
         # read-only target) raised by save_frame/Recorder while writing
         # frames; translating it here keeps the CLI's clean "error:" +
