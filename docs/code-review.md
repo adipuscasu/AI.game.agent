@@ -190,3 +190,42 @@ wrapping the write in `save_frame` into a `CaptureError`.
 2. `uv run ruff check src tests --fix` for the four dead imports.
 3. Optionally broaden `main()`'s `except` to include `OSError` (N2).
 4. Optionally document/adjust the FPS-ceiling behavior (N1).
+
+---
+
+## Phase 2 — current state (updated 2026-10-03, HEAD `15fba73`)
+
+> Supersedes the transient review at `0c03ec1`. Verified with `python3 -m pytest -q`
+> and by importing each module against the real package.
+
+**Verdict:** Phase 2 steps 1–4 are green; the three 🔴 criticals from the prior
+review (broken `test_pipeline.py`, API-mismatch `test_objects.py`, stray root
+`perception/` drafts) are **resolved**. Full suite: **137 passed, 1 failed** — the
+single failure is `tests/test_mss_backend.py` failing because the optional `mss`
+extra is not installed in this environment (should skip, not fail).
+
+### Still open
+
+| # | Sev | Where | Finding |
+|---|-----|-------|---------|
+| 1 | 🟠 | `perception/objects.py` | Broken at runtime: `super().__init__(config)` on a `Protocol`; `BBox`/`DetectedObject` used without import; `self.config.get(...)` on a frozen config; `ObjectHit(object_type=…, detection_source=…)` vs real `(kind, bbox, confidence)`; reads `frame.image` (real `Frame` → `pixels`/`to_image()`); defines `run()` not `match()`; `print()` logging |
+| 2 | 🟠 | `perception/color_blobs.py` | Import error: imports nonexistent `BlobHit`; uses `frame.data`; returns `List[Observation]`. Dead code — delete or fix |
+| 3 | 🟡 | `assets/templates/target_frame.png` | Not a valid PNG (`PIL.UnidentifiedImageError`); blocks the template/step-8 demo |
+| 4 | 🟡 | `tests/test_mss_backend.py` | Fails instead of skipping when `mss` is absent — add a `pytest.skip` guard |
+| 5 | ⚪ | repo (39 files) | CRLF flip; no `.gitattributes` / `core.autocrlf=input` |
+
+### Not started (roadmap)
+
+Step 7 `perception/ocr.py` + `tests/test_ocr.py`; step 8 `analyze` subcommand
+(`__main__.py` still only `capture`/`observe`; the `except` tuple lacks
+`ConfigError`/`PerceptionError`); step 9 README Phase 2 section. `pyproject.toml`
+already ships the `vision` + `ocr` extras, so the dependency scaffolding is in place.
+
+### Suggested order
+
+1. Fix `objects.py` to the `ObjectDetector` protocol (`match(frame) -> list[ObjectHit]`, `ObjectHit(kind, bbox, confidence)`, no `print`) — or delete `color_blobs.py`.
+2. Replace `target_frame.png` with a valid synthetic PNG.
+3. `pytest.skip` guard in `tests/test_mss_backend.py`.
+4. Write `tests/test_objects.py` red→green.
+5. `core.autocrlf=input` (or add `.gitattributes` forcing LF).
+6. Proceed to steps 7–9.
