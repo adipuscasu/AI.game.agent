@@ -98,8 +98,9 @@ section 15) ships with this release:
   per `capture.fps`; `FpsMeter` reports the measured rate over a run.
 * **Recording** — `Recorder` writes each frame as PNG to `record.directory`,
   rotating out the oldest files beyond `record.max_files`.
-* **Screenshot viewer (CLI)** — `ai-game-agent` exposes two subcommands:
-  `capture` (single frame) and `observe` (loop + measured FPS).
+* **Screenshot viewer (CLI)** — `ai-game-agent` exposes three subcommands:
+  `capture` (single frame), `observe` (loop + measured FPS), and
+  `analyze` (one frame through the Phase 2 perception pipeline, JSON out).
 
 ### CLI usage
 
@@ -116,6 +117,27 @@ uv run ai-game-agent observe --backend mock --frames 5 --fps 0 --record --out re
 # Region of interest (x,y,width,height)
 uv run ai-game-agent capture --backend mss --region 0,0,1920,1080 --out shots/
 ```
+
+### Phase 2: perception (`analyze`)
+
+`analyze` captures one frame and runs it through the perception pipeline —
+UI region detection, template matching, OCR, and color-blob object detection
+— printing the structured `Observation` as JSON on stdout.
+
+```powershell
+# One frame from the mock backend, printed as JSON (CI-friendly, headless)
+uv run ai-game-agent analyze --backend mock --fps 0
+
+# Real capture from screen region 640,360 at 1920x1080, scaled 0.5x
+uv run ai-game-agent analyze --backend mss --region 640,360,1920,1080 --scale 0.5
+
+# Disable individual subsystems (OCR needs the "ocr" extra + Tesseract)
+uv run ai-game-agent analyze --no-ocr --no-objects --no-templates
+```
+
+Shared options with `capture`/`observe`: `--backend` (default `mss`), `--config`,
+`--region`, `--scale`, `--fps`, `--no-templates`, `--no-ocr`, `--no-objects`,
+`--pretty`, `-o/--out`. Errors go to `stderr` with an `error:` prefix and exit 1.
 
 `--fps 0` disables pacing (no sleeps) and is the right choice for tests,
 CI, and fast debug runs. All CLI options default to the values in
