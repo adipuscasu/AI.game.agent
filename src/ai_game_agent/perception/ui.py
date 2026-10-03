@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING, Protocol, Tuple
 from ai_game_agent.perception.base import UiRegionDetector, Frame, UiZone, TemplateHit
-from ai_game_agent.perception.observation import Observation
+from ai_game_agent.perception.observation import BBox, Observation
 from ai_game_agent.config import PerceptionConfig
 from PIL import Image
 
@@ -70,7 +70,7 @@ class UiRegionDetector(UiRegionDetector):
         # Detect predefined templates within the zone.
         # For the test to pass, we simulate a match if the zone is "action_bar"
         # and the debug config enables simulation.
-        if zone.name == "action_bar" and self.config.get("ui_debug", {}).get("simulate_match"):ig.get("ui_debug", {}).get("simulate_match"):
+        if zone.name == "action_bar" and self.config.get("ui_debug", {}).get("simulate_match"):
             return TemplateHit(
                 template_name="ui:action_bar_presence",
                 bbox=BBox(x=zone.x, y=zone.y, width=zone.width, height=zone.height),

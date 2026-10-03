@@ -1,8 +1,9 @@
 # Phase 2 Implementation Plan — Basic Computer Vision
 
-**Date:** 2026-09-27
-**Status:** In progress — build steps 1–4 of §12 complete, 5–9 outstanding (see §14).
-        Template-asset policy (§13) is the one open decision gating the step 8 demo.
+**Date:** 2026-10-03 (updated; originally 2026-09-27)
+**Status:** In progress — build steps 1–4 of §12 complete; steps 5–6 have code but
+        unverified test coverage; 7–9 outstanding (see §14).
+        Template-asset policy (§13) remains the open decision gating the step 8 demo.
 **Scope:** Convert Phase 1 screenshots into structured information: template
 matching, UI-region detection, OCR, and (optional) basic object detection.
 
@@ -484,9 +485,11 @@ long before any heavy dependency is required.
 * **Template asset policy** — *open; the only blocking decision.* Do we
   commit a small set of synthetic sample templates under `assets/templates/`
   (recommended: yes, tiny PNGs, MIT), or keep the repo asset-free and
-  generate them in-test? Leaning: commit, so `analyze` is demoable out of
-  the box. No `assets/` directory exists in the repo yet. This decision gates
-  the step 8 (`analyze`) demo and the §7.3 done-criteria, but steps 5–7 are
+  generate them in-test? Leaning: commit, so `analyze` is demoable out of the
+  box. Note: `assets/templates/` now exists but holds a single **invalid**
+  177-byte placeholder PNG (see §14), so the decision must land on either
+  replacing it with valid PNGs or deleting it. This decision gates the step 8
+  (`analyze`) demo and the §7.3 done-criteria, but steps 5–7 are
   independent of it and can proceed in the meantime.
 * **OCR default** — *resolved: yes.* `pytesseract` is the default engine
   (`perception.ocr.engine` default in `config.py`, `ocr` extra declared in
@@ -498,7 +501,7 @@ long before any heavy dependency is required.
 
 ---
 
-## 14. Status & remaining work (as of this update)
+## 14. Status & remaining work (as of 2026-10-03)
 
 Completion status of the §12 build order, verified against the code:
 
@@ -507,38 +510,65 @@ Completion status of the §12 build order, verified against the code:
 | 1 | `Observation` + sub-models + `to_dict`/`to_json` + `schema_version` | ✅ Done — `perception/observation.py`, `tests/test_observation.py` |
 | 2 | `PerceptionConfig` + `default.yaml` `perception:` block | ✅ Done — `config.py`, `config/default.yaml`, `tests/test_perception_config.py` |
 | 3 | `base.py` protocols + `Perception` pipeline (fake detectors) | ✅ Done — `perception/base.py`, `perception/pipeline.py`, `tests/test_pipeline.py` |
-| 4 | `template.py` — `CvTemplateMatcher` | ✅ Done — `perception/template.py`, `tests/test_template_matcher.py` (see note below) |
-| 5 | `ui.py` — zone checks | ❌ Not started — no `ui.py`, no `tests/test_ui_zones.py` |
-| 6 | `objects.py` — `ColorBlobsDetector` | ❌ Not started — no `objects.py`, no `tests/test_objects.py` |
+| 4 | `template.py` — `CvTemplateMatcher` | ✅ Done — `perception/template.py`, `tests/test_template_matcher.py` |
+| 5 | `ui.py` — zone checks | ⚠️ Code exists — `perception/ui.py` implements the closed check set, but `tests/test_ui_zones.py` is a self-contained stub that never imports the real module (see notes) |
+| 6 | `objects.py` — `ColorBlobsDetector` | ⚠️ Code exists — `perception/objects.py` (+ `perception/color_blobs.py`) present, but `tests/test_objects.py` was deleted in the working tree and must be restored against the real detector |
 | 7 | `ocr.py` — `pytesseract` adapter | ❌ Not started — no `ocr.py`, no `tests/test_ocr.py` |
 | 8 | `analyze` CLI subcommand + e2e tests | ❌ Not started — `__main__.py` has only `capture`/`observe`; none of the §7.2 analyze e2e tests exist |
 | 9 | README + config example + `docs/` cross-links | ⚠️ Partial — `default.yaml` example block done; README has no Phase 2 section |
 
-### Next up (verified 2026-09-27 against the tree)
+Verification notes (2026-10-03):
+
+* `uv run pytest` is green: **138 passed** in a bare environment (no
+  `vision`/`ocr` extras installed), so steps 1–4 hold the §7.3 contract in a
+  bare venv. The green run is, however, an overstatement of real coverage:
+  `tests/test_ui_zones.py` defines its own `MockObservation`/`MockTemplateHit`/
+  `MockBBox` and never imports `ai_game_agent.perception.ui`, and
+  `tests/test_objects.py` is absent (deleted in the working tree).
+* `perception/ui.py` previously failed to import at all: a `SyntaxError` on
+  line 73 (duplicated `:ig.get(...)` fragment in the
+  `simulate_match` condition) plus a missing `BBox` import. Both fixed on
+  2026-10-03; `import ai_game_agent.perception.ui` now succeeds and the suite
+  stays green. `perception/__init__.py` exports `UiRegionDetector`.
+* `perception/objects.py` defines `ColorBlobsDetector` (+ `color_blobs.py`) and
+  `perception/__init__.py` exports `ObjectDetector`; the module is not yet
+  exercised by any passing test.
+* `assets/templates/target_frame.png` is present (177 bytes) but is **not a
+  valid PNG** — `PIL.UnidentifiedImageError` on load. Either replace it with
+  valid synthetic PNGs (if the §13 decision is "commit") or delete it; as-is
+  it breaks `analyze`'s template-loading path.
+
+### Next up (verified 2026-10-03 against the tree)
 
 1. **Decide §13 "Template asset policy"** — one-line decision; only it gates
    the `analyze` out-of-the-box demo. Everything below can start without it.
-2. **Step 5 → 6 → 7** in that order (`ui.py`, `objects.py`, `ocr.py`): each is
-   TDD — write `tests/test_ui_zones.py` / `test_objects.py` / `test_ocr.py`
-   red first, then the minimal implementation green, then refactor. `ui.py`
-   and `objects.py` need the `vision` extra; `ocr.py` needs the `ocr` extra
-   only at runtime (tests inject fakes).
-3. **Step 8** (`analyze` CLI) — depends on 2 (wires the real detectors) and on
-   decision 1 (demoable templates). Includes the `main()` catch-tuple
-   extension for `ConfigError` + `PerceptionError` and the §7.2 e2e suite.
-4. **Step 9** (README Phase 2 section) — last, once `analyze` is stable.
+2. **Steps 5–6 test coverage (highest priority):**
+   * `tests/test_ui_zones.py` — rewrite to import and exercise the real
+     `UiRegionDetector` (currently a self-contained stub that tests only its
+     own fakes); per §7.1: presence fires only in-zone, brightness flips
+     across the threshold, `color_present` with/without the color.
+   * `tests/test_objects.py` — restore (currently deleted from the working
+     tree) against the real `ColorBlobsDetector`: planted blob detected with
+     correct bbox bounds, absent color → no hits, protocol compliance.
+   Both need the `vision` extra; the real detectors already exist, so this is
+   red→green, not green-from-scratch.
+3. **Step 7** (`ocr.py`) — `TesseractEngine` behind `OcrEngine` (lazy
+   `pytesseract` import; missing engine/binary → `"ocr: ..."` in
+   `detector_errors`), plus `tests/test_ocr.py` with a `FakeOcrEngine`.
+4. **Step 8** (`analyze` CLI) — depends on 2 and on decision 1 (demoable
+   templates). Includes the `main()` catch-tuple extension for `ConfigError`
+   + `PerceptionError` and the §7.2 e2e suite.
+5. **Step 9** (README Phase 2 section) — last, once `analyze` is stable.
 
 ### Remaining work, item by item
 
-1. **`perception/ui.py` (step 5)** — `UiRegionDetector` implementing the
-   closed set of zone checks from §5.2 (`presence`, `brightness`,
-   `color_present`; the config side already validates this set in
-   `config.py`), emitting `TemplateHit(template=f"ui:{zone_name}")`. Wire it
-   into `Perception`'s injection point and add `tests/test_ui_zones.py`
-   (§7.1) first, per TDD.
-2. **`perception/objects.py` (step 6)** — `ColorBlobsDetector`
-   (`cv2.inRange` + `cv2.connectedComponents` per §5.4) implementing the
-   `ObjectDetector` protocol, plus `tests/test_objects.py` first.
+1. **`tests/test_ui_zones.py` (step 5 coverage)** — the real `ui.py`
+   already implements the §5.2 closed check set (`presence`, `brightness`,
+   `color_present`) and emits `TemplateHit(template=f"ui:{zone_name}")`; the
+   stub test file must be rewritten to import and drive the real detector.
+2. **`tests/test_objects.py` (step 6 coverage)** — restore the deleted test
+   file against the real `ColorBlobsDetector` (`cv2.inRange` +
+   `cv2.connectedComponents`), implementing the `ObjectDetector` protocol.
 3. **`perception/ocr.py` (step 7)** — `TesseractEngine` behind the
    `OcrEngine` protocol (lazy `pytesseract` import; missing
    engine/binary → `"ocr: ..."` in `detector_errors`, never a pipeline
@@ -561,9 +591,10 @@ Completion status of the §12 build order, verified against the code:
 5. **README (step 9)** — add the Phase 2 section: install with extras
    (`uv sync --extra dev --extra vision --extra ocr`), `analyze` usage,
    and the `perception:` config example; cross-link from `docs/`.
-6. **Template assets** — decide §13's asset policy and, if committing,
-   add tiny synthetic PNGs under `assets/templates/` so `analyze` is
-   demoable out of the box.
+6. **Template assets** — decide §13's asset policy. Note: a placeholder
+   `assets/templates/target_frame.png` already exists but is not a valid
+   PNG (177 bytes, `UnidentifiedImageError`); replace with valid synthetic
+   PNGs if the decision is "commit", or remove it.
 
 ### Known cleanup
 
