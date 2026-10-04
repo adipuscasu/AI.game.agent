@@ -137,7 +137,19 @@ def _frame_to_bgr(frame: Frame) -> np.ndarray:
 
 
 def _match_color(img: np.ndarray, spec: dict[str, object], min_area: int) -> list[ObjectHit]:
-    """Find all blobs of ``spec``'s color in ``img`` (BGR uint8)."""
+    """Find all blobs of ``spec``'s color in ``img`` (BGR uint8).
+
+    ``ObjectHit.confidence`` here is **area-based, not a classifier score**:
+    ``confidence = min(1.0, area / max(1.0, frame_area / _MAX_AREA_FRACTION))``.
+    A blob covering at least ``frame_area / _MAX_AREA_FRACTION`` pixels
+    (i.e. ``1 / _MAX_AREA_FRACTION`` of the frame, ``1/256`` by default) is
+    "fully" detected and scores ``1.0``; smaller blobs score proportionally
+    lower. It measures how much of the frame the matched blob occupies, so a
+    large, unambiguous blob reads more confident than a small one — it is
+    *evidence of size*, not a learned probability. The field name
+    ``confidence`` is kept for the stable ``Observation`` contract; treat it
+    as a size/coverage signal, not a classifier's calibrated confidence.
+    """
     rgb = spec["rgb"]  # [r, g, b] ints 0-255
     tol = int(spec["tolerance"])
     bgr = [int(rgb[2]), int(rgb[1]), int(rgb[0])]  # RGB -> BGR

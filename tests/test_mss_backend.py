@@ -99,6 +99,11 @@ def test_mss_backend_open_close_idempotent():
 
 
 def test_create_backend_mss_returns_mss_backend():
+    # This test exercises the real factory path, which ``import mss``-checks
+    # availability (``create_backend`` -> ``_mss_available``). The other tests
+    # inject a fake via ``mss_factory`` and run headless, so only this one
+    # needs the dependency present. Skip cleanly on a bare venv.
+    pytest.importorskip("mss")
     backend = create_backend(CaptureConfig(backend="mss"))
     assert isinstance(backend, MssBackend)
     assert backend.name == "mss"

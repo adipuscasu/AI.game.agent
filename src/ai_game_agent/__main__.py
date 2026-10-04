@@ -248,6 +248,12 @@ def _build_perception(args: argparse.Namespace, cfg) -> Perception:
 
 def _analyze(args: argparse.Namespace) -> int:
     cfg = load_config(getattr(args, "config", None))
+    # Build the perception pipeline FIRST so any setup failure (invalid
+    # config, missing optional extra, detector construction error) is
+    # reported before we open a capture backend — fail fast with no half-open
+    # capture resource to leak. ``Perception.__init__`` is pure (it only holds
+    # detector references; it never touches the screen), so this is safe.
+    perception = _build_perception(args, cfg)
     cap = _build_capture(
         args,
         record_enabled=False,
@@ -256,7 +262,6 @@ def _analyze(args: argparse.Namespace) -> int:
     )
     with cap:
         frame = cap.grab()
-    perception = _build_perception(args, cfg)
     observation = perception.observe(frame)
     if getattr(args, "pretty", False):
         text = json.dumps(observation.to_dict(), indent=2)
