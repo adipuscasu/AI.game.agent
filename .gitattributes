@@ -1,0 +1,18 @@
+# Normalize line endings to LF in the repo.
+#
+# Rationale: on 2026-10-04 a branch flip from LF to CRLF silently inflated the
+# diff on ~14 files (up to 1536 added/removed lines each) and forced a manual
+# cleanup. Enforcing LF at the repo level means Windows checkouts that would
+# otherwise rewrite files to CRLF no longer produce that churn, and `git diff`
+# reflects real content changes only.
+#
+# PowerShell scripts target Windows and are kept as CRLF (the least-surprising
+# default for the platform they run on).
+* text=auto eol=lf
+*.ps1 text eol=crlf
+# Binary assets: never treat as text (no newline rewriting, no "LF will be
+# replaced" noise).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
