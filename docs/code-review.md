@@ -229,3 +229,67 @@ already ships the `vision` + `ocr` extras, so the dependency scaffolding is in p
 4. Write `tests/test_objects.py` red→green.
 5. `core.autocrlf=input` (or add `.gitattributes` forcing LF).
 6. Proceed to steps 7–9.
+
+---
+
+## Phase 2 — re-review (updated 2026-10-04, HEAD `37fb946`)
+
+> Supersedes the 2026-10-03 section above. Verified with `uv run pytest -q`,
+> `uv run ruff check src tests`, `uv lock --check`, and by running the `analyze`
+> subcommand in both the real (cv2/numpy present) and the bare (cv2/numpy
+> import-blocked) environments.
+
+**Verdict:** Phase 2 is **functionally complete and green.** All five open
+items from the 2026-10-03 review are resolved except one (the `mss`
+skip-guard, re-verified open today). Full suite **194 passed**, ruff clean,
+lockfile in sync. The branch is ready to merge modulo that one minor test guard.
+
+### Resolution of the 2026-10-03 open items
+
+| # | Sev (10-03) | Where | Status (10-04) |
+|---|-------------|-------|----------------|
+| 1 | 🟠 | `perception/objects.py` | ✅ **Resolved** — `objects.py` removed; `perception/color_blobs.py` is now the real `ColorBlobsDetector` (commit `e73a495`). |
+| 2 | 🟠 | `perception/color_blobs.py` | ✅ **Resolved** — import errors gone; implements the `ObjectDetector` protocol and is covered by 21 tests in `tests/test_objects.py`. |
+| 3 | 🟡 | `assets/templates/target_frame.png` | ✅ **Resolved** — replaced with a valid 64×36 PNG (opens in PIL; matches at confidence 1.0 under `CvTemplateMatcher`). |
+| 4 | 🟡 | `tests/test_mss_backend.py` | ❌ **Still open** — re-verified empirically: with `mss` blocked, `test_create_backend_mss_returns_mss_backend` **fails (exit 1)** instead of skipping. |
+| 5 | ⚪ | repo CRLF | ✅ **Resolved** — all text files normalized to LF; `.gitattributes` added (`text=auto eol=lf`, `*.ps1` kept CRLF, image assets `binary`) so it can't recur. |
+
+### Not-started items (10-03) — all now complete
+
+| Item | Status |
+|------|--------|
+| Step 7 `perception/ocr.py` + `tests/test_ocr.py` | ✅ `TesseractEngine` behind the `OcrEngine` protocol, 14 tests (commit `a7adc1a`). |
+| Step 8 `analyze` subcommand | ✅ Wired end-to-end in `__main__.py`; `--no-templates` / `--no-ocr` / `--no-objects` toggles; clean `error:` + exit-1 on `ConfigError`/`PerceptionError`/`OSError`. |
+| Step 9 README Phase 2 section | ✅ `analyze` subcommand + perception pipeline documented (commit `babb684`). |
+
+### Still open (re-verified 2026-10-04)
+
+| # | Sev | Where | Finding |
+|---|-----|-------|---------|
+| 1 | 🟡 | `tests/test_mss_backend.py:101` | `test_create_backend_mss_returns_mss_backend` calls `create_backend(CaptureConfig(backend="mss"))`, which raises `CaptureError` when `mss` is absent — the test **fails (exit 1)** rather than skipping. The other 4 tests in the file use `FakeMss` and pass. Fix: `pytest.importorskip("mss")` at the top of that one test. |
+| 2 | ⚪ | `__main__.py:312` | `--no-templates` also disables UI-zone checks (they share one flag). Documented in the help text and covered by `test_no_templates_flag_disables_ui_detector`, but the flag name doesn't signal it. Naming-clarity only, not a bug. |
+
+### Re-review — verified correct (checked, not assumed)
+
+- **Bare-env `analyze` works.** With `cv2`/`numpy` import-blocked, `main(["analyze", "--backend", "mock"])` returns rc=0 and emits valid JSON with `schema_version==1` and `detector_errors==[]`. The lazy `color_blobs` import (commit `7fda6af`) means the CLI loads and degrades cleanly without the `vision` extra.
+- **Real-detector `analyze` works.** With the `vision` extra, a config enabling a template + a brightness UI zone + an object color returns rc=0, detects the object (`kind=red_blob`), and reports no `detector_errors`.
+- **Missing template file is a clean error.** `templates.ghost: /tmp/does_not_exist.png` → `error: template file not found: …`, exit 1, no traceback.
+- **Config fail-fast.** An unknown UI-zone `check:` value raises `ConfigError` (pydantic `extra="forbid"` + validator) rather than silently passing.
+- **No dead code left.** `_default_backend` and the unused `ocr.engine` knob are gone; `Pillow` is now declared explicitly in the `ocr` extra (it was transitive-only).
+- **Whitespace is stable.** `.gitattributes` enforces LF; the previously-churned 14 files now show `+0 −0` vs `develop`; the whole-branch diff shrank from **48 files / +9393** to **35 files / +4934 −8**.
+
+### Verification snapshot (2026-10-04, HEAD `37fb946`)
+
+```
+uv run pytest -q                            -> 194 passed
+uv run ruff check src tests                 -> All checks passed!
+uv lock --check                             -> in sync (23 packages)
+analyze (bare, cv2/numpy blocked)           -> rc=0, valid JSON, detector_errors=[]
+analyze (real: template + ui_zone + objects) -> rc=0, object detected, no errors
+```
+
+### Suggested order
+
+1. Add `pytest.importorskip("mss")` to `test_create_backend_mss_returns_mss_backend` — the only open item (one line).
+2. (Optional) Rename or further document the `--no-templates` / UI-zone coupling for discoverability.
+3. Merge `feature/phase-2` into `develop`.
