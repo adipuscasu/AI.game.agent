@@ -129,14 +129,14 @@ def _one_spec(name: object, spec: Any) -> dict[str, object]:
     }
 
 
-def _frame_to_bgr(frame: Frame) -> "np.ndarray":
+def _frame_to_bgr(frame: Frame) -> np.ndarray:
     """Convert a :class:`Frame` (row-major RGB bytes) to a BGR ``uint8`` array."""
     arr = np.frombuffer(frame.pixels, dtype=np.uint8).reshape(frame.height, frame.width, 3)
     # RGB -> BGR (single conversion site; base types stay RGB).
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 
-def _match_color(img: "np.ndarray", spec: dict[str, object], min_area: int) -> list[ObjectHit]:
+def _match_color(img: np.ndarray, spec: dict[str, object], min_area: int) -> list[ObjectHit]:
     """Find all blobs of ``spec``'s color in ``img`` (BGR uint8)."""
     rgb = spec["rgb"]  # [r, g, b] ints 0-255
     tol = int(spec["tolerance"])

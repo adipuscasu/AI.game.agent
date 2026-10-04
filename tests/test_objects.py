@@ -41,11 +41,16 @@ import pytest
 cv2 = pytest.importorskip("cv2", reason="color_blobs requires OpenCV (vision extra)")
 np = pytest.importorskip("numpy", reason="color_blobs requires NumPy (vision extra)")
 
-from ai_game_agent.capture import Frame
-from ai_game_agent.config import PerceptionConfig
-from ai_game_agent.perception.color_blobs import ColorBlobsDetector
-from ai_game_agent.perception.observation import BBox  # noqa: F401  (document contract)
+# E402 is intentional: these imports must run only after the ``importorskip``
+# guards above have succeeded.  In a bare venv (no ``vision`` extra)
+# ``importorskip`` skips this module, so ``color_blobs`` is never imported and
+# the ``PerceptionError`` it raises at load time is never triggered (§7.3).
+from ai_game_agent.capture import Frame  # noqa: E402
+from ai_game_agent.config import PerceptionConfig  # noqa: E402
+from ai_game_agent.perception.color_blobs import ColorBlobsDetector  # noqa: E402
+from ai_game_agent.perception.observation import BBox  # noqa: E402, F401
 
+# BBox (above) documents the ObjectHit contract; its F401 is intentional.
 
 # --- frame helpers -----------------------------------------------------------
 
@@ -61,7 +66,7 @@ def _frame(width: int, height: int, pixel_at) -> Frame:
             r, g, b = pixel_at(x, y)
             buf.write(struct.pack("BBB", r, g, b))
     return Frame(
-        width, height, buf.getvalue(), _dt.datetime.now(_dt.timezone.utc), "test"
+        width, height, buf.getvalue(), _dt.datetime.now(_dt.UTC), "test"
     )
 
 

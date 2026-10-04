@@ -40,8 +40,6 @@ Checks
 
 from __future__ import annotations
 
-from typing import Any, Optional
-
 from ai_game_agent.capture import Frame
 from ai_game_agent.config import PerceptionConfig, UiZone
 from ai_game_agent.perception.base import PerceptionError
@@ -103,7 +101,7 @@ class UiRegionDetector:
         self._tolerance = int(tolerance)
 
     # -- protocol ------------------------------------------------------------
-    def detect(self, frame: Frame, zone: UiZone) -> Optional[TemplateHit]:
+    def detect(self, frame: Frame, zone: UiZone) -> TemplateHit | None:
         """Run the zone's check and return a hit, or ``None`` if absent.
 
         Never raises for per-frame conditions (unknown ``check`` value,
@@ -123,7 +121,7 @@ class UiRegionDetector:
                 # Unknown check value (e.g. forced past the validator).
                 # Degrade gracefully: no hit, no raise.
                 return None
-        except Exception as exc:  # noqa: BLE001 - contract: never raise per-frame
+        except Exception:  # noqa: BLE001 - contract: never raise per-frame
             # Per-frame failure (CaptureError from out-of-bounds zone,
             # missing OpenCV, bad frame, ...).  Degrade gracefully:
             # return None so the pipeline records it in

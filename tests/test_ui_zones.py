@@ -36,12 +36,15 @@ from __future__ import annotations
 import datetime as _dt
 import io
 import struct
+from types import SimpleNamespace
 
 import pytest
 
+from ai_game_agent.__main__ import _build_perception
 from ai_game_agent.capture import Frame
 from ai_game_agent.config import PerceptionConfig, UiZone
 from ai_game_agent.perception.base import TemplateHit, UiRegionDetector
+from ai_game_agent.perception.pipeline import Perception
 from ai_game_agent.perception.ui import UiRegionDetector as RealUiRegionDetector
 
 # Confirm we are actually testing the real implementation, not a local
@@ -62,7 +65,7 @@ def _frame(width: int, height: int, pixel_at) -> Frame:
             r, g, b = pixel_at(x, y)
             buf.write(struct.pack("BBB", r, g, b))
     return Frame(
-        width, height, buf.getvalue(), _dt.datetime.now(_dt.timezone.utc), "test"
+        width, height, buf.getvalue(), _dt.datetime.now(_dt.UTC), "test"
     )
 
 
@@ -241,11 +244,6 @@ class TestColorPresent:
 # (and can even toggle them off via ``--no-templates``) but then hardcodes
 # ``ui_detector=None`` in the ``Perception`` it returns.  So a configured
 # zone never runs -- the detector is dead code.  These tests pin the wiring.
-
-from types import SimpleNamespace
-
-from ai_game_agent.__main__ import _build_perception
-from ai_game_agent.perception.pipeline import Perception
 
 
 def _args(**overrides):

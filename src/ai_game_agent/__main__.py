@@ -62,7 +62,13 @@ from ai_game_agent.config import (
     load_config,
 )
 from ai_game_agent.perception import Perception, PerceptionError
-from ai_game_agent.perception.color_blobs import ColorBlobsDetector
+
+# NB: color_blobs is NOT imported here at module top.  It imports cv2 at
+# module load and raises PerceptionError when the "vision" extra is absent
+# (its documented contract: "imported only when the subsystem is selected").
+# __main__.py must stay importable in a bare venv (§7.3: the CLI works with no
+# vision/ocr extras), so the import lives inside _build_perception's
+# object-detection branch, where it is actually needed.
 from ai_game_agent.perception.ocr import TesseractEngine
 from ai_game_agent.perception.template import CvTemplateMatcher
 from ai_game_agent.perception.ui import UiRegionDetector
@@ -211,11 +217,15 @@ def _build_perception(args: argparse.Namespace, cfg) -> Perception:
     )
     if getattr(args, "no_objects", False):
         object_colors = []
-    object_detector = (
-        ColorBlobsDetector(object_colors)
-        if object_colors
-        else None
-    )
+    object_detector = None
+    if object_colors:
+        # Lazy import: color_blobs needs the "vision" extra (cv2/numpy).  It
+        # is only imported when the objects subsystem is actually selected,
+        # so a bare venv (no vision extra) still imports the CLI cleanly and
+        # the extra's absence surfaces here as a fail-fast PerceptionError.
+        from ai_game_agent.perception.color_blobs import ColorBlobsDetector
+
+        object_detector = ColorBlobsDetector(object_colors)
     perception_cfg = PerceptionConfig(
         enabled=perception.enabled,
         template_threshold=perception.template_threshold,
@@ -253,7 +263,10 @@ def _analyze(args: argparse.Namespace) -> int:
     else:
         text = json.dumps(observation.to_dict(), sort_keys=True)
     print(text)
-    log.info("analyze: frame=%dx%d detectors=%d", frame.width, frame.height, len(observation.detector_errors))
+    log.info(
+        "analyze: frame=%dx%d detectors=%d",
+        frame.width, frame.height, len(observation.detector_errors),
+    )
     return 0
 
 
@@ -292,11 +305,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_an.add_argument("--region", default=None, help="x,y,width,height (integers)")
     p_an.add_argument("--scale", default=None, help="downscale factor (e.g. 0.5)")
     p_an.add_argument("--fps", type=int, default=0, help="0 = no pacing (CLI default)")
-    p_an.add_argument("--config", default=None, help="YAML config file (default: config/default.yaml)")
+    p_an.add_argument(
+        "--config", default=None,
+        help="YAML config file (default: config/default.yaml)",
+    )
     p_an.add_argument("--no-templates", action="store_true",
                       help="disable template matching and UI-zone checks")
     p_an.add_argument("--no-ocr", action="store_true", help="disable OCR")
-    p_an.add_argument("--no-objects", action="store_true", help="disable color-blob object detection")
+    p_an.add_argument(
+        "--no-objects", action="store_true",
+        help="disable color-blob object detection",
+    )
     p_an.add_argument("--pretty", action="store_true", help="pretty-print JSON output")
     p_an.set_defaults(func=_analyze)
     return parser

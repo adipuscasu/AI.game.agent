@@ -16,6 +16,7 @@ Run with::
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -201,9 +202,6 @@ def test_unknown_backend_reports_error(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Phase 2 – ``analyze`` subcommand
 # ---------------------------------------------------------------------------
-
-
-import json
 
 
 @pytest.mark.e2e

@@ -124,14 +124,6 @@ class CvTemplateMatcher:
                 f"{frame.width}x{frame.height} frame"
             )
 
-        tmpl = self._templates[template]
-        th, tw = tmpl.shape[:2]
-        if th > frame.height or tw > frame.width:
-            raise PerceptionError(
-                f"template {template!r} is {tw}x{th}, larger than the "
-                f"{frame.width}x{frame.height} frame"
-            )
-
         frame_bgr = _to_cv_image(cv2, frame)
         result = cv2.matchTemplate(frame_bgr, tmpl, cv2.TM_CCOEFF_NORMED)
         _, best, _, best_loc = cv2.minMaxLoc(result)

@@ -123,3 +123,47 @@ def test_cli_observe_logs_to_stderr_not_stdout(capsys):
     captured = capsys.readouterr()
     assert captured.out.startswith("frames=3 fps=")
     assert "observe: frames=" not in captured.out
+
+
+# --- bare-environment contract ---------------------------------------------
+# §7.3 done-criterion: "analyze prints valid JSON in a bare dev environment
+# (no vision/ocr extras installed)".  The CLI entry point must therefore
+# import cleanly when cv2/numpy are absent.  color_blobs.py imports cv2 at
+# module top and raises PerceptionError if it is missing -- by design it is
+# "imported only when the subsystem is selected", so __main__.py must import
+# ColorBlobsDetector lazily (inside the `if object_colors` branch), not at the
+# module top.
+
+def test_cli_imports_cleanly_without_vision_extra():
+    """`import ai_game_agent.__main__` must succeed when cv2/numpy are blocked.
+
+    This is the §7.3 bare-env contract.  The current unconditional top-level
+    import of color_blobs in __main__.py violates it: color_blobs raises
+    PerceptionError at import time when cv2 is absent, so the whole CLI
+    (every subcommand) fails to load in a bare venv.
+    """
+    import subprocess
+    import sys
+
+    script = (
+        "import sys\n"
+        "class _Blocker:\n"
+        "    def find_spec(self, fullname, path=None, target=None):\n"
+        "        if fullname in ('cv2', 'numpy') or fullname.startswith(('cv2.', 'numpy.')):\n"
+        "            raise ImportError('blocked: ' + fullname)\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, _Blocker())\n"
+        "import ai_game_agent.__main__\n"
+        "print('imported-ok')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        "importing ai_game_agent.__main__ must succeed without cv2/numpy "
+        f"(§7.3 bare-env); got rc={result.returncode}\n"
+        f"--- stderr ---\n{result.stderr}"
+    )
+    assert "imported-ok" in result.stdout

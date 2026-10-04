@@ -1,8 +1,11 @@
-import pytest
 from unittest.mock import MagicMock
-from ai_game_agent.config import PerceptionConfig
-from ai_game_agent.perception.base import Frame, UiZone, TemplateHit
+
+import pytest
 from PIL import Image
+
+from ai_game_agent.config import PerceptionConfig
+from ai_game_agent.perception.base import Frame, UiZone
+
 
 @pytest.fixture
 def mock_frame() -> MagicMock:
@@ -24,9 +27,18 @@ def mock_config() -> PerceptionConfig:
     # Define the mock zones that match the structure expected by test_ui_zones.py
     # The actual values are placeholders.
     mock_zones_data = [
-        {"name": "action_bar", "x": 640, "y": 940, "width": 640, "height": 120, "check": "presence"},
-        {"name": "health_bar", "x": 100, "y": 100, "width": 200, "height": 30, "check": "brightness"},
-        {"name": "loot_glow_check", "x": 500, "y": 500, "width": 50, "height": 50, "check": "color_present"},
+        {
+            "name": "action_bar", "x": 640, "y": 940,
+            "width": 640, "height": 120, "check": "presence",
+        },
+        {
+            "name": "health_bar", "x": 100, "y": 100,
+            "width": 200, "height": 30, "check": "brightness",
+        },
+        {
+            "name": "loot_glow_check", "x": 500, "y": 500,
+            "width": 50, "height": 50, "check": "color_present",
+        },
     ]
     
     # Create mock UiZone objects manually to satisfy the TypeCheck on PerceptionConfig
@@ -35,7 +47,6 @@ def mock_config() -> PerceptionConfig:
     for data in mock_zones_data:
         # We must bypass the real UiZone constructor checks for the fixture setup
         # by relying on the knowledge that it accepts these parameters.
-        from ai_game_agent.perception.base import UiZone
         mock_ui_zones.append(UiZone(
             name=data["name"], 
             x=data["x"], 
