@@ -106,6 +106,32 @@ def test_capture_config_rejects_negative_fps():
         CaptureConfig(backend="mock", fps=-1)
 
 
+def test_capture_config_monitor_defaults_to_primary():
+    # The documented "no region" behavior is "capture the full primary
+    # monitor" (config/default.yaml), so the default must be mss monitors[1],
+    # not monitors[0] (the whole black-banded virtual screen).
+    from ai_game_agent.config import CaptureConfig
+
+    assert CaptureConfig(backend="mss").monitor == 1
+
+
+def test_capture_config_monitor_accepts_valid_indices():
+    from ai_game_agent.config import CaptureConfig
+
+    assert CaptureConfig(backend="mss", monitor=0).monitor == 0   # whole virtual screen
+    assert CaptureConfig(backend="mss", monitor=2).monitor == 2   # first secondary
+
+
+def test_capture_config_rejects_negative_monitor():
+    import pytest
+    from pydantic import ValidationError
+
+    from ai_game_agent.config import CaptureConfig
+
+    with pytest.raises(ValidationError):
+        CaptureConfig(backend="mss", monitor=-1)
+
+
 def test_region_validates_positive_dimensions():
     import pytest
     from pydantic import ValidationError

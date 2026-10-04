@@ -124,6 +124,16 @@ def _parse_scale(value: str | None) -> float | None:
     return scale
 
 
+def _parse_monitor(value: str | None) -> int | None:
+    """Parse a CLI monitor index; ``None`` leaves the config default."""
+    if value is None:
+        return None
+    monitor = int(value)
+    if monitor < 0:
+        raise ValueError("monitor must be a non-negative integer")
+    return monitor
+
+
 def _build_capture(
     args: argparse.Namespace,
     *,
@@ -132,6 +142,7 @@ def _build_capture(
     record_max_files: int,
 ) -> Capture:
     scale = _parse_scale(getattr(args, "scale", None))
+    monitor = _parse_monitor(getattr(args, "monitor", None))
     cfg = CaptureConfig(
         backend=args.backend,
         region=_parse_region(args.region),
@@ -140,6 +151,7 @@ def _build_capture(
         record_enabled=record_enabled,
         record_directory=str(record_dir),
         record_max_files=record_max_files,
+        monitor=1 if monitor is None else monitor,
     )
     return Capture(cfg)
 
@@ -281,6 +293,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_cap = sub.add_parser("capture", help="Grab one screenshot and save it as PNG.")
     p_cap.add_argument("--backend", default="mss", help="capture backend (mss | mock)")
+    p_cap.add_argument("--monitor", default=None,
+                       help="mss monitor index: 1=primary (default), 2+=secondary, 0=all")
     p_cap.add_argument("--region", default=None, help="x,y,width,height (integers)")
     p_cap.add_argument("--scale", default=None, help="downscale factor (e.g. 0.5)")
     p_cap.add_argument("--out", default="screenshots", help="output directory")
@@ -289,6 +303,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_obs = sub.add_parser("observe", help="Run a capture loop and print measured FPS.")
     p_obs.add_argument("--backend", default="mss")
+    p_obs.add_argument("--monitor", default=None,
+                       help="mss monitor index: 1=primary (default), 2+=secondary, 0=all")
     p_obs.add_argument("--region", default=None, help="x,y,width,height (integers)")
     p_obs.add_argument("--scale", default=None, help="downscale factor (e.g. 0.5)")
     p_obs.add_argument("--frames", type=int, default=30)
@@ -307,6 +323,8 @@ def build_parser() -> argparse.ArgumentParser:
         "analyze", help="Capture one frame and print the perception Observation as JSON."
     )
     p_an.add_argument("--backend", default="mss", help="capture backend (mss | mock)")
+    p_an.add_argument("--monitor", default=None,
+                      help="mss monitor index: 1=primary (default), 2+=secondary, 0=all")
     p_an.add_argument("--region", default=None, help="x,y,width,height (integers)")
     p_an.add_argument("--scale", default=None, help="downscale factor (e.g. 0.5)")
     p_an.add_argument("--fps", type=int, default=0, help="0 = no pacing (CLI default)")

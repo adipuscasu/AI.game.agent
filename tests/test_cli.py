@@ -68,6 +68,29 @@ def test_cli_capture_with_invalid_scale_returns_nonzero(tmp_path):
     assert rc != 0
 
 
+def test_cli_capture_with_monitor_flag(tmp_path):
+    # --monitor only affects the mss backend's monitor selection; with the
+    # mock backend it must be accepted and produce a normal capture.
+    out = tmp_path / "shots"
+    rc = main(["capture", "--backend", "mock", "--monitor", "1", "--out", str(out)])
+    assert rc == 0
+    assert len(list(out.glob("*.png"))) == 1
+
+
+def test_cli_capture_with_invalid_monitor_returns_nonzero():
+    rc = main(["capture", "--backend", "mock", "--monitor", "-1", "--out", "ignored"])
+    assert rc != 0
+
+
+def test_cli_observe_accepts_monitor_flag(tmp_path):
+    out = tmp_path / "rec"
+    rc = main([
+        "observe", "--backend", "mock", "--frames", "3", "--fps", "0",
+        "--monitor", "2", "--out", str(out),
+    ])
+    assert rc == 0
+
+
 def test_cli_no_command_returns_nonzero(capsys):
     assert main([]) == 2
 

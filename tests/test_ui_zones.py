@@ -187,6 +187,18 @@ class TestBrightness:
         just_above = _solid(128, 72, (129, 129, 129))
         assert det.detect(just_above, zone) is not None
 
+    def test_threshold_out_of_range_rejected(self):
+        """BT.601 luminance is [0, 255]; a threshold outside that range could
+        never fire (or always fire), so the constructor must reject it rather
+        than let a config typo silently disable the check."""
+        with pytest.raises(ValueError, match="threshold"):
+            UiZone("z", 0, 0, 8, 8, "brightness", threshold=256)
+        with pytest.raises(ValueError, match="threshold"):
+            UiZone("z", 0, 0, 8, 8, "brightness", threshold=-1)
+        # Boundaries are valid.
+        assert UiZone("lo", 0, 0, 8, 8, "brightness", threshold=0.0).threshold == 0.0
+        assert UiZone("hi", 0, 0, 8, 8, "brightness", threshold=255.0).threshold == 255.0
+
 
 # --- error isolation --------------------------------------------------------
 

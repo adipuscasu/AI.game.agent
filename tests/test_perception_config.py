@@ -155,6 +155,39 @@ def test_load_perception_rejects_invalid_threshold(tmp_path):
         raise AssertionError("expected ConfigError for out-of-range template_threshold")
 
 
+def test_load_perception_rejects_zone_threshold_out_of_range(tmp_path):
+    # A ui-zone brightness threshold is compared against BT.601 luminance
+    # ([0, 255]); 500 could never fire, -5 always would. Both must fail fast.
+    for bad_value in ("500", "-5"):
+        path = tmp_path / f"zone-thr-{bad_value}.yaml"
+        path.write_text(
+            "perception:\n  ui_zones:\n"
+            "    - name: bar\n      x: 0\n      y: 0\n      width: 10\n      height: 10\n"
+            f"      check: brightness\n      threshold: {bad_value}\n",
+            encoding="utf-8",
+        )
+        try:
+            load_config(str(path))
+        except ConfigError as exc:
+            assert "threshold" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError(f"expected ConfigError for zone threshold {bad_value}")
+
+
+def test_load_perception_accepts_zone_threshold_boundaries(tmp_path):
+    for good_value in ("0", "255"):
+        path = tmp_path / f"zone-thr-ok-{good_value}.yaml"
+        path.write_text(
+            "perception:\n  ui_zones:\n"
+            "    - name: bar\n      x: 0\n      y: 0\n      width: 10\n      height: 10\n"
+            f"      check: brightness\n      threshold: {good_value}\n",
+            encoding="utf-8",
+        )
+        p = load_config(str(path)).perception
+        zone = next(z for z in p.ui_zones if z.name == "bar")
+        assert zone.threshold == float(good_value)
+
+
 def test_ui_zone_is_immutable():
     z = UiZone(name="z", x=0, y=0, width=1, height=1, check="brightness")
     with pytest.raises(AttributeError):

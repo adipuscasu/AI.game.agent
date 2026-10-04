@@ -174,7 +174,7 @@ def create_backend(config: CaptureConfig):
                 "the 'mss' backend is not installed; "
                 "install it with 'pip install mss' or set capture.backend to 'mock'"
             )
-        return MssBackend()
+        return MssBackend(monitor=config.monitor)
     raise CaptureError(f"unknown capture backend: {config.backend!r}")
 
 
@@ -196,8 +196,13 @@ class MssBackend(CaptureBackend):
 
     name = "mss"
 
-    def __init__(self, mss_factory: Callable[[], object] | None = None) -> None:
+    def __init__(
+        self,
+        mss_factory: Callable[[], object] | None = None,
+        monitor: int = 1,
+    ) -> None:
         self._factory = mss_factory
+        self._monitor = monitor
         self._screen: object | None = None
 
     def open(self) -> None:
@@ -218,9 +223,12 @@ class MssBackend(CaptureBackend):
     def grab(self) -> Frame:
         if self._screen is None:
             raise CaptureError("mss backend not opened; call open() first")
-        # mss >= 10 requires an explicit monitor; monitors[0] is the whole
-        # virtual screen (same as the legacy no-argument grab).
-        shot = self._screen.grab(self._screen.monitors[0])
+        # mss >= 10 requires an explicit monitor. mss monitors[0] is the whole
+        # virtual screen (all monitors); monitors[1] is the primary, and
+        # monitors[n] for n >= 2 is the (n-1)th secondary. Default is 1 so a
+        # bare capture is the primary monitor, not the black-banded virtual
+        # desktop (see docs/manual-testing.md).
+        shot = self._screen.grab(self._screen.monitors[self._monitor])
         size = shot.size
         # mss 9 exposes shot.size as a dict; mss >= 10 as a Size object.
         if isinstance(size, dict):

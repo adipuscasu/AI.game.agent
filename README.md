@@ -108,6 +108,9 @@ section 15) ships with this release:
 # One screenshot from the primary monitor, saved to ./screenshots
 uv run ai-game-agent capture --backend mss --out shots/
 
+# Select a different monitor (1=primary default, 2+=secondary, 0=whole virtual screen)
+uv run ai-game-agent capture --backend mss --monitor 2 --out shots/
+
 # A 30-frame capture loop with measured FPS (no recording)
 uv run ai-game-agent observe --backend mss --frames 30 --fps 30
 
@@ -135,7 +138,7 @@ uv run ai-game-agent analyze --backend mss --region 640,360,1920,1080 --scale 0.
 uv run ai-game-agent analyze --no-ocr --no-objects --no-templates
 ```
 
-Shared options with `capture`/`observe`: `--backend` (default `mss`), `--config`,
+Shared options with `capture`/`observe`: `--backend` (default `mss`), `--monitor` (1=primary default, 2+=secondary, 0=whole virtual screen), `--config`,
 `--region`, `--scale`, `--fps`, `--no-templates`, `--no-ocr`, `--no-objects`,
 `--pretty`, `-o/--out`. Errors go to `stderr` with an `error:` prefix and exit 1.
 

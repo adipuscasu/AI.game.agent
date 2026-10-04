@@ -19,8 +19,12 @@ capture:
   # "capture" extra). Use "mock" for CI / replay without a desktop session.
   backend: mss
   # Optional region of interest in pixels: {x, y, width, height}.
-  # null = capture the full primary monitor.
+  # null = capture the whole selected monitor (see ``monitor`` below).
   region: null
+  # mss monitor selector (mss monitors[] index): 1 = primary (default),
+  # 2+ = (n-1)th secondary, 0 = the whole virtual screen (all monitors).
+  # Ignored by the mock backend.
+  monitor: 1
   # Target capture rate; frames closer together are dropped.
   fps: 30
   # Optional downscale factor applied after capture (1.0 = no scaling).

@@ -20,29 +20,24 @@ uv run python -m ai_game_agent capture --backend mss --out shots
 uv run python -m ai_game_agent capture --backend mss --region 0,0,3840,2160 --out shots
 uv run python -m ai_game_agent observe --backend mss --frames 30 --fps 30
 
-> **Note (this PC — 2 monitors):** `MssBackend.grab()` captures the whole
-> virtual screen (5760×2160), so bare `capture` includes large black bands
-> around the secondary monitor. The layout is:
+> **Note (this PC — 2 monitors):** By default `capture` grabs the *primary*
+> monitor only (3840 × 2160), which is what you usually want — no black bands
+> around the secondary. To grab a different monitor use `--monitor`
+> (1 = primary, 2+ = the (n-1)th secondary, 0 = the whole 5760×2160 virtual
+> screen):
 >
-> | Monitor | left | top | size |
-> |---|---|---|---|
-> | Primary (Dell G3223Q) | 0 | 0 | 3840 × 2160 |
-> | Secondary (Dell U2412M) | -1920 | 432 | 1920 × 1200 |
+> ```powershell
+> uv run python -m ai_game_agent capture --backend mss --monitor 2 --out shots   # secondary (Dell U2412M, 1920×1200)
+> uv run python -m ai_game_agent capture --backend mss --monitor 0 --out shots   # whole virtual screen
+> ```
 >
-> To avoid the black bands, capture only the primary:
->
-> uv run python -m ai_game_agent capture --backend mss --region 0,0,3840,2160 --out shots
->
-> The secondary cannot be selected with `--region` today (negative
-> coordinates are rejected). A monitor selector in `MssBackend`
-> (mss supports `screen.grab(monitors[2])`) is the planned fix.
 > If a *primary*-monitor capture is also fully black, disable DP HDR in the
 > Windows display settings — HDR mode can make screen capture render black.
 
 > **mss 10.x compatibility:** `MssBackend` works with mss 10+ (verified on
-> 10.2.0): `grab()` passes `monitors[0]` explicitly (required argument in
-> mss 10) and handles both the dict-style `shot.size` (mss 9) and the `Size`
-> object (mss 10+). If you see
+> 10.2.0): `grab()` passes `monitors[<selector>]` explicitly (the monitor
+> argument is required in mss 10) and handles both the dict-style `shot.size`
+> (mss 9) and the `Size` object (mss 10+). If you see
 > `MSS.grab() missing 1 required positional argument: 'monitor'` or
 > `tuple indices must be integers`, the running code predates that fix —
 > update the package, not your command.

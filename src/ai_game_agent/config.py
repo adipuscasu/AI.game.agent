@@ -43,6 +43,10 @@ class _CaptureConfig(BaseModel):
 
     backend: str = "mss"
     region: _Region | None = None
+    # mss monitor selector (mss monitors[] index): 0 = whole virtual screen,
+    # 1 = primary (default), n >= 2 = (n-1)th secondary. Ignored by backends
+    # that do not expose monitors (mock).
+    monitor: int = Field(default=1, ge=0)
     # fps=0 is a valid "no pacing" value used by the CLI for headless/CI runs.
     fps: int = Field(default=30, ge=0)
     scale: float = Field(default=1.0, gt=0)
@@ -144,7 +148,7 @@ class _UiZoneConfig(BaseModel):
     check: str
     #: Optional per-zone overrides (all optional, defaulted to the detector
     #: canonical constants when unset).
-    threshold: float | None = Field(default=None, ge=0.0)
+    threshold: float | None = Field(default=None, ge=0.0, le=255.0)
     target_rgb: tuple[int, int, int] | None = None
     tolerance: int | None = Field(default=None, ge=0)
 
@@ -309,6 +313,13 @@ class UiZone:
         if check not in _VALID_UI_CHECKS:
             allowed = ", ".join(sorted(_VALID_UI_CHECKS))
             raise ValueError(f"invalid ui zone check {check!r}; expected one of: {allowed}")
+        if threshold is not None and not 0 <= threshold <= 255:
+            # BT.601 luminance is [0, 255]; a value outside that range could
+            # never fire (or always fire) the brightness check — fail fast
+            # instead of silently degrading (mirrors the pydantic model).
+            raise ValueError(
+                f"ui zone threshold must be in [0, 255], got {threshold!r}"
+            )
         # object.__setattr__ bypasses the immutability guard below (same
         # pattern as _FrozenConfig); post-construction writes raise AttributeError.
         object.__setattr__(self, "name", name)
@@ -411,6 +422,7 @@ class CaptureConfig(_FrozenConfig):
         record_enabled: bool = False,
         record_directory: str = "recordings",
         record_max_files: int = 1000,
+        monitor: int = 1,
     ) -> None:
         super().__init__(
             _CaptureConfig(
@@ -421,6 +433,7 @@ class CaptureConfig(_FrozenConfig):
                 record_enabled=record_enabled,
                 record_directory=record_directory,
                 record_max_files=record_max_files,
+                monitor=monitor,
             )
         )
 
@@ -454,6 +467,10 @@ class CaptureConfig(_FrozenConfig):
     @property
     def record_max_files(self) -> int:
         return self._m.record_max_files
+
+    @property
+    def monitor(self) -> int:
+        return self._m.monitor
 
 
 class SafetyConfig(_FrozenConfig):
@@ -646,6 +663,7 @@ def _config_from_model(model: _Config) -> Config:
             record_enabled=model.capture.record_enabled,
             record_directory=model.capture.record_directory,
             record_max_files=model.capture.record_max_files,
+            monitor=model.capture.monitor,
         ),
         safety=SafetyConfig(
             tuple(model.safety.emergency_stop_keys),
