@@ -32,6 +32,7 @@ from ai_game_agent.perception.observation import (
     Observation,
     TemplateHit,
     TextRegion,
+    UiZoneHit,
 )
 
 __all__ = ["Perception"]
@@ -85,18 +86,20 @@ class Perception:
                 captured_at=frame.captured_at,
                 source=frame.source,
                 templates=(),
+                ui_zones=(),
                 text_regions=(),
                 objects=(),
                 detector_errors=(),
             )
 
         template_hits: list[TemplateHit] = []
+        ui_zone_hits: list[UiZoneHit] = []
         text_regions: list[TextRegion] = []
         object_hits: list[ObjectHit] = []
         errors: list[str] = []
 
         self._run_templates(frame, template_hits, errors)
-        self._run_ui_zones(frame, template_hits, errors)
+        self._run_ui_zones(frame, ui_zone_hits, errors)
         self._run_ocr(frame, text_regions, errors)
         self._run_objects(frame, object_hits, errors)
 
@@ -106,6 +109,7 @@ class Perception:
             captured_at=frame.captured_at,
             source=frame.source,
             templates=tuple(template_hits),
+            ui_zones=tuple(ui_zone_hits),
             text_regions=tuple(text_regions),
             objects=tuple(object_hits),
             detector_errors=tuple(errors),
@@ -129,7 +133,7 @@ class Perception:
                 hits.append(hit)
 
     def _run_ui_zones(
-        self, frame: Frame, hits: list[TemplateHit], errors: list[str]
+        self, frame: Frame, hits: list[UiZoneHit], errors: list[str]
     ) -> None:
         detector = self._ui_detector
         if detector is None:

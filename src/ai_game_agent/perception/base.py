@@ -20,7 +20,13 @@ from typing import Protocol, runtime_checkable
 
 from ai_game_agent.capture import Frame
 from ai_game_agent.config import UiZone
-from ai_game_agent.perception.observation import BBox, ObjectHit, TemplateHit, TextRegion
+from ai_game_agent.perception.observation import (
+    BBox,
+    ObjectHit,
+    TemplateHit,
+    TextRegion,
+    UiZoneHit,
+)
 
 __all__ = [
     "ObjectDetector",
@@ -60,11 +66,19 @@ class UiRegionDetector(Protocol):
     """Checks one configured UI zone against a frame.
 
     The pipeline calls this once per zone in ``PerceptionConfig.ui_zones``.
-    Implementations emit their verdict as a ``TemplateHit`` with
-    ``template=f"ui:{zone.name}"`` so the ``Observation`` shape stays stable.
+    Implementations return a :class:`UiZoneHit` (a semantic UI state with the
+    zone's name, check, bbox, and measured value) when the check fires, or
+    ``None`` when it legitimately does not.
+
+    Contract: per-frame operational failures (bad frame, missing optional
+    dependency, out-of-bounds region, ...) must *raise* (``PerceptionError``
+    is conventional) so the pipeline can record them in
+    ``Observation.detector_errors``. Only "the check did not fire" returns
+    ``None`` — the pipeline must be able to tell "not present" apart from
+    "detector failed".
     """
 
-    def detect(self, frame: Frame, zone: UiZone) -> TemplateHit | None:
+    def detect(self, frame: Frame, zone: UiZone) -> UiZoneHit | None:
         """Return a hit if the zone's check fired, else ``None``."""
         ...
 

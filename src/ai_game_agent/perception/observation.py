@@ -33,10 +33,14 @@ __all__ = [
     "ObjectHit",
     "TemplateHit",
     "TextRegion",
+    "UiZoneHit",
 ]
 
 # Bump if the serialized shape below changes in a way consumers must handle.
-SCHEMA_VERSION = 1
+# v2: UI-zone detections moved out of ``templates`` into their own ``ui_zones``
+# collection (see ``UiZoneHit``) — template matches and semantic UI state are
+# now distinct concepts instead of one conflated list.
+SCHEMA_VERSION = 2
 
 
 def _validate_bounding_box(*, x: int, y: int, width: int, height: int) -> None:
@@ -129,6 +133,39 @@ class ObjectHit:
 
 
 @dataclass(frozen=True)
+class UiZoneHit:
+    """A configured UI zone whose check fired (a *semantic UI state*).
+
+    This is deliberately distinct from :class:`TemplateHit`: a template match
+    says "this image was found here"; a UI-zone hit says "this part of the game
+    UI is in this state" (e.g. the health bar is bright, an action bar is
+    present). Downstream state machines treat those differently, so they are
+    separate collections on :class:`Observation` rather than one conflated list.
+
+    ``value`` is the measured quantity that triggered the check, normalized to
+    ``[0.0, 1.0]`` where applicable (e.g. ``brightness`` → average luminance
+    / 255; ``color_present`` → matched pixel fraction; ``presence`` → ``1.0``).
+    It is the observable evidence, not a classifier confidence score.
+    """
+
+    zone: str
+    check: str
+    bbox: BBox
+    value: float
+
+    def __post_init__(self) -> None:
+        _validate_confidence(self.value)  # value is constrained to [0.0, 1.0]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "zone": self.zone,
+            "check": self.check,
+            "bbox": self.bbox.to_dict(),
+            "value": self.value,
+        }
+
+
+@dataclass(frozen=True)
 class Observation:
     """The single stable output of the perception layer.
 
@@ -142,6 +179,7 @@ class Observation:
     captured_at: datetime.datetime
     source: str
     templates: tuple[TemplateHit, ...]
+    ui_zones: tuple[UiZoneHit, ...]
     text_regions: tuple[TextRegion, ...]
     objects: tuple[ObjectHit, ...]
     detector_errors: tuple[str, ...]
@@ -155,6 +193,7 @@ class Observation:
             "captured_at": self.captured_at.isoformat(),
             "source": self.source,
             "templates": [t.to_dict() for t in self.templates],
+            "ui_zones": [u.to_dict() for u in self.ui_zones],
             "text_regions": [t.to_dict() for t in self.text_regions],
             "objects": [o.to_dict() for o in self.objects],
             "detector_errors": list(self.detector_errors),

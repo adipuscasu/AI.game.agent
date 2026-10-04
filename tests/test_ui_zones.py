@@ -3,32 +3,35 @@
 These tests drive the **real** ``UiRegionDetector`` class against the
 ``UiRegionDetector`` protocol contract in ``perception/base.py``::
 
-    detect(frame: Frame, zone: UiZone) -> TemplateHit | None
+    detect(frame: Frame, zone: UiZone) -> UiZoneHit | None
 
 and the real ``UiZone`` config model in ``ai_game_agent.config``.
 
 Real contract (verified against ``config.py`` / ``perception/observation.py``):
 
-- ``UiZone(name, x, y, width, height, check)`` -- positional, immutable, with
-  ``check`` restricted to the closed set ``{presence, brightness, color_present}``.
-- ``TemplateHit(template, bbox, confidence)`` and ``BBox(x, y, width, height)``.
+- ``UiZone(name, x, y, width, height, check, threshold=None, target_rgb=None,
+  tolerance=None)`` -- positional + optional per-zone overrides, immutable,
+  with ``check`` restricted to the closed set
+  ``{presence, brightness, color_present}``.
+- ``UiZoneHit(zone, check, bbox, value)`` and ``BBox(x, y, width, height)``.
 - ``Frame`` (from ``ai_game_agent.capture``) has ``width``, ``height`` and
   ``pixels`` as a row-major RGB ``bytes`` buffer.
 
 Design notes
 ============
 
-- ``presence`` and ``brightness`` are pure-PIL / pure-Python (the same
-  dependencies the pipeline already uses for ``Frame.pixels``), so these
-  tests run headless with no OpenCV and no template assets.
-- ``color_present`` is HSV-threshold based and requires OpenCV; those
-  paths are exercised by the OpenCV-dependent tests and skipped cleanly
-  when ``cv2`` is absent.
-- A detector must never raise for a configured zone: any internal error
-  (e.g. an unknown ``check`` value, an out-of-bounds zone) must surface as
-  ``None`` so the pipeline can record it in ``Observation.detector_errors``.
-- The ``UiZone`` model carries **no** threshold/color/min_area fields, so
-  the detector must use documented defaults (brightness 128, min area 4).
+- ``presence`` and ``brightness`` are pure-Python (no OpenCV or PIL needed
+  beyond ``Frame.pixels``), so these tests run headless with no template
+  assets.
+- ``color_present`` uses OpenCV RGB thresholding; those paths are exercised
+  by the OpenCV-dependent tests and skipped cleanly when ``cv2`` is absent.
+- Per-frame operational failures (unknown ``check`` value, out-of-bounds
+  zone, missing OpenCV) **raise** :class:`PerceptionError` so the pipeline
+  can record them in ``Observation.detector_errors``.  Only a legitimate
+  "check did not fire" result returns ``None``.
+- ``UiZone`` now carries optional per-zone ``threshold`` / ``target_rgb`` /
+  ``tolerance`` overrides; when unset the detector uses its documented
+  defaults (brightness 128, red 200/30/30, tolerance 40, min area 0.001).
 """
 
 from __future__ import annotations
@@ -43,7 +46,8 @@ import pytest
 from ai_game_agent.__main__ import _build_perception
 from ai_game_agent.capture import Frame
 from ai_game_agent.config import PerceptionConfig, UiZone
-from ai_game_agent.perception.base import TemplateHit, UiRegionDetector
+from ai_game_agent.perception.base import UiRegionDetector
+from ai_game_agent.perception.observation import UiZoneHit
 from ai_game_agent.perception.pipeline import Perception
 from ai_game_agent.perception.ui import UiRegionDetector as RealUiRegionDetector
 
@@ -114,13 +118,13 @@ class TestConstruction:
         assert hasattr(det, "detect")
         assert callable(det.detect)
 
-    def test_detect_returns_TemplatHit_or_None(self):
-        """Signature: detect(frame, zone) -> TemplateHit | None."""
-        cfg = _config(_zone("menu", 0, 0, 100, 100, "presence"))
+    def test_detect_returns_UiZoneHit_or_None(self):
+        """Signature: detect(frame, zone) -> UiZoneHit | None."""
+        cfg = _config(_zone("menu", 0, 0, 64, 36, "presence"))
         det = _detector(cfg)
         frame = _solid(128, 72, (0, 0, 0))
         result = det.detect(frame, cfg.ui_zones[0])
-        assert result is None or isinstance(result, TemplateHit)
+        assert result is None or isinstance(result, UiZoneHit)
 
 
 # --- presence check ---------------------------------------------------------
@@ -133,8 +137,8 @@ class TestPresence:
         frame = _checkerboard(128, 72, (255, 255, 255), (10, 10, 10))
         hit = det.detect(frame, zone)
         assert hit is not None, "a non-uniform region should be detected as present"
-        assert hit.template == "hp_bar"
-        assert hit.confidence > 0.0
+        assert hit.zone == "hp_bar"
+        assert hit.value > 0.0
         assert hit.bbox is not None
 
     def test_uniform_region_reports_absent(self):
@@ -166,7 +170,7 @@ class TestBrightness:
         frame = _solid(128, 72, (220, 220, 220))
         hit = det.detect(frame, zone)
         assert hit is not None
-        assert hit.template == "bright_btn"
+        assert hit.zone == "bright_btn"
 
     def test_dark_region_reports_none(self):
         zone = _zone("dark_bg", 0, 0, 32, 32, "brightness")
@@ -187,27 +191,28 @@ class TestBrightness:
 # --- error isolation --------------------------------------------------------
 
 class TestErrorIsolation:
-    def test_unknown_check_returns_none(self):
-        """A ``check`` outside the closed set must not raise.
+    def test_unknown_check_raises(self):
+        """A ``check`` outside the closed set must raise, not return ``None``.
 
         ``UiZone.__init__`` enforces the closed set, so we build a valid
         zone, then force an invalid ``check`` past the validator with
-        ``object.__setattr__``.  The detector must still degrade gracefully
-        (return ``None``) rather than blowing up the pipeline.
+        ``object.__setattr__``.  The detector must raise
+        :class:`PerceptionError` so the pipeline records it in
+        ``detector_errors``.
         """
         zone = _zone("weird", 0, 0, 32, 32, "presence")
         object.__setattr__(zone, "check", "not_a_real_check")
-        # Construct the detector with a *valid* config (no invalid zones),
-        # then pass the forced-invalid zone directly to detect().
         det = _detector(_config(_zone("other", 0, 0, 32, 32, "presence")))
         frame = _solid(128, 72, (0, 0, 0))
-        assert det.detect(frame, zone) is None  # must not raise
+        from ai_game_agent.perception.base import PerceptionError
+        with pytest.raises(PerceptionError, match="unknown check"):
+            det.detect(frame, zone)
 
     def test_detect_never_raises_on_empty_frame(self):
         det = _detector(_config(_zone("x", 0, 0, 1, 1, "presence")))
         frame = _frame(128, 72, lambda x, y: (0, 0, 0))
         result = det.detect(frame, _zone("x", 0, 0, 1, 1, "presence"))
-        assert result is None or isinstance(result, TemplateHit)
+        assert result is None or isinstance(result, UiZoneHit)
 
 
 # --- color_present check (OpenCV required) ---------------------------------
@@ -222,7 +227,7 @@ class TestColorPresent:
         frame = _solid(128, 72, (200, 30, 30))  # clearly red
         hit = det.detect(frame, zone)
         assert hit is not None
-        assert hit.template == "red_health"
+        assert hit.zone == "red_health"
 
     def test_blue_region_is_not_red(self):
         zone = _zone("red_health", 0, 0, 64, 36, "color_present")
@@ -235,7 +240,7 @@ class TestColorPresent:
         det = _detector(_config(zone))
         frame = _solid(128, 72, (10, 10, 10))
         result = det.detect(frame, zone)
-        assert result is None or isinstance(result, TemplateHit)
+        assert result is None or isinstance(result, UiZoneHit)
 
 
 # --- wiring: _build_perception must actually wire the UI detector ----------
@@ -299,8 +304,8 @@ class TestBuildPerceptionWiring:
         # A non-uniform frame (checkerboard) so the ``presence`` check fires.
         frame = _checkerboard(128, 72, (200, 200, 200), (20, 20, 20))
         observation = perception.observe(frame)
-        hit_names = [t.template for t in observation.templates]
-        assert "action_bar" in hit_names, (
+        hit_zones = [u.zone for u in observation.ui_zones]
+        assert "action_bar" in hit_zones, (
             f"configured presence zone should produce a hit; "
-            f"got templates={hit_names}, errors={observation.detector_errors}"
+            f"got ui_zones={hit_zones}, errors={observation.detector_errors}"
         )

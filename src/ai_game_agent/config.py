@@ -142,6 +142,11 @@ class _UiZoneConfig(BaseModel):
     width: int = Field(gt=0)
     height: int = Field(gt=0)
     check: str
+    #: Optional per-zone overrides (all optional, defaulted to the detector
+    #: canonical constants when unset).
+    threshold: float | None = Field(default=None, ge=0.0)
+    target_rgb: tuple[int, int, int] | None = None
+    tolerance: int | None = Field(default=None, ge=0)
 
     @field_validator("check")
     @classmethod
@@ -149,6 +154,15 @@ class _UiZoneConfig(BaseModel):
         if value not in _VALID_UI_CHECKS:
             allowed = ", ".join(sorted(_VALID_UI_CHECKS))
             raise ValueError(f"invalid ui zone check {value!r}; expected one of: {allowed}")
+        return value
+
+    @field_validator("target_rgb")
+    @classmethod
+    def _check_target_rgb(cls, value: tuple[int, int, int] | None) -> tuple[int, int, int] | None:
+        if value is None:
+            return None
+        if any(not 0 <= c <= 255 for c in value):
+            raise ValueError(f"target_rgb channels must be in [0, 255], got {value!r}")
         return value
 
 
@@ -274,10 +288,21 @@ class UiZone:
     one of the closed set (presence, brightness, color_present).
     """
 
-    __slots__ = ("name", "x", "y", "width", "height", "check")
+    __slots__ = (
+        "name", "x", "y", "width", "height", "check", "threshold", "target_rgb", "tolerance"
+    )
 
     def __init__(
-        self, name: str, x: int, y: int, width: int, height: int, check: str
+        self,
+        name: str,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        check: str,
+        threshold: float | None = None,
+        target_rgb: tuple[int, int, int] | None = None,
+        tolerance: int | None = None,
     ) -> None:
         if width <= 0 or height <= 0:
             raise ValueError("ui zone width and height must be positive")
@@ -292,6 +317,9 @@ class UiZone:
         object.__setattr__(self, "width", width)
         object.__setattr__(self, "height", height)
         object.__setattr__(self, "check", check)
+        object.__setattr__(self, "threshold", threshold)
+        object.__setattr__(self, "target_rgb", target_rgb)
+        object.__setattr__(self, "tolerance", tolerance)
 
     def __setattr__(self, name: str, value: object) -> None:  # pragma: no cover
         raise AttributeError("UiZone is immutable")
@@ -299,19 +327,24 @@ class UiZone:
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
             f"UiZone(name={self.name!r}, x={self.x}, y={self.y}, "
-            f"width={self.width}, height={self.height}, check={self.check!r})"
+            f"width={self.width}, height={self.height}, check={self.check!r}, "
+            f"threshold={self.threshold!r}, target_rgb={self.target_rgb!r}, "
+            f"tolerance={self.tolerance!r})"
         )
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, UiZone):
             return NotImplemented
         return (
-            (self.name, self.x, self.y, self.width, self.height, self.check)
-            == (other.name, other.x, other.y, other.width, other.height, other.check)
+            (self.name, self.x, self.y, self.width, self.height, self.check,
+             self.threshold, self.target_rgb, self.tolerance)
+            == (other.name, other.x, other.y, other.width, other.height, other.check,
+                other.threshold, other.target_rgb, other.tolerance)
         )
 
     def __hash__(self) -> int:
-        return hash((self.name, self.x, self.y, self.width, self.height, self.check))
+        return hash((self.name, self.x, self.y, self.width, self.height, self.check,
+                        self.threshold, self.target_rgb, self.tolerance))
 
 
 class _FrozenConfig:
@@ -490,7 +523,8 @@ class PerceptionConfig(_FrozenConfig):
     ) -> None:
         ui_zone_models = tuple(
             _UiZoneConfig(
-                name=z.name, x=z.x, y=z.y, width=z.width, height=z.height, check=z.check
+                name=z.name, x=z.x, y=z.y, width=z.width, height=z.height, check=z.check,
+                threshold=z.threshold, target_rgb=z.target_rgb, tolerance=z.tolerance,
             )
             for z in ui_zones
         )
@@ -542,7 +576,8 @@ class PerceptionConfig(_FrozenConfig):
     def ui_zones(self) -> tuple[UiZone, ...]:
         return tuple(
             UiZone(
-                z.name, z.x, z.y, z.width, z.height, z.check
+                z.name, z.x, z.y, z.width, z.height, z.check,
+                threshold=z.threshold, target_rgb=z.target_rgb, tolerance=z.tolerance,
             )
             for z in self._m.ui_zones
         )
@@ -623,7 +658,9 @@ def _config_from_model(model: _Config) -> Config:
             template_threshold=model.perception.template_threshold,
             templates=dict(model.perception.templates),
             ui_zones=tuple(
-                UiZone(z.name, z.x, z.y, z.width, z.height, z.check)
+                UiZone(z.name, z.x, z.y, z.width, z.height, z.check,
+                       threshold=z.threshold, target_rgb=z.target_rgb,
+                       tolerance=z.tolerance)
                 for z in model.perception.ui_zones
             ),
             ocr_enabled=model.perception.ocr.enabled,

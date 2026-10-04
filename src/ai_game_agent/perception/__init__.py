@@ -22,6 +22,7 @@ from ai_game_agent.perception.observation import (
     Observation,
     TemplateHit,
     TextRegion,
+    UiZoneHit,
 )
 from ai_game_agent.perception.pipeline import Perception
 
@@ -37,4 +38,5 @@ __all__ = [
     "TemplateMatcher",
     "TextRegion",
     "UiRegionDetector",
+    "UiZoneHit",
 ]

@@ -34,6 +34,7 @@ from ai_game_agent.perception import (
     TemplateMatcher,
     TextRegion,
     UiRegionDetector,
+    UiZoneHit,
 )
 from ai_game_agent.perception.observation import ObjectHit
 
@@ -83,14 +84,14 @@ class FakeUiDetector:
 
     def __init__(
         self,
-        hits: dict[str, TemplateHit] | None = None,
+        hits: dict[str, UiZoneHit] | None = None,
         fail_zones: tuple[str, ...] = (),
     ) -> None:
         self._hits = dict(hits or {})
         self._fail_zones = set(fail_zones)
         self.calls: list[tuple[Frame, UiZone]] = []
 
-    def detect(self, frame: Frame, zone: UiZone) -> TemplateHit | None:
+    def detect(self, frame: Frame, zone: UiZone) -> UiZoneHit | None:
         self.calls.append((frame, zone))
         if zone.name in self._fail_zones:
             raise RuntimeError(f"boom for {zone.name}")
@@ -158,7 +159,10 @@ def _full_fakes() -> dict[str, object]:
             hits={"target_frame": TemplateHit("target_frame", _bbox(0, 0, 24, 24), 0.94)}
         ),
         "ui_detector": FakeUiDetector(
-            hits={"action_bar": TemplateHit("ui:action_bar", _bbox(0, 60, 32, 12), 0.9)}
+            hits={"action_bar": UiZoneHit(
+                zone="action_bar", check="brightness",
+                bbox=_bbox(0, 60, 32, 12), value=0.9,
+            )}
         ),
         "ocr_engine": FakeOcrEngine(
             hits={_bbox(): TextRegion("12 / 12", _bbox(), 0.88)}
@@ -216,7 +220,10 @@ class TestObserveComposition:
         assert obs.source == "mock"
         assert obs.templates == (
             TemplateHit("target_frame", _bbox(0, 0, 24, 24), 0.94),
-            TemplateHit("ui:action_bar", _bbox(0, 60, 32, 12), 0.9),
+        )
+        assert obs.ui_zones == (
+            UiZoneHit(zone="action_bar", check="brightness",
+                      bbox=_bbox(0, 60, 32, 12), value=0.9),
         )
         assert obs.text_regions == (TextRegion("12 / 12", _bbox(), 0.88),)
         assert obs.objects == (ObjectHit("loot_glow", _bbox(50, 40, 8, 8), 0.7),)
@@ -236,12 +243,14 @@ class TestObserveComposition:
         obs = p.observe(_frame())
 
         assert obs.templates == ()
+        assert obs.ui_zones == ()
         assert obs.text_regions == ()
         assert obs.objects == ()
         assert obs.detector_errors == ()
 
     def test_ui_zone_hit_is_pass_through(self) -> None:
-        zone_hit = TemplateHit("ui:action_bar", _bbox(0, 60, 32, 12), 0.9)
+        zone_hit = UiZoneHit(zone="action_bar", check="brightness",
+                             bbox=_bbox(0, 60, 32, 12), value=0.9)
         p = Perception(
             _config(templates=None, ocr_enabled=False, objects_enabled=False),
             ui_detector=FakeUiDetector(hits={"action_bar": zone_hit}),
@@ -249,7 +258,7 @@ class TestObserveComposition:
 
         obs = p.observe(_frame())
 
-        assert obs.templates == (zone_hit,)
+        assert obs.ui_zones == (zone_hit,)
 
     def test_ocr_receives_configured_region_bbox(self) -> None:
         engine = FakeOcrEngine(hits={_bbox(): TextRegion("hp", _bbox(), 0.5)})
@@ -311,6 +320,7 @@ class TestDisabledDetectors:
         obs = p.observe(_frame())
 
         assert obs.templates == ()
+        assert obs.ui_zones == ()
         assert obs.text_regions == ()
         assert obs.objects == ()
         assert obs.detector_errors == ()
@@ -384,7 +394,7 @@ class TestDetectorErrors:
     def test_single_failing_ui_zone_others_still_checked(self) -> None:
         zone_a = UiZone("zone_a", 0, 0, 10, 10, "brightness")
         zone_b = UiZone("zone_b", 0, 0, 10, 10, "brightness")
-        hit_b = TemplateHit("ui:zone_b", _bbox(), 0.8)
+        hit_b = UiZoneHit(zone="zone_b", check="brightness", bbox=_bbox(), value=0.8)
         detector = FakeUiDetector(hits={"zone_b": hit_b}, fail_zones=("zone_a",))
         p = Perception(
             _config(
@@ -398,6 +408,6 @@ class TestDetectorErrors:
 
         obs = p.observe(_frame())
 
-        assert obs.templates == (hit_b,)
+        assert obs.ui_zones == (hit_b,)
         assert len(obs.detector_errors) == 1
         assert obs.detector_errors[0].startswith("ui:zone_a")

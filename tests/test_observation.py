@@ -18,6 +18,7 @@ from ai_game_agent.perception.observation import (
     Observation,
     TemplateHit,
     TextRegion,
+    UiZoneHit,
 )
 
 
@@ -36,6 +37,7 @@ def _full() -> Observation:
         captured_at=_ts(),
         source="mock",
         templates=(TemplateHit(template="target_frame", bbox=_bbox(), confidence=0.94),),
+        ui_zones=(UiZoneHit(zone="hp_bar", check="brightness", bbox=_bbox(), value=0.85),),
         text_regions=(TextRegion(text="12 / 12", bbox=_bbox(), confidence=0.88),),
         objects=(ObjectHit(kind="loot_glow", bbox=_bbox(), confidence=0.7),),
         detector_errors=("ocr: tesseract not installed",),
@@ -75,18 +77,19 @@ class TestObservationShape:
         # Frozen dataclass with tuple fields must be hashable.
         assert hash(_full()) == hash(_full())
 
-    def test_schema_version_defaults_to_one(self) -> None:
+    def test_schema_version_is_two(self) -> None:
         obs = Observation(
             frame_width=2,
             frame_height=2,
             captured_at=_ts(),
             source="mock",
             templates=(),
+            ui_zones=(),
             text_regions=(),
             objects=(),
             detector_errors=(),
         )
-        assert obs.schema_version == 1
+        assert obs.schema_version == 2
 
 
 class TestEmptyObservation:
@@ -97,12 +100,14 @@ class TestEmptyObservation:
             captured_at=_ts(),
             source="mock",
             templates=(),
+            ui_zones=(),
             text_regions=(),
             objects=(),
             detector_errors=(),
         )
         d = obs.to_dict()
         assert d["templates"] == []
+        assert d["ui_zones"] == []
         assert d["text_regions"] == []
         assert d["objects"] == []
         assert d["detector_errors"] == []
@@ -133,6 +138,7 @@ class TestSerialization:
             "captured_at",
             "source",
             "templates",
+            "ui_zones",
             "text_regions",
             "objects",
             "detector_errors",
@@ -152,7 +158,7 @@ class TestSerialization:
     def test_to_json_round_trips(self) -> None:
         payload = json.loads(_full().to_json())
         assert payload["source"] == "mock"
-        assert payload["schema_version"] == 1
+        assert payload["schema_version"] == 2
         assert payload["detector_errors"] == ["ocr: tesseract not installed"]
 
     def test_empty_to_json_round_trips(self) -> None:
@@ -162,9 +168,11 @@ class TestSerialization:
             captured_at=_ts(),
             source="mock",
             templates=(),
+            ui_zones=(),
             text_regions=(),
             objects=(),
             detector_errors=(),
         )
         payload = json.loads(empty.to_json())
         assert payload["templates"] == []
+        assert payload["ui_zones"] == []
