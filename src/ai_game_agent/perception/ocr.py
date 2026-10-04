@@ -18,9 +18,9 @@ Design rules:
 * The engine does not swallow backend errors — it lets them propagate.
   The ``Perception`` pipeline is responsible for catching per-region
   exceptions into ``Observation.detector_errors``.
-
-The default backend (``_default_backend()``) imports ``pytesseract`` and
-``PIL`` on first call, so the module imports cleanly in a bare venv.
+* ``pytesseract`` and ``PIL`` are imported lazily on first use (see
+  :meth:`TesseractEngine._resolve_backend`), so the module loads cleanly in
+  a bare venv.
 """
 
 from __future__ import annotations
@@ -176,14 +176,3 @@ class TesseractEngine:
             return None
 
         return TextRegion(text=text, bbox=region, confidence=confidence)
-
-
-def _default_backend() -> TesseractBackend:  # pragma: no cover
-    """Construct a default pytesseract-based backend.
-
-    Kept as a standalone function so ``TesseractEngine.__init__`` stays
-    lightweight and the import is deferred to first use.
-    """
-    import pytesseract
-
-    return pytesseract

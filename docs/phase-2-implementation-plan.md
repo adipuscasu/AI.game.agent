@@ -369,7 +369,6 @@ perception:
   ui_zones: []                    # see plan §5.2 for the shape
   ocr:
     enabled: false                # default off: needs the `ocr` extra + tesseract
-    engine: pytesseract
     regions: []                   # [{x, y, width, height, name}]
   objects:
     enabled: false
@@ -491,10 +490,13 @@ long before any heavy dependency is required.
   replacing it with valid PNGs or deleting it. This decision gates the step 8
   (`analyze`) demo and the §7.3 done-criteria, but steps 5–7 are
   independent of it and can proceed in the meantime.
-* **OCR default** — *resolved: yes.* `pytesseract` is the default engine
-  (`perception.ocr.engine` default in `config.py`, `ocr` extra declared in
-  `pyproject.toml`); the "real" engine decision is deferred to the Phase 5
-  review. (The adapter in `ocr.py` is still pending — step 7.)
+* **OCR default** — *resolved: yes.* `pytesseract` is the default engine,
+  behind the `OcrEngine` protocol (`ocr` extra declared in
+  `pyproject.toml`); there is deliberately **no** `engine` selector knob in
+  config — the pipeline supports the Tesseract backend, and swapping adapters
+  is a code change (that is the point of the protocol). The "real" engine
+  decision is deferred to the Phase 5 review. (The adapter in `ocr.py` is
+  still pending — step 7.)
 * **`Observation` versioning** — *resolved: yes.* Implemented in step 1:
   `Observation.schema_version` with `SCHEMA_VERSION = 1` in
   `perception/observation.py`.

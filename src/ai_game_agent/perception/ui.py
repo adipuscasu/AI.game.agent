@@ -170,7 +170,7 @@ class UiRegionDetector:
         can fail fast.
         """
         try:
-            import cv2  # noqa: F401
+            import cv2
             import numpy as np
         except ImportError as exc:
             raise PerceptionError(

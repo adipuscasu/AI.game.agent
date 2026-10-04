@@ -43,6 +43,10 @@ vision = [
 ]
 ocr = [
     "pytesseract>=0.3.10",
+    # pytesseract pulls Pillow transitively, but we use it directly in
+    # perception/ocr.py (cropping) — declare it explicitly so the extra is
+    # self-contained.
+    "Pillow>=10.0",
 ]
 
 [project.scripts]

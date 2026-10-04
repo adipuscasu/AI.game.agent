@@ -264,7 +264,7 @@ def _analyze(args: argparse.Namespace) -> int:
         text = json.dumps(observation.to_dict(), sort_keys=True)
     print(text)
     log.info(
-        "analyze: frame=%dx%d detectors=%d",
+        "analyze: frame=%dx%d detector_errors=%d",
         frame.width, frame.height, len(observation.detector_errors),
     )
     return 0
@@ -310,7 +310,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="YAML config file (default: config/default.yaml)",
     )
     p_an.add_argument("--no-templates", action="store_true",
-                      help="disable template matching and UI-zone checks")
+                      help="disable template matching AND UI-zone checks "
+                           "(they share one flag; see docs/phase-2-implementation-plan.md §5.2)")
     p_an.add_argument("--no-ocr", action="store_true", help="disable OCR")
     p_an.add_argument(
         "--no-objects", action="store_true",

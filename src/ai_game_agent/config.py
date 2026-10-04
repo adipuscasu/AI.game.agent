@@ -165,12 +165,16 @@ class _OcrRegionConfig(BaseModel):
 
 
 class _OcrConfig(BaseModel):
-    """OCR settings (Phase 2). Default off: needs the ``ocr`` extra + binary."""
+    """OCR settings (Phase 2). Default off: needs the ``ocr`` extra + binary.
+
+    There is intentionally no ``engine`` selector: the pipeline only supports
+    the Tesseract backend (``perception/ocr.py``), so a config knob that could
+    not change behavior would be dead surface.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     enabled: bool = False
-    engine: str = "pytesseract"
     regions: tuple[_OcrRegionConfig, ...] = ()
 
 
@@ -480,9 +484,9 @@ class PerceptionConfig(_FrozenConfig):
         templates: dict[str, str] | None = None,
         ui_zones: tuple[UiZone, ...] = (),
         ocr_enabled: bool = False,
-        ocr_regions: tuple[dict[str, object], ...] = (),
+        ocr_regions: tuple[dict[str, object], ...] | list[dict[str, object]] = (),
         objects_enabled: bool = False,
-        object_colors: tuple[dict[str, object], ...] = (),
+        object_colors: tuple[dict[str, object], ...] | list[dict[str, object]] = (),
     ) -> None:
         ui_zone_models = tuple(
             _UiZoneConfig(
@@ -495,7 +499,7 @@ class PerceptionConfig(_FrozenConfig):
                 x=int(r["x"]), y=int(r["y"]), width=int(r["width"]),
                 height=int(r["height"]), name=str(r.get("name", "")),
             )
-            for r in ocr_regions
+            for r in (ocr_regions or ())
         )
         object_color_models = tuple(
             _ObjectColorConfig(
@@ -503,7 +507,7 @@ class PerceptionConfig(_FrozenConfig):
                 rgb=(int(c["rgb"][0]), int(c["rgb"][1]), int(c["rgb"][2])),
                 tolerance=int(c.get("tolerance", 40)),
             )
-            for c in object_colors
+            for c in (object_colors or ())
         )
         super().__init__(
             _PerceptionConfig(
@@ -551,10 +555,6 @@ class PerceptionConfig(_FrozenConfig):
     def ocr_regions(self) -> list[dict[str, object]]:
         """Configured OCR regions as JSON-shaped dicts (lists, not tuples)."""
         return [r.model_dump(mode="json") for r in self._m.ocr.regions]
-
-    @property
-    def ocr_engine(self) -> str:
-        return self._m.ocr.engine
 
     @property
     def objects_enabled(self) -> bool:
