@@ -65,6 +65,7 @@ from ai_game_agent.perception import Perception, PerceptionError
 from ai_game_agent.perception.color_blobs import ColorBlobsDetector
 from ai_game_agent.perception.ocr import TesseractEngine
 from ai_game_agent.perception.template import CvTemplateMatcher
+from ai_game_agent.perception.ui import UiRegionDetector
 
 log = logging.getLogger("ai_game_agent")
 
@@ -225,10 +226,11 @@ def _build_perception(args: argparse.Namespace, cfg) -> Perception:
         objects_enabled=bool(object_colors),
         object_colors=tuple(object_colors),
     )
+    ui_detector = UiRegionDetector(perception_cfg) if ui_zones else None
     return Perception(
         perception_cfg,
         template_matcher=template_matcher,
-        ui_detector=None,  # ui zones: no standalone detector in Phase 2
+        ui_detector=ui_detector,
         ocr_engine=ocr_engine,
         object_detector=object_detector,
     )
