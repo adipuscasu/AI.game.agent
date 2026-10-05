@@ -55,8 +55,8 @@ from pathlib import Path
 from ai_game_agent.capture import Capture, CaptureError, FpsMeter, save_frame
 from ai_game_agent.config import (
     CaptureConfig,
+    Config,
     ConfigError,
-    LoggingConfig,
     PerceptionConfig,
     Region,
     load_config,
@@ -76,21 +76,21 @@ from ai_game_agent.perception.ui import UiRegionDetector
 log = logging.getLogger("ai_game_agent")
 
 
-def _setup_logging() -> None:
+def _setup_logging(config: Config) -> None:
     """Configure the ``ai_game_agent`` logger to write to a file.
 
-    Log output goes to ``<logging.directory>/agent.log`` (default
-    ``logs/agent.log``) at the configured level.  No ``StreamHandler`` is
-    attached so that stdout carries only program output (``saved: …``,
-    ``frames=… fps=…``) and stderr carries only ``error:`` / usage — the
-    stream-routing contract the CLI and e2e tests assert on.
+    Log output goes to ``<logging.directory>/agent.log`` at the configured
+    level, both taken from the loaded ``config.logging`` block (defaulting to
+    ``logs/agent.log`` at INFO). No ``StreamHandler`` is attached so that
+    stdout carries only program output (``saved: …``, ``frames=… fps=…``) and
+    stderr carries only ``error:`` / usage — the stream-routing contract the
+    CLI and e2e tests assert on.
     """
-    log_cfg = LoggingConfig()  # level=INFO, directory=logs (defaults)
-    log_dir = Path(log_cfg.directory)
+    log_dir = Path(config.logging.directory)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("ai_game_agent")
-    logger.setLevel(getattr(logging, log_cfg.level, logging.INFO))
+    logger.setLevel(getattr(logging, config.logging.level, logging.INFO))
 
     # Remove handlers left by a previous main() call (happens in-process
     # during the test suite) so the file always reflects the current CWD.
@@ -135,29 +135,42 @@ def _parse_monitor(value: str | None) -> int | None:
 
 
 def _build_capture(
+    cfg: Config,
     args: argparse.Namespace,
     *,
     record_enabled: bool,
     record_dir: Path,
     record_max_files: int,
 ) -> Capture:
+    """Build a :class:`Capture` honoring CLI flags, then config, then defaults.
+
+    Precedence: an explicitly-passed flag (``--backend``/``--region``/
+    ``--scale``/``--fps``/``--monitor``) wins; otherwise the value in
+    ``cfg.capture``; otherwise the :class:`CaptureConfig` code default. Before
+    this, the flag defaults (mss / whole-monitor / 1.0 / no-pacing) were forced
+    no matter what the config said.
+    """
     scale = _parse_scale(getattr(args, "scale", None))
     monitor = _parse_monitor(getattr(args, "monitor", None))
-    cfg = CaptureConfig(
-        backend=args.backend,
-        region=_parse_region(args.region),
-        fps=args.fps,  # fps=0 is a valid "no pacing" value in the config model
-        scale=1.0 if scale is None else scale,
-        record_enabled=record_enabled,
-        record_directory=str(record_dir),
-        record_max_files=record_max_files,
-        monitor=1 if monitor is None else monitor,
+    region = _parse_region(getattr(args, "region", None))
+    ccfg = cfg.capture
+    return Capture(
+        CaptureConfig(
+            backend=args.backend if args.backend is not None else ccfg.backend,
+            region=region if region is not None else ccfg.region,
+            fps=args.fps if args.fps is not None else ccfg.fps,
+            scale=scale if scale is not None else ccfg.scale,
+            record_enabled=record_enabled,
+            record_directory=str(record_dir),
+            record_max_files=record_max_files,
+            monitor=monitor if monitor is not None else ccfg.monitor,
+        )
     )
-    return Capture(cfg)
 
 
-def _capture(args: argparse.Namespace) -> int:
+def _capture(args: argparse.Namespace, cfg: Config) -> int:
     cap = _build_capture(
+        cfg,
         args,
         record_enabled=False,
         record_dir=Path(args.out),
@@ -171,9 +184,10 @@ def _capture(args: argparse.Namespace) -> int:
     return 0
 
 
-def _observe(args: argparse.Namespace) -> int:
+def _observe(args: argparse.Namespace, cfg: Config) -> int:
     meter = FpsMeter()
     cap = _build_capture(
+        cfg,
         args,
         record_enabled=args.record,
         record_dir=Path(args.out),
@@ -258,8 +272,7 @@ def _build_perception(args: argparse.Namespace, cfg) -> Perception:
     )
 
 
-def _analyze(args: argparse.Namespace) -> int:
-    cfg = load_config(getattr(args, "config", None))
+def _analyze(args: argparse.Namespace, cfg: Config) -> int:
     # Build the perception pipeline FIRST so any setup failure (invalid
     # config, missing optional extra, detector construction error) is
     # reported before we open a capture backend — fail fast with no half-open
@@ -267,6 +280,7 @@ def _analyze(args: argparse.Namespace) -> int:
     # detector references; it never touches the screen), so this is safe.
     perception = _build_perception(args, cfg)
     cap = _build_capture(
+        cfg,
         args,
         record_enabled=False,
         record_dir=Path("screenshots"),
@@ -292,17 +306,25 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     p_cap = sub.add_parser("capture", help="Grab one screenshot and save it as PNG.")
-    p_cap.add_argument("--backend", default="mss", help="capture backend (mss | mock)")
+    p_cap.add_argument("--backend", default=None,
+                       help="capture backend (mss | mock); default from config")
     p_cap.add_argument("--monitor", default=None,
                        help="mss monitor index: 1=primary (default), 2+=secondary, 0=all")
     p_cap.add_argument("--region", default=None, help="x,y,width,height (integers)")
     p_cap.add_argument("--scale", default=None, help="downscale factor (e.g. 0.5)")
     p_cap.add_argument("--out", default="screenshots", help="output directory")
-    p_cap.add_argument("--fps", type=int, default=0, help="0 = no pacing (CLI default)")
+    p_cap.add_argument("--fps", type=int, default=None,
+                       help="0 = no pacing; default from config (30)")
+    p_cap.add_argument(
+        "--config", default=None,
+        help="YAML config file (default: config/default.yaml); "
+             "provides defaults for --backend/--region/--scale/--fps/--monitor",
+    )
     p_cap.set_defaults(func=_capture)
 
     p_obs = sub.add_parser("observe", help="Run a capture loop and print measured FPS.")
-    p_obs.add_argument("--backend", default="mss")
+    p_obs.add_argument("--backend", default=None,
+                       help="capture backend (mss | mock); default from config")
     p_obs.add_argument("--monitor", default=None,
                        help="mss monitor index: 1=primary (default), 2+=secondary, 0=all")
     p_obs.add_argument("--region", default=None, help="x,y,width,height (integers)")
@@ -311,23 +333,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_obs.add_argument(
         "--fps",
         type=int,
-        default=0,
-        help="0 = no pacing (headless/CI); otherwise a ceiling, not a guarantee",
+        default=None,
+        help="0 = no pacing (headless/CI); otherwise a ceiling, not a guarantee. "
+             "Default from config (30)",
     )
     p_obs.add_argument("--record", action="store_true", help="write each frame to --out")
     p_obs.add_argument("--record-max-files", type=int, default=1000)
     p_obs.add_argument("--out", default="recordings")
+    p_obs.add_argument(
+        "--config", default=None,
+        help="YAML config file (default: config/default.yaml); "
+             "provides defaults for --backend/--region/--scale/--fps/--monitor",
+    )
     p_obs.set_defaults(func=_observe)
 
     p_an = sub.add_parser(
         "analyze", help="Capture one frame and print the perception Observation as JSON."
     )
-    p_an.add_argument("--backend", default="mss", help="capture backend (mss | mock)")
+    p_an.add_argument("--backend", default=None,
+                      help="capture backend (mss | mock); default from config")
     p_an.add_argument("--monitor", default=None,
                       help="mss monitor index: 1=primary (default), 2+=secondary, 0=all")
     p_an.add_argument("--region", default=None, help="x,y,width,height (integers)")
     p_an.add_argument("--scale", default=None, help="downscale factor (e.g. 0.5)")
-    p_an.add_argument("--fps", type=int, default=0, help="0 = no pacing (CLI default)")
+    p_an.add_argument("--fps", type=int, default=None,
+                      help="0 = no pacing; default from config (30)")
     p_an.add_argument(
         "--config", default=None,
         help="YAML config file (default: config/default.yaml)",
@@ -352,9 +382,16 @@ def main(argv: list[str] | None = None) -> int:
         # No subcommand: usage goes to stderr (argparse convention), exit 2.
         parser.print_help(sys.stderr)
         return 2
-    _setup_logging()
+    # The config is the source of defaults for every subcommand: an
+    # explicitly-passed CLI flag wins, otherwise the loaded config, otherwise
+    # the code default. Load it once here and hand it to the subcommand
+    # handler so capture settings and logging are all config-driven.  The
+    # load sits inside the try so a malformed file yields the clean "error:"
+    # + exit-1 contract instead of a raw traceback (mirrors N2).
     try:
-        return int(args.func(args))
+        cfg = load_config(getattr(args, "config", None))
+        _setup_logging(cfg)
+        return int(args.func(args, cfg))
     except (ValueError, CaptureError, ConfigError, PerceptionError, OSError) as exc:
         # OSError covers genuine I/O failures (permission, full disk,
         # read-only target) raised by save_frame/Recorder while writing

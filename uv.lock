@@ -22,6 +22,7 @@ capture = [
 ]
 dev = [
     { name = "freezegun" },
+    { name = "mss" },
     { name = "pillow" },
     { name = "pytest" },
     { name = "ruff" },
@@ -40,6 +41,7 @@ vision = [
 requires-dist = [
     { name = "freezegun", marker = "extra == 'dev'", specifier = ">=1.4" },
     { name = "mss", marker = "extra == 'capture'", specifier = ">=9.0" },
+    { name = "mss", marker = "extra == 'dev'", specifier = ">=9.0" },
     { name = "numpy", marker = "extra == 'vision'", specifier = ">=1.26" },
     { name = "opencv-python-headless", marker = "extra == 'vision'", specifier = ">=4.9" },
     { name = "pillow", marker = "extra == 'capture'", specifier = ">=10.0" },

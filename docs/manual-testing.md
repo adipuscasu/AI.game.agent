@@ -84,16 +84,23 @@ Shared flags with `capture`/`observe`: `--backend` (default `mss`), `--monitor`,
 
 ### 3.1 Install the optional extras
 
-The core CLI imports and runs with no extras. The perception detectors need
-two optional extras:
+The core CLI imports and runs with no extras. Four extras cover the full
+manual-testing flow:
 
+- `dev` — test tooling (pytest, ruff, …) for the §3.5 cross-checks.
+- `capture` — mss + Pillow. Backs the **real** `--backend mss` capture steps.
 - `vision` — OpenCV + numpy. Backs **template matching** and **object blobs**.
 - `ocr` — pytesseract + Pillow. Backs **OCR** (and, separately, a Tesseract
   binary).
 
+> **`uv sync` prunes the venv to *exactly* the extras you list.** Omitting
+> `capture` here uninstalls `mss` (you will see a ` - mss==…` line in the
+> sync output), and then every `--backend mss` step fails with
+> `error: the 'mss' backend is not installed`. List all four:
+
 ```powershell
-# One-shot: dev + perception extras into the same .venv
-uv sync --extra dev --extra vision --extra ocr
+# One-shot: dev + capture + perception extras into the same .venv
+uv sync --extra dev --extra capture --extra vision --extra ocr
 ```
 
 OCR needs the Tesseract **binary** on `PATH` as well — the Python package alone
@@ -101,7 +108,7 @@ is not enough:
 
 ```powershell
 # Option A — winget (Windows 10/11), then open a NEW terminal:
-winget install --id UB Mannheim.Tesseract-OCR
+winget install --id UB-Mannheim.TesseractOCR
 
 # Option B — download the installer from the Tesseract wiki
 # (https://github.com/UB-Mannheim/tesseract/wiki), install, open a NEW terminal.

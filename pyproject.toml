@@ -32,7 +32,11 @@ dev = [
     "pytest>=8.0",
     "freezegun>=1.4",
     "ruff>=0.4",
+    # Pillow + mss: the *default* capture backend (mss) and frame-to-PNG path
+    # (Pillow) must work immediately after the documented `uv sync --extra dev`
+    # setup step, not only after adding the separate `capture` extra.
     "Pillow>=10.0",
+    "mss>=9.0",
 ]
 # Phase 2 perception. ``vision`` backs template matching / blob detection
 # (OpenCV + numpy). ``ocr`` wraps the Tesseract binary. Both are optional: the
