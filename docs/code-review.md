@@ -359,3 +359,43 @@ analyze disabled-perception (bare env)      -> rc=0, empty observation, detector
 
 1. Refresh the PR description (commits/files/tests) to match the current head.
 2. Merge `feature/phase-2` into `develop` once CI is green on the final head.
+
+## Phase 2 — fourth review (2026-10-06, PR #2 head)
+
+> External re-review of the current head of PR #2. Verdict: **Request changes —
+> 1 P1 + 1 P2**, with the earlier import-hygiene concern carried over as the
+> P1. Re-verified against the live tree before acting (the review snapshot lagged
+> the head).
+
+### Resolution of the fourth review
+
+| # | Sev | Where | Finding | Resolution |
+|---|-----|-------|---------|------------|
+| 1 | 🔴 P1 | `__main__.py` module scope | The import-hygiene test asserts `perception.enabled:false` must not import `perception.template`/`ocr`/`ui`, yet `__main__.py` was reported to import those three at module top. | ✅ **Already fixed** — the live head (commit `da0bf9a`, "import perception impls only when their subsystem is selected") already moved all three into the selecting branch of `_build_perception`, behind the `enabled` master switch. `test_cli_analyze_perception_disabled_imports_no_impl_modules` passes against the live tree. No re-fix needed. |
+| 2 | 🟠 P2 | `__main__.py` `build_parser` / `_observe` | `--record` and `--no-record` wrote to two independent argparse destinations, so `--record --no-record` evaluated as `args.record if args.record is not None else args.no_record` → `True`. **Both** flag orders enabled recording, contradicting the documented "last flag wins". | ✅ **Fixed in this commit** — both flags now share the single `record` destination (`store_const` True/False, default `None`), so argparse applies them in command-line order and the last flag wins: `--record --no-record` → off, `--no-record --record` → on, no flag → `None` → config. `_observe` simplified to `record_enabled = args.record`. |
+| 3 | 🟡 Minor | PR description | Still reported 15 commits / 37 files / 194 tests while the PR had grown to 30 commits. | ⚠️ Cleanup — PR body refresh requires a GitHub write credential not present in this environment. |
+
+### Regression tests added (red → green)
+
+- `test_cli_observe_record_no_record_last_flag_wins`: `--record --no-record`
+  with config `record.enabled: true` must record **nothing** (the last flag,
+  `--no-record`, wins). **Verified red** against the pre-fix code (3 frames were
+  written), green after the fix.
+- `test_cli_observe_no_record_record_last_flag_wins`: `--no-record --record`
+  must record **3 frames** (the last flag, `--record`, wins). The two orders
+  now produce opposite results, matching the documented CLI contract.
+
+### Verification snapshot (2026-10-06, this commit)
+
+```
+pytest -q                                   -> 225 passed
+ruff check src/ai_game_agent/__main__.py tests/test_cli.py -> All checks passed!
+--record --no-record  -> record = False   (last flag wins)
+--no-record --record  -> record = True    (last flag wins)
+(no flag)             -> record = None    (falls back to config)
+```
+
+### Suggested order
+
+1. Refresh the PR description (commits/files/tests) to match the current head.
+2. Merge `feature/phase-2` into `develop` once CI is green on the final head.

@@ -197,13 +197,15 @@ def _capture(args: argparse.Namespace, cfg: Config) -> int:
 
 def _observe(args: argparse.Namespace, cfg: Config) -> int:
     meter = FpsMeter()
-    # ``--record``/``--no-record`` are None sentinels (not booleans) so the
-    # config's capture.record.{enabled,directory,max_files} can supply the
-    # default when no flag is passed — the same precedence as every other
-    # capture knob (flag → config → code default). When both flags are passed
-    # the last one on the command line wins (argparse applies them in order),
-    # matching the usual CLI convention.
-    record_enabled = args.record if args.record is not None else args.no_record
+    # ``--record`` and ``--no-record`` both write to the single
+    # ``record`` destination (``store_const`` True/False, default ``None``)
+    # so argparse applies them in command-line order and the LAST flag
+    # wins: ``--record --no-record`` → False, ``--no-record --record`` →
+    # True. A ``None`` sentinel (no flag) means the config's
+    # capture.record.{enabled,directory,max_files} supplies the default —
+    # the same precedence as every other capture knob (flag → config →
+    # code default).
+    record_enabled = args.record
     cap = _build_capture(
         cfg,
         args,
@@ -379,10 +381,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="0 = no pacing (headless/CI); otherwise a ceiling, not a guarantee. "
              "Default from config (30)",
     )
-    p_obs.add_argument("--record", action="store_const", const=True, default=None,
+    # Both flags share the ``record`` destination (store_const True/False,
+    # default None) so argparse applies them in command-line order: the
+    # last flag wins, and a missing pair falls back to the config.
+    p_obs.add_argument("--record", dest="record", action="store_const",
+                       const=True, default=None,
                        help="write each frame to --out"
                             " (default: capture.record.enabled from config)")
-    p_obs.add_argument("--no-record", action="store_const", const=False, default=None,
+    p_obs.add_argument("--no-record", dest="record", action="store_const",
+                       const=False, default=None,
                        help="do not record for this run, even if the config "
                             "enables capture.record.enabled")
     p_obs.add_argument("--record-max-files", type=int, default=None,

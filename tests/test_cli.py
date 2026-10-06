@@ -322,6 +322,69 @@ def test_cli_observe_no_record_flag_beats_config_enabled(tmp_path):
     )
 
 
+def test_cli_observe_record_no_record_last_flag_wins(tmp_path):
+    """With both flags passed, the LAST one on the command line wins.
+
+    Regression for the P2 review finding: ``--record`` and ``--no-record``
+    wrote to two independent argparse destinations, so
+    ``--record --no-record`` evaluated as
+    ``args.record if args.record is not None else args.no_record``
+    → ``True`` — i.e. recording stayed ON even though the user's last
+    (and final) choice was ``--no-record``. Both flags must target the
+    same destination so argparse's in-order application makes the last
+    flag win: ``--record --no-record`` → off.
+    """
+    cfg = tmp_path / "cap.yaml"
+    rec = tmp_path / "recs"
+    cfg.write_text(
+        "capture:\n"
+        "  backend: mock\n"
+        "  record:\n"
+        "    enabled: true\n"
+        f"    directory: {rec}\n"
+        "    max_files: 1000\n",
+        encoding="utf-8",
+    )
+    rc = main([
+        "observe", "--config", str(cfg), "--backend", "mock",
+        "--frames", "3", "--fps", "0", "--record", "--no-record",
+    ])
+    assert rc == 0
+    assert not list(rec.glob("*.png")), (
+        "--record --no-record: the last flag (--no-record) must win — "
+        "recording must stay off"
+    )
+
+
+def test_cli_observe_no_record_record_last_flag_wins(tmp_path):
+    """Mirror of the ordering test above: ``--no-record --record`` → on.
+
+    The two orders must produce opposite results; the documented CLI
+    contract is that the last flag on the command line wins, not that
+    ``--record`` always wins.
+    """
+    cfg = tmp_path / "cap.yaml"
+    rec = tmp_path / "recs"
+    cfg.write_text(
+        "capture:\n"
+        "  backend: mock\n"
+        "  record:\n"
+        "    enabled: true\n"
+        f"    directory: {rec}\n"
+        "    max_files: 1000\n",
+        encoding="utf-8",
+    )
+    rc = main([
+        "observe", "--config", str(cfg), "--backend", "mock",
+        "--frames", "3", "--fps", "0", "--no-record", "--record",
+    ])
+    assert rc == 0
+    assert len(list(rec.glob("*.png"))) == 3, (
+        "--no-record --record: the last flag (--record) must win — "
+        "recording must be on"
+    )
+
+
 def test_cli_analyze_perception_disabled_skips_optional_detectors(tmp_path, capsys):
     """perception.enabled: false must short-circuit before detector construction.
 
