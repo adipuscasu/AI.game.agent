@@ -1,0 +1,78 @@
+# config/fulltest.yaml
+#
+# Full-perception reference config: every perception subsystem enabled.
+# Use it to exercise / demo the pipeline, or as a starting point:
+#
+#   ai-game-agent analyze --config config/fulltest.yaml                  # real screen (mss)
+#   ai-game-agent analyze --config config/fulltest.yaml --backend mock   # headless demo
+#
+# The heavy detectors need the optional extras (already covered by `.[dev]`):
+#
+#   pip install ai-game-agent[vision,ocr]
+#
+# A missing extra never crashes `analyze`: that subsystem reports a clean,
+# named error in `detector_errors` and the rest of the observation stands.
+#
+# All ui_zones / ocr.regions are anchored at the top-left and small enough to
+# fit inside the 128x72 mock frame, so the headless run stays clean. On a real
+# screen, tune the coordinates, colors, and thresholds to your game's UI.
+
+ai:
+  provider: ollama
+  model: qwen3.8:27b
+  base_url: http://localhost:11434
+
+capture:
+  backend: mss        # real screen; `--backend mock` overrides this for headless
+  region: null        # null = whole monitor (set x,y,width,height to crop)
+  monitor: 1          # 0 = whole virtual screen, 1 = primary monitor
+  fps: 30
+  scale: 1.0
+
+perception:
+  enabled: true
+  template_threshold: 0.8
+
+  # 1) Template matching — locate the loot-glow icon anywhere on screen.
+  #    Path is resolved relative to the working directory.
+  templates:
+    loot_glow: assets/templates/loot_glow.png
+
+  # 2) UI zones — semantic state checks on fixed UI regions.
+  ui_zones:
+    - name: health
+      x: 0
+      y: 0
+      width: 100
+      height: 8
+      check: brightness
+      threshold: 8              # low → fires even on the dark mock frame
+    - name: resource
+      x: 0
+      y: 16
+      width: 100
+      height: 8
+      check: color_present
+      target_rgb: [10, 20, 30]  # the mock frame color → fires headless
+      tolerance: 20
+
+  # 3) OCR — read text from a region (needs the `ocr` extra + tesseract binary).
+  ocr:
+    enabled: true
+    regions:
+      - name: label
+        x: 0
+        y: 40
+        width: 100
+        height: 12
+
+  # 4) Object detection — color blobs (needs the `vision` extra).
+  objects:
+    enabled: true
+    colors:
+      - name: frame_color   # the mock frame color → fires deterministically headless
+        rgb: [10, 20, 30]
+        tolerance: 20
+      - name: loot_gold     # a real-screen color; fires on a live WoW UI
+        rgb: [255, 200, 40]
+        tolerance: 40

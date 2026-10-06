@@ -268,6 +268,31 @@ perception:
 
 
 @pytest.mark.e2e
+def test_analyze_fulltest_config_fires_all_subsystems() -> None:
+    """config/fulltest.yaml exercises every perception subsystem headless.
+
+    The mock backend emits a deterministic uniform frame, so this is a stable
+    non-empty-output contract for the full-perception config: a *clean* run
+    (no detector errors — the template PNG loads, OCR runs) with real hits
+    from the detectors that can fire on a uniform frame.
+    """
+    result = run_cli("analyze", "--backend", "mock", "--config", "config/fulltest.yaml")
+    assert result.returncode == 0, result.stderr
+    obs = json.loads(result.stdout)
+    # Clean run: all four subsystems executed without error.
+    assert obs.get("detector_errors") == []
+    # ui_zones fired (brightness + color_present checks).
+    zones = {z["zone"] for z in obs.get("ui_zones", [])}
+    assert {"health", "resource"} <= zones
+    # objects fired (the frame-color blob detector).
+    assert "frame_color" in {o["kind"] for o in obs.get("objects", [])}
+    # A blank frame has no icon/text: "ran but found nothing" is the correct
+    # outcome for templates and OCR — not an error.
+    assert obs.get("templates") == []
+    assert obs.get("text_regions") == []
+
+
+@pytest.mark.e2e
 def test_analyze_bad_config_reports_error(tmp_path: Path) -> None:
     """analyze --config with a malformed file ⇒ exit 1, error: on stderr, empty stdout."""
     bad = tmp_path / "bad.yaml"

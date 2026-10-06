@@ -136,6 +136,10 @@ uv run ai-game-agent analyze --backend mss --region 640,360,1920,1080 --scale 0.
 
 # Disable individual subsystems (OCR needs the "ocr" extra + Tesseract)
 uv run ai-game-agent analyze --no-ocr --no-objects --no-templates
+
+# Full-perception demo: every subsystem on (needs .[vision,ocr]); the mock
+# frame makes the ui-zone / object hits deterministic headless
+uv run ai-game-agent analyze --config config/fulltest.yaml --backend mock --fps 0
 ```
 
 Shared options with `capture`/`observe`: `--backend` (default `mss`), `--monitor` (1=primary default, 2+=secondary, 0=whole virtual screen), `--config`,
