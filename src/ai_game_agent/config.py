@@ -188,12 +188,18 @@ class _OcrConfig(BaseModel):
     There is intentionally no ``engine`` selector: the pipeline only supports
     the Tesseract backend (``perception/ocr.py``), so a config knob that could
     not change behavior would be dead surface.
+
+    ``min_confidence`` is a noise floor: Tesseract emits low-confidence
+    garbage on real frames (e.g. a single "i" at 0.34 from UI anti-aliasing);
+    results strictly below the floor are dropped by the pipeline. The gate
+    lives in the pipeline (not the engine) so any future engine benefits.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     enabled: bool = False
     regions: tuple[_OcrRegionConfig, ...] = ()
+    min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class _ObjectColorConfig(BaseModel):
@@ -535,6 +541,7 @@ class PerceptionConfig(_FrozenConfig):
         ui_zones: tuple[UiZone, ...] = (),
         ocr_enabled: bool = False,
         ocr_regions: tuple[dict[str, object], ...] | list[dict[str, object]] = (),
+        ocr_min_confidence: float = 0.5,
         objects_enabled: bool = False,
         object_colors: tuple[dict[str, object], ...] | list[dict[str, object]] = (),
     ) -> None:
@@ -569,6 +576,7 @@ class PerceptionConfig(_FrozenConfig):
                 ocr=_OcrConfig(
                     enabled=ocr_enabled,
                     regions=ocr_regions_models,
+                    min_confidence=ocr_min_confidence,
                 ),
                 objects=_ObjectConfig(
                     enabled=objects_enabled,
@@ -602,6 +610,11 @@ class PerceptionConfig(_FrozenConfig):
     @property
     def ocr_enabled(self) -> bool:
         return self._m.ocr.enabled
+
+    @property
+    def ocr_min_confidence(self) -> float:
+        """Noise floor: OCR results strictly below this are dropped."""
+        return self._m.ocr.min_confidence
 
     @property
     def ocr_regions(self) -> list[dict[str, object]]:
@@ -683,6 +696,7 @@ def _config_from_model(model: _Config) -> Config:
             ),
             ocr_enabled=model.perception.ocr.enabled,
             ocr_regions=tuple(r.model_dump() for r in model.perception.ocr.regions),
+            ocr_min_confidence=model.perception.ocr.min_confidence,
             objects_enabled=model.perception.objects.enabled,
             object_colors=tuple(c.model_dump() for c in model.perception.objects.colors),
         ),

@@ -411,3 +411,45 @@ class TestDetectorErrors:
         assert obs.ui_zones == (hit_b,)
         assert len(obs.detector_errors) == 1
         assert obs.detector_errors[0].startswith("ui:zone_a")
+
+
+class TestOcrConfidenceGate:
+    """OCR results below ``ocr_min_confidence`` are dropped (noise gate).
+
+    Mirrors the objects noise-floor fix: Tesseract routinely emits
+    low-confidence garbage on real frames (e.g. ``"i"`` at 0.34 from UI
+    anti-aliasing), and those must not pollute the observation contract.
+    """
+
+    def _perception_with(self, hit: TextRegion, **overrides: object) -> Perception:
+        return Perception(
+            _config(**overrides),
+            template_matcher=FakeTemplateMatcher(hits={}),
+            ui_detector=FakeUiDetector(hits={}),
+            ocr_engine=FakeOcrEngine(hits={_bbox(): hit}),
+            object_detector=FakeObjectDetector(objects=()),
+        )
+
+    def test_low_confidence_ocr_result_dropped(self) -> None:
+        p = self._perception_with(TextRegion("i", _bbox(), 0.34))
+        obs = p.observe(_frame())
+        assert obs.text_regions == ()
+
+    def test_high_confidence_ocr_result_kept(self) -> None:
+        p = self._perception_with(TextRegion("12 / 12", _bbox(), 0.91))
+        obs = p.observe(_frame())
+        assert len(obs.text_regions) == 1
+        assert obs.text_regions[0].text == "12 / 12"
+
+    def test_boundary_confidence_kept(self) -> None:
+        """Exactly at the default floor (0.5): kept — gate is strictly-less-than."""
+        p = self._perception_with(TextRegion("hp", _bbox(), 0.5))
+        obs = p.observe(_frame())
+        assert len(obs.text_regions) == 1
+
+    def test_min_confidence_is_configurable(self) -> None:
+        """A stricter floor drops a result the default floor would keep."""
+        hit = TextRegion("12 / 12", _bbox(), 0.88)
+        p = self._perception_with(hit, ocr_min_confidence=0.95)
+        obs = p.observe(_frame())
+        assert obs.text_regions == ()

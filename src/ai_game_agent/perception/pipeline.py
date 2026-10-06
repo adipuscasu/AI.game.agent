@@ -166,6 +166,11 @@ class Perception:
             except Exception as exc:  # noqa: BLE001 - recorded, never fatal
                 errors.append(f"ocr:{name}: {exc}")
                 continue
+            if text is not None and text.confidence < self._config.ocr_min_confidence:
+                # Noise floor (config: perception.ocr.min_confidence): Tesseract
+                # routinely emits low-confidence garbage on real frames; drop it
+                # here, in one place, for any engine.
+                continue
             if text is not None:
                 regions.append(text)
 

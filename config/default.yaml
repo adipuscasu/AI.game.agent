@@ -74,6 +74,10 @@ perception:
     # regions:
     #   - {name: health_bar, x: 10, y: 20, width: 100, height: 20}
     regions: []
+    # Noise floor: recognized text with mean confidence strictly below this
+    # is dropped (Tesseract emits garbage on real frames; 0.34 "i" was one).
+    # Set to 0.0 to disable the gate.
+    min_confidence: 0.5
   # Basic object detection (color blobs). Default off.
   objects:
     enabled: false
