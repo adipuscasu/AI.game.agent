@@ -198,14 +198,17 @@ def _capture(args: argparse.Namespace, cfg: Config) -> int:
 
 def _observe(args: argparse.Namespace, cfg: Config) -> int:
     meter = FpsMeter()
-    # ``--record`` is a None sentinel (not a boolean) so the config's
-    # capture.record.{enabled,directory,max_files} can supply the default
-    # when the flag is not passed — the same precedence as every other
-    # capture knob (flag → config → code default).
+    # ``--record``/``--no-record`` are None sentinels (not booleans) so the
+    # config's capture.record.{enabled,directory,max_files} can supply the
+    # default when no flag is passed — the same precedence as every other
+    # capture knob (flag → config → code default). When both flags are passed
+    # the last one on the command line wins (argparse applies them in order),
+    # matching the usual CLI convention.
+    record_enabled = args.record if args.record is not None else args.no_record
     cap = _build_capture(
         cfg,
         args,
-        record_enabled=args.record,
+        record_enabled=record_enabled,
         record_dir=args.out,
         record_max_files=args.record_max_files,
     )
@@ -364,6 +367,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_obs.add_argument("--record", action="store_const", const=True, default=None,
                        help="write each frame to --out"
                             " (default: capture.record.enabled from config)")
+    p_obs.add_argument("--no-record", action="store_const", const=False, default=None,
+                       help="do not record for this run, even if the config "
+                            "enables capture.record.enabled")
     p_obs.add_argument("--record-max-files", type=int, default=None,
                        help="max frames to keep before rotation"
                             " (default: capture.record.max_files from config, 1000)")
@@ -374,7 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config", default=None,
         help="YAML config file (default: config/default.yaml); "
              "provides defaults for --backend/--region/--scale/--fps/--monitor"
-             "/--record/--record-max-files",
+             "/--record/--record-max-files/--no-record",
     )
     p_obs.set_defaults(func=_observe)
 

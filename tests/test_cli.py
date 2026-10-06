@@ -294,6 +294,34 @@ def test_cli_observe_record_flag_beats_config(tmp_path):
     assert not list(rec.glob("*.png")), "frames must go to the flag --out dir, not the config dir"
 
 
+def test_cli_observe_no_record_flag_beats_config_enabled(tmp_path):
+    """--no-record turns off recording even when config says record.enabled: true.
+
+    Precedence: ``--record``/``--no-record`` (flag) → ``capture.record.enabled``
+    (config) → ``False`` (code default). This test covers the flag→config
+    direction: the flag must beat a config that enables recording.
+    """
+    cfg = tmp_path / "cap.yaml"
+    rec = tmp_path / "recs"
+    cfg.write_text(
+        "capture:\n"
+        "  backend: mock\n"
+        "  record:\n"
+        "    enabled: true\n"
+        f"    directory: {rec}\n"
+        "    max_files: 1000\n",
+        encoding="utf-8",
+    )
+    rc = main([
+        "observe", "--config", str(cfg), "--backend", "mock",
+        "--frames", "3", "--fps", "0", "--no-record",
+    ])
+    assert rc == 0
+    assert not list(rec.glob("*.png")), (
+        "--no-record must suppress recording even when config enables it"
+    )
+
+
 def test_cli_analyze_perception_disabled_skips_optional_detectors(tmp_path, capsys):
     """perception.enabled: false must short-circuit before detector construction.
 
