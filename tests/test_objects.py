@@ -190,6 +190,45 @@ class TestMatch:
         assert len(_det({"loot": {"rgb": [200, 30, 30], "tolerance": 40}},
                         min_area=1).match(small)) == 1
 
+    def test_large_frame_drops_specks_keeps_real_blob(self):
+        """On a large (real-screen-scale) frame the default detector must drop
+        small tolerance-threshold specks while still reporting a genuine
+        UI-sized blob.
+
+        A real 4K screen (3840x2160) produced 7-11px anti-aliasing specks
+        (16-36 px^2) that the absolute 16 px^2 floor admitted. The effective
+        floor must scale with frame area: a speck is noise on a big frame even
+        though it clears the absolute minimum. A UI-sized blob is kept.
+        """
+        W, H = 400, 300  # 120,000 px^2 -> relative floor ~58 px^2
+
+        def px(x, y):
+            if 10 <= x < 16 and 10 <= y < 16:      # 6x6 speck (~25 px^2)
+                return RED
+            if 200 <= x < 224 and 150 <= y < 174:  # 24x24 real blob (~529 px^2)
+                return RED
+            return BG
+
+        frame = _frame(W, H, px)
+        det = _det({"loot": {"rgb": [200, 30, 30], "tolerance": 40}})
+        hits = det.match(frame)
+        # The speck is below the frame-relative floor (dropped); the real
+        # blob is above it (kept).
+        assert len(hits) == 1
+        kept = hits[0].bbox
+        assert kept.width >= 20  # the kept hit is the real blob, not the speck
+
+    def test_small_frame_absolute_floor_unchanged(self):
+        """On small frames the frame-relative floor must not raise the
+        absolute ``MIN_BLOB_AREA`` (16) — existing small-frame behaviour is
+        preserved."""
+        # 32x32 = 1024 px^2; 1024 // 2048 == 0 -> floor stays the absolute 16.
+        frame = _planted(32, 32, BG, RED, 4, 4, 10)  # ~81 px^2 blob
+        assert len(_det({"loot": {"rgb": [200, 30, 30], "tolerance": 40}}).match(frame)) == 1
+        # A sub-floor 3x3 (~4 px^2) blob is still dropped on the small frame.
+        small = _planted(32, 32, BG, RED, 4, 4, 3)
+        assert _det({"loot": {"rgb": [200, 30, 30], "tolerance": 40}}).match(small) == []
+
 
 # --- constructor / introspection --------------------------------------------
 

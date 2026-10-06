@@ -39,11 +39,32 @@ except ImportError as exc:  # pragma: no cover - exercised only without extras
 
 __all__ = ["ColorBlobsDetector", "MIN_BLOB_AREA"]
 
-# Contours smaller than this (in pixels^2) are treated as noise and dropped.
+# Absolute minimum contour area (px^2): the floor on small frames.
 MIN_BLOB_AREA = 16
+
+# Frame-relative noise floor: on a large frame a blob must cover at least
+# 1/_MIN_AREA_FRAME_DIVISOR of the frame to count (``frame_area // 2048`` by
+# default). This scales the floor with capture resolution so anti-aliasing /
+# UI-edge specks (e.g. a handful of px^2 at 4K) are dropped as noise while
+# real UI-sized blobs are kept. On small frames this resolves below
+# MIN_BLOB_AREA, so small-frame behaviour is unchanged.
+_MIN_AREA_FRAME_DIVISOR = 2048
 
 # Confidence ceiling: a blob that covers this fraction of the frame gets 1.0.
 _MAX_AREA_FRACTION = 256
+
+
+def _effective_min_area(min_area: int | None, frame_area: int) -> int:
+    """Resolve the effective area floor for a frame of ``frame_area`` px^2.
+
+    An explicit ``min_area`` (non-``None``) is used as-is — an operator who
+    sets a floor opts in to exactly that value. Otherwise the floor is the
+    greater of the absolute :data:`MIN_BLOB_AREA` and the frame-relative
+    noise floor (``frame_area // _MIN_AREA_FRAME_DIVISOR``).
+    """
+    if min_area is not None:
+        return min_area
+    return max(MIN_BLOB_AREA, frame_area // _MIN_AREA_FRAME_DIVISOR)
 
 
 class ColorBlobsDetector:
@@ -51,7 +72,8 @@ class ColorBlobsDetector:
 
     Each configured color is an RGB triple with a per-channel tolerance;
     the detector threshold-masks the frame in BGR space and reports every
-    contour whose area clears ``MIN_BLOB_AREA`` as an :class:`ObjectHit`.
+    contour whose area clears the effective floor as an :class:`ObjectHit`
+    (the frame-relative :func:`_effective_min_area` by default).
 
     Parameters
     ----------
@@ -61,27 +83,31 @@ class ColorBlobsDetector:
         ``tolerance`` (int, default 40). A ``None`` / empty sequence is
         accepted and simply yields no hits.
     min_area:
-        Minimum contour area (px^2) for a blob to count (default 16).
+        Minimum contour area (px^2) for a blob to count. ``None`` (default) uses
+        a frame-relative floor that scales with capture resolution, so specks
+        on large/4K frames are dropped as noise; an explicit int is used as-is.
     """
 
     def __init__(
         self,
         colors: Any,
         *,
-        min_area: int = MIN_BLOB_AREA,
+        min_area: int | None = None,
     ) -> None:
-        if min_area < 1:
+        if min_area is not None and min_area < 1:
             raise ValueError("min_area must be >= 1")
-        self._min_area = int(min_area)
+        self._min_area = None if min_area is None else int(min_area)
         self._colors = _normalize_colors(colors)
 
     # -- protocol ------------------------------------------------------------
     def match(self, frame: Frame) -> list[ObjectHit]:
         """Return one :class:`ObjectHit` per detected blob (empty list if none)."""
         img = _frame_to_bgr(frame)
+        frame_area = int(frame.width * frame.height) or 1
+        min_area = _effective_min_area(self._min_area, frame_area)
         hits: list[ObjectHit] = list()
         for spec in self._colors:
-            hits.extend(_match_color(img, spec, self._min_area))
+            hits.extend(_match_color(img, spec, min_area))
         return hits
 
     # -- introspection -------------------------------------------------------
