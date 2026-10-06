@@ -359,13 +359,90 @@ def test_cli_analyze_perception_disabled_skips_optional_detectors(tmp_path, caps
     assert obs["detector_errors"] == []
 
 
+def test_cli_analyze_perception_disabled_works_in_bare_env(tmp_path):
+    """`perception.enabled: false` must need no optional dependency at all.
+
+    Same bare-env setup as the import contract above, extended to run the
+    full ``analyze`` subcommand (not just ``import``) with a config that
+    enables every detector subsystem — templates (pointing at a missing
+    file), UI zones, OCR regions, and object colors — while the master
+    switch is off. With the master switch honored first in
+    ``_build_perception``, none of these may be touched: no OpenCV/NumPy
+    (template matcher / color blobs), no PIL/pytesseract (OCR), no template
+    file read. The CLI must exit 0 with the empty observation the
+    ``PerceptionConfig.enabled == False`` contract promises.
+    """
+    import subprocess
+    import sys
+
+    cfg_path = tmp_path / "disabled.yaml"
+    cfg_path.write_text(
+        "capture:\n  backend: mock\n"
+        "perception:\n"
+        "  enabled: false\n"
+        "  templates:\n"
+        "    loot: definitely-missing-template.png\n"
+        "  ui_zones:\n"
+        "    - name: health\n"
+        "      x: 0\n"
+        "      y: 0\n"
+        "      width: 10\n"
+        "      height: 10\n"
+        "      check: presence\n"
+        "  ocr:\n"
+        "    enabled: true\n"
+        "    regions:\n"
+        "      - name: health\n"
+        "        x: 0\n        y: 0\n"
+        "        width: 10\n        height: 10\n"
+        "  objects:\n"
+        "    enabled: true\n"
+        "    colors:\n"
+        "      - name: loot\n"
+        "        rgb: [255, 200, 0]\n",
+        encoding="utf-8",
+    )
+    script = (
+        "import sys\n"
+        "class _Blocker:\n"
+        "    def find_spec(self, fullname, path=None, target=None):\n"
+        "        if (fullname in ('cv2', 'numpy', 'PIL', 'pytesseract', 'mss')\n"
+        "                or fullname.startswith(('cv2.', 'numpy.', 'PIL.', 'pytesseract.'))):\n"
+        "            raise ImportError('blocked: ' + fullname)\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, _Blocker())\n"
+        "from ai_game_agent.__main__ import main\n"
+        f"rc = main(['analyze', '--config', {str(cfg_path)!r}])\n"
+        "print('rc', rc)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        "analyze with perception.enabled=false must succeed with "
+        "cv2/numpy/PIL/pytesseract all blocked; got rc="
+        f"{result.returncode}\n--- stderr ---\n{result.stderr}"
+    )
+    out = result.stdout
+    assert "rc 0" in out, f"main() must return 0; stdout was: {out!r}"
+    # The JSON observation is on stdout before the 'rc 0' marker.
+    obs = json.loads(out.split("rc 0", 1)[0])
+    assert obs["templates"] == []
+    assert obs["ui_zones"] == []
+    assert obs["text_regions"] == []
+    assert obs["objects"] == []
+    assert obs["detector_errors"] == []
+
+
 def test_cli_logging_respects_config_directory_and_level(tmp_path, monkeypatch):
     """The log file goes to ``logging.directory`` and DEBUG is enabled per config."""
 
     cfg = tmp_path / "cap.yaml"
     cfg.write_text(
         "capture:\n  backend: mock\n"
-        "logging:\n  level: DEBUG\n  directory: logs_custom\n",
+        "logging:\n  level: DEBUG\n  directory: logs_custom",
         encoding="utf-8",
     )
     real_load = cli.load_config

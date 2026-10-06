@@ -291,3 +291,46 @@ analyze (real: template + ui_zone + objects) -> rc=0, object detected, no errors
 
 1. (Optional) Rename or further document the `--no-templates` / UI-zone coupling for discoverability.
 2. Merge `feature/phase-2` into `develop`.
+
+## Phase 2 — third review (2026-10-06, PR #2 head)
+
+> External re-review of the current head of PR #2 (snapshot taken at head
+> `1e0bfad`, 23 commits). Verdict: **Request changes — 1 remaining P1**
+> (`perception.enabled` not honored during CLI detector construction), plus
+> two non-blocking items (stale PR description; no `--no-record`).
+
+### Resolution of the third review
+
+| # | Sev | Where | Finding | Resolution |
+|---|-----|-------|---------|------------|
+| 1 | 🔴 P1 | `__main__.py` `_build_perception` | `perception.enabled: false` still constructed detectors (template matcher, OCR engine, color-blob detector) before the `Perception` pipeline could short-circuit; a configured template or object color could still require the optional `vision` extra even though the master switch said off. | ✅ Fixed in `0b4b867` — `_build_perception` now returns `Perception(perception)` immediately when `cfg.perception.enabled` is False, before any detector is constructed. No optional dependency is touched and a misconfigured template path can no longer turn "perception disabled" into a setup error. |
+| 2 | 🟠 P2 | PR description | Still reported 15 commits / 37 files / 194 tests while the PR had grown to 23 commits. | ⚠️ Cleanup — PR body refresh required (needs a GitHub write credential not present in this environment). |
+| 3 | 🟡 P3 | `observe` CLI | `capture.record.enabled: true` could not be overridden off for a single invocation (two-state sentinel). | ✅ Fixed in `5c5ffa3` — `--no-record` added alongside `--record`; both are `None` sentinels so precedence is flag (`--record`/`--no-record`) → `capture.record.enabled` → `False`. |
+
+### Regression tests added
+
+- `test_cli_analyze_perception_disabled_skips_optional_detectors` (in-process):
+  config with `perception.enabled: false` + a missing template + object
+  colors; asserts `analyze` exits 0 with an empty observation and no
+  `detector_errors`. **Verified red** against pre-fix code `1e0bfad`
+  (`error: template file not found: missing-template.png`, exit 1).
+- `test_cli_analyze_perception_disabled_works_in_bare_env` (subprocess,
+  `meta_path` blocker): same shape of config with **every** detector
+  subsystem enabled (templates, `ui_zones`, OCR regions, object colors)
+  while `cv2`/`numpy`/`PIL`/`pytesseract` are import-blocked — the
+  reviewer's stronger invariant: `perception.enabled=false` means the CLI
+  requires no vision/OCR dependency at all. **Verified red** against
+  `1e0bfad` (exit 1 with `cv2` blocked), green after the fix.
+
+### Verification snapshot (2026-10-06, local head after `5c5ffa3`)
+
+```
+pytest -q                                   -> 215 passed
+ruff check src tests                        -> All checks passed!
+analyze disabled-perception (bare env)      -> rc=0, empty observation, detector_errors=[]
+```
+
+### Suggested order
+
+1. Refresh the PR description (commits/files/tests) to match the current head.
+2. Merge `feature/phase-2` into `develop` once CI is green on the final head.
