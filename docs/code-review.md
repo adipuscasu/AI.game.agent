@@ -399,3 +399,83 @@ ruff check src/ai_game_agent/__main__.py tests/test_cli.py -> All checks passed!
 
 1. Refresh the PR description (commits/files/tests) to match the current head.
 2. Merge `feature/phase-2` into `develop` once CI is green on the final head.
+
+## Phase 2 — fifth review (2026-10-06, PR #2 head)
+
+> External re-review of the current head of PR #2. The reviewer reported the
+> P1 (lazy perception imports) as **fixed/resolved** and re-raised the P2
+> (`--record`/`--no-record` ordering) as **still broken**, quoting the
+> pre-fix implementation (two argparse destinations +
+> `args.record if args.record is not None else args.no_record`) and
+> suggesting a parser-level ordering test.
+
+### Re-verification against the live tree
+
+The review snapshot **lagged the live head** (a recurrence of the stale-
+snapshot pattern seen in reviews three and four). Before acting, the live
+tree was re-checked:
+
+- The P2 was **already fixed in commit `d4db04e`** (the fourth-review fix).
+  `__main__.py` currently reads:
+  ```python
+  p_obs.add_argument("--record", dest="record", action="store_const",
+                     const=True, default=None, ...)
+  p_obs.add_argument("--no-record", dest="record", action="store_const",
+                     const=False, default=None, ...)
+  ```
+  and `_observe` is the simple `record_enabled = args.record`. The
+  `args.record if args.record is not None else args.no_record` expression the
+  review quotes is **not present in the live tree**.
+- Both flag orders resolve correctly on the live parser:
+  `--record --no-record` → `False`, `--no-record --record` → `True`,
+  no flag → `None` (falls back to config).
+- The two integration ordering tests added in the fourth review
+  (`test_cli_observe_record_no_record_last_flag_wins`,
+  `test_cli_observe_no_record_record_last_flag_wins`) **pass** on the live
+tree.
+
+Conclusion: **no further code fix is needed.** The one genuinely new,
+actionable item was the reviewer's request for a **parser-level** ordering
+test ("I prefer this second version because it tests exactly the behavior
+we're fixing").
+
+### Change made in this round
+
+- **Added** `test_observe_record_flags_last_one_wins` in `tests/test_cli.py` —
+  tests `cli.build_parser()` directly, independent of the capture
+  implementation, asserting the three-way contract:
+  `--record --no-record` → `False`, `--no-record --record` → `True`,
+  no flag → `None` (config fallback).
+
+### Red → green (this round)
+
+- **Red**: with the pre-fix `__main__.py` (from `d4db04e~1`), the new
+  parser test **fails** — `--record --no-record` still resolved to `True`
+  (the original bug), and the fourth-review integration test also failed
+  (frames were written). This proves the new test **catches the original
+  bug**.
+- **Green**: on the live tree (`d4db04e`), the new parser test **passes**,
+  alongside both integration ordering tests.
+
+### Verification snapshot (2026-10-06, this commit)
+
+```
+pytest -q                                   -> 226 passed
+ruff check src tests                        -> All checks passed!
+--record --no-record  -> record = False   (last flag wins)
+--no-record --record  -> record = True    (last flag wins)
+(no flag)             -> record = None    (falls back to config)
+```
+
+### Remaining (non-code)
+
+- 🟡 **PR description** still advertises the old **15 commits / 37 files /
+  194 tests** while the live branch is **31 commits / 226 tests**. This is
+  PR-body text on GitHub (documentation hygiene, not a merge blocker) and
+  needs a GitHub write credential to update.
+
+### Verdict
+
+All code-review findings (P1 and P2) are **resolved in the live tree**.
+This round only added the requested parser-level regression test. With CI
+green, the PR is **ready to merge**.

@@ -385,6 +385,36 @@ def test_cli_observe_no_record_record_last_flag_wins(tmp_path):
     )
 
 
+def test_observe_record_flags_last_one_wins():
+    """Parser-level proof of the last-flag-wins contract (P2 regression).
+
+    Tests the parser directly, independent of the capture implementation:
+    ``--record`` and ``--no-record`` must write to the SAME ``record``
+    destination so argparse applies them in command-line order:
+
+      --record --no-record   -> False
+      --no-record --record   -> True
+      (no flag)              -> None  (capture.record.enabled applies)
+    """
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["observe", "--record", "--no-record"])
+    assert args.record is False, (
+        "--record --no-record: last flag (--no-record) must win -> False"
+    )
+
+    args = parser.parse_args(["observe", "--no-record", "--record"])
+    assert args.record is True, (
+        "--no-record --record: last flag (--record) must win -> True"
+    )
+
+    args = parser.parse_args(["observe"])
+    assert args.record is None, (
+        "no flag: record must be the None sentinel so the config default "
+        "(capture.record.enabled) applies"
+    )
+
+
 def test_cli_analyze_perception_disabled_skips_optional_detectors(tmp_path, capsys):
     """perception.enabled: false must short-circuit before detector construction.
 
