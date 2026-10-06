@@ -322,10 +322,35 @@ analyze (real: template + ui_zone + objects) -> rc=0, object detected, no errors
   requires no vision/OCR dependency at all. **Verified red** against
   `1e0bfad` (exit 1 with `cv2` blocked), green after the fix.
 
-### Verification snapshot (2026-10-06, local head after `5c5ffa3`)
+### Import-hygiene hardening (post-review, same P1)
+
+The reviewer's suggested "further improvement" was applied: `_build_perception`
+was returning a detector-free `Perception` when disabled, but `__main__.py`
+still imported the three detector implementation modules (`template`, `ocr`,
+`ui`) at **module scope**, so `perception.enabled:false` skipped *construction*
+yet still *imported* them. All three imports were moved into the selecting
+branch of `_build_perception` (the same lazy pattern already used for
+`color_blobs`), so the contract is now:
+
+**`perception.enabled: false` → no perception implementation is imported,
+instantiated, or executed.**
+
+- `test_cli_analyze_perception_disabled_imports_no_impl_modules` (subprocess):
+  after a disabled-perception `analyze`, asserts none of `perception.template`/
+  `perception.ocr`/`perception.ui`/`perception.color_blobs` is in `sys.modules`.
+  **Verified red** against the module-scope-import version (leaked all three),
+  green after moving the imports.
+- No test or source referenced the `__main__` re-exports of the three names
+  (checked before moving), so nothing depended on them.
+
+> Note on the reviewer's suggested extra assertion: the Observation JSON has
+> **no `ocr` key** — it is `text_regions`. The empty-observation assertions
+> already in `…_works_in_bare_env` use the correct key.
+
+### Verification snapshot (2026-10-06, local head after import-hygiene fix)
 
 ```
-pytest -q                                   -> 215 passed
+pytest -q                                   -> 216 passed
 ruff check src tests                        -> All checks passed!
 analyze disabled-perception (bare env)      -> rc=0, empty observation, detector_errors=[]
 ```

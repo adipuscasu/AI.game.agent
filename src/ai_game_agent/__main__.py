@@ -63,15 +63,14 @@ from ai_game_agent.config import (
 )
 from ai_game_agent.perception import Perception, PerceptionError
 
-# NB: color_blobs is NOT imported here at module top.  It imports cv2 at
-# module load and raises PerceptionError when the "vision" extra is absent
-# (its documented contract: "imported only when the subsystem is selected").
-# __main__.py must stay importable in a bare venv (§7.3: the CLI works with no
-# vision/ocr extras), so the import lives inside _build_perception's
-# object-detection branch, where it is actually needed.
-from ai_game_agent.perception.ocr import TesseractEngine
-from ai_game_agent.perception.template import CvTemplateMatcher
-from ai_game_agent.perception.ui import UiRegionDetector
+# NB: the detector *implementation* modules are NOT imported at module top.
+# __main__.py must stay importable — and `perception.enabled: false` must
+# not import, instantiate, or execute any perception implementation — so
+# each implementation is imported lazily inside _build_perception, in the
+# branch where its subsystem is actually selected (color_blobs: cv2/numpy;
+# template/ui: OpenCV helpers; ocr: pytesseract/PIL). A missing optional
+# extra then fails fast with a clean error naming the extra, never at
+# import time (§7.3: the CLI works with no vision/ocr extras).
 
 log = logging.getLogger("ai_game_agent")
 
@@ -239,10 +238,10 @@ def _build_perception(args: argparse.Namespace, cfg) -> Perception:
     pipeline fail fast if the extra is absent).
 
     ``perception.enabled == False`` is honored first: no detector is
-    constructed at all, so a missing optional extra (vision/ocr) or a
-    misconfigured template path cannot turn "perception disabled" into a
-    setup error. ``Perception.observe()`` then returns the empty
-    observation the config contract promises.
+    imported, constructed, or executed at all, so a missing optional extra
+    (vision/ocr) or a misconfigured template path cannot turn "perception
+    disabled" into a setup error. ``Perception.observe()`` then returns the
+    empty observation the config contract promises.
     """
     perception = cfg.perception
     if not perception.enabled:
@@ -250,11 +249,16 @@ def _build_perception(args: argparse.Namespace, cfg) -> Perception:
     templates_cfg = perception.templates or {}
     if getattr(args, "no_templates", False):
         templates_cfg = {}
-    template_matcher = (
-        CvTemplateMatcher(templates_cfg, threshold=perception.template_threshold)
-        if templates_cfg
-        else None
-    )
+    template_matcher = None
+    if templates_cfg:
+        # Lazy import: only when the template subsystem is actually
+        # selected, so `perception.enabled=false` (or a template-free
+        # config) imports no OpenCV-backed implementation at all.
+        from ai_game_agent.perception.template import CvTemplateMatcher
+
+        template_matcher = CvTemplateMatcher(
+            templates_cfg, threshold=perception.template_threshold
+        )
     ui_zones = perception.ui_zones
     if getattr(args, "no_templates", False):
         # UI zones are gated by the same ``--no-templates`` flag; the flag is
@@ -264,7 +268,13 @@ def _build_perception(args: argparse.Namespace, cfg) -> Perception:
     ocr_regions = list(perception.ocr_regions) if perception.ocr_enabled else []
     if getattr(args, "no_ocr", False):
         ocr_regions = []
-    ocr_engine = TesseractEngine() if ocr_regions else None
+    ocr_engine = None
+    if ocr_regions:
+        # Lazy import: the OCR engine module is imported only when OCR is
+        # actually selected (see module-top note).
+        from ai_game_agent.perception.ocr import TesseractEngine
+
+        ocr_engine = TesseractEngine()
     object_colors = (
         list(perception.object_colors) if perception.objects_enabled else []
     )
@@ -289,7 +299,12 @@ def _build_perception(args: argparse.Namespace, cfg) -> Perception:
         objects_enabled=bool(object_colors),
         object_colors=tuple(object_colors),
     )
-    ui_detector = UiRegionDetector(perception_cfg) if ui_zones else None
+    ui_detector = None
+    if ui_zones:
+        # Lazy import: only when UI zones are actually selected.
+        from ai_game_agent.perception.ui import UiRegionDetector
+
+        ui_detector = UiRegionDetector(perception_cfg)
     return Perception(
         perception_cfg,
         template_matcher=template_matcher,

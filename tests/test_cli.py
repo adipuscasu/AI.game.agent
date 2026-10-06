@@ -436,6 +436,81 @@ def test_cli_analyze_perception_disabled_works_in_bare_env(tmp_path):
     assert obs["detector_errors"] == []
 
 
+def test_cli_analyze_perception_disabled_imports_no_impl_modules(tmp_path):
+    """`perception.enabled: false` → no perception implementation imported.
+
+    The strictest form of the master-switch contract: with perception
+    disabled, the CLI must not merely avoid *using* the detector
+    implementations — it must not even *import* them (perception.template,
+    perception.ocr, perception.ui, perception.color_blobs). The bare-env
+    test above proves the runtime consequence (analyze works without the
+    vision/ocr extras); this one proves the import hygiene that keeps the
+    contract robust to any future packaging change of the optional extras.
+    """
+    import subprocess
+    import sys
+
+    cfg_path = tmp_path / "disabled.yaml"
+    cfg_path.write_text(
+        "capture:\n  backend: mock\n"
+        "perception:\n"
+        "  enabled: false\n"
+        "  templates:\n"
+        "    loot: definitely-missing-template.png\n"
+        "  ui_zones:\n"
+        "    - name: health\n"
+        "      x: 0\n"
+        "      y: 0\n"
+        "      width: 10\n"
+        "      height: 10\n"
+        "      check: presence\n"
+        "  ocr:\n"
+        "    enabled: true\n"
+        "    regions:\n"
+        "      - name: health\n"
+        "        x: 0\n        y: 0\n"
+        "        width: 10\n        height: 10\n"
+        "  objects:\n"
+        "    enabled: true\n"
+        "    colors:\n"
+        "      - name: loot\n"
+        "        rgb: [255, 200, 0]\n",
+        encoding="utf-8",
+    )
+    script = (
+        "import sys\n"
+        "from ai_game_agent.__main__ import main\n"
+        f"rc = main(['analyze', '--config', {str(cfg_path)!r}])\n"
+        "import json\n"
+        "mods = sorted(k for k in sys.modules\n"
+        "               if k.startswith('ai_game_agent.perception.'))\n"
+        "print('rc', rc)\n"
+        "print(json.dumps(mods))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"analyze must succeed with perception disabled; rc="
+        f"{result.returncode}\n--- stderr ---\n{result.stderr}"
+    )
+    out = result.stdout
+    assert "rc 0" in out, f"main() must return 0; stdout was: {out!r}"
+    impl_modules = set(json.loads(out.split("rc 0", 1)[1].strip()))
+    leaked = impl_modules & {
+        "ai_game_agent.perception.template",
+        "ai_game_agent.perception.ocr",
+        "ai_game_agent.perception.ui",
+        "ai_game_agent.perception.color_blobs",
+    }
+    assert not leaked, (
+        "perception.enabled=false must not import any detector "
+        f"implementation module; imported: {sorted(leaked)}"
+    )
+
+
 def test_cli_logging_respects_config_directory_and_level(tmp_path, monkeypatch):
     """The log file goes to ``logging.directory`` and DEBUG is enabled per config."""
 
