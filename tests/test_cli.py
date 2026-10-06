@@ -1,3 +1,4 @@
+import json
 import logging
 
 import ai_game_agent.__main__ as cli
@@ -291,6 +292,43 @@ def test_cli_observe_record_flag_beats_config(tmp_path):
         "flag --record-max-files=3 must beat config max_files=2"
     )
     assert not list(rec.glob("*.png")), "frames must go to the flag --out dir, not the config dir"
+
+
+def test_cli_analyze_perception_disabled_skips_optional_detectors(tmp_path, capsys):
+    """perception.enabled: false must short-circuit before detector construction.
+
+    Regression for the P1 review finding: with perception disabled, the CLI
+    must return an empty observation even when templates/objects are
+    configured. It must NOT construct detectors (which would load template
+    files / OpenCV) nor fail on a missing optional extra — the flag's contract
+    is "don't run perception, return an empty Observation".
+    """
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "perception:\n"
+        "  enabled: false\n"
+        "  templates:\n"
+        "    loot: missing-template.png\n"
+        "  objects:\n"
+        "    enabled: true\n"
+        "    colors:\n"
+        "      - name: loot\n"
+        "        rgb: [255, 215, 0]\n",
+        encoding="utf-8",
+    )
+    rc = main([
+        "analyze",
+        "--backend", "mock",
+        "--fps", "0",
+        "--config", str(cfg),
+    ])
+    assert rc == 0
+    obs = json.loads(capsys.readouterr().out)
+    assert obs["templates"] == []
+    assert obs["ui_zones"] == []
+    assert obs["text_regions"] == []
+    assert obs["objects"] == []
+    assert obs["detector_errors"] == []
 
 
 def test_cli_logging_respects_config_directory_and_level(tmp_path, monkeypatch):

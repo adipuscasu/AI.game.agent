@@ -234,8 +234,16 @@ def _build_perception(args: argparse.Namespace, cfg) -> Perception:
     constructed lazily so a missing optional extra only surfaces when the
     subsystem is actually selected (and only when it is selected does the
     pipeline fail fast if the extra is absent).
+
+    ``perception.enabled == False`` is honored first: no detector is
+    constructed at all, so a missing optional extra (vision/ocr) or a
+    misconfigured template path cannot turn "perception disabled" into a
+    setup error. ``Perception.observe()`` then returns the empty
+    observation the config contract promises.
     """
     perception = cfg.perception
+    if not perception.enabled:
+        return Perception(perception)
     templates_cfg = perception.templates or {}
     if getattr(args, "no_templates", False):
         templates_cfg = {}
