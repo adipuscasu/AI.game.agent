@@ -138,9 +138,9 @@ def _build_capture(
     cfg: Config,
     args: argparse.Namespace,
     *,
-    record_enabled: bool,
-    record_dir: Path,
-    record_max_files: int,
+    record_enabled: bool | None,
+    record_dir: str | Path | None,
+    record_max_files: int | None,
 ) -> Capture:
     """Build a :class:`Capture` honoring CLI flags, then config, then defaults.
 
@@ -149,6 +149,12 @@ def _build_capture(
     ``cfg.capture``; otherwise the :class:`CaptureConfig` code default. Before
     this, the flag defaults (mss / whole-monitor / 1.0 / no-pacing) were forced
     no matter what the config said.
+
+    Recording is the same rule: ``record_enabled``/``record_dir``/
+    ``record_max_files`` are set by the caller from the subcommand's own flags
+    (``None`` = the flag was not passed), and ``None`` falls back to the
+    ``capture.record.{enabled,directory,max_files}`` config block. Subcommands
+    that have no recording flags pass explicit values (typically disabled).
     """
     scale = _parse_scale(getattr(args, "scale", None))
     monitor = _parse_monitor(getattr(args, "monitor", None))
@@ -160,9 +166,15 @@ def _build_capture(
             region=region if region is not None else ccfg.region,
             fps=args.fps if args.fps is not None else ccfg.fps,
             scale=scale if scale is not None else ccfg.scale,
-            record_enabled=record_enabled,
-            record_directory=str(record_dir),
-            record_max_files=record_max_files,
+            record_enabled=(
+                ccfg.record_enabled if record_enabled is None else record_enabled
+            ),
+            record_directory=(
+                str(record_dir) if record_dir is not None else ccfg.record_directory
+            ),
+            record_max_files=(
+                ccfg.record_max_files if record_max_files is None else record_max_files
+            ),
             monitor=monitor if monitor is not None else ccfg.monitor,
         )
     )
@@ -173,8 +185,8 @@ def _capture(args: argparse.Namespace, cfg: Config) -> int:
         cfg,
         args,
         record_enabled=False,
-        record_dir=Path(args.out),
-        record_max_files=getattr(args, "record_max_files", 1000),
+        record_dir=args.out,
+        record_max_files=1000,
     )
     with cap:
         frame = cap.grab()
@@ -186,11 +198,15 @@ def _capture(args: argparse.Namespace, cfg: Config) -> int:
 
 def _observe(args: argparse.Namespace, cfg: Config) -> int:
     meter = FpsMeter()
+    # ``--record`` is a None sentinel (not a boolean) so the config's
+    # capture.record.{enabled,directory,max_files} can supply the default
+    # when the flag is not passed — the same precedence as every other
+    # capture knob (flag → config → code default).
     cap = _build_capture(
         cfg,
         args,
         record_enabled=args.record,
-        record_dir=Path(args.out),
+        record_dir=args.out,
         record_max_files=args.record_max_files,
     )
     # M2: recording is owned by the Capture facade (cap.recorder) and happens
@@ -283,7 +299,7 @@ def _analyze(args: argparse.Namespace, cfg: Config) -> int:
         cfg,
         args,
         record_enabled=False,
-        record_dir=Path("screenshots"),
+        record_dir="screenshots",
         record_max_files=1000,
     )
     with cap:
@@ -337,13 +353,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="0 = no pacing (headless/CI); otherwise a ceiling, not a guarantee. "
              "Default from config (30)",
     )
-    p_obs.add_argument("--record", action="store_true", help="write each frame to --out")
-    p_obs.add_argument("--record-max-files", type=int, default=1000)
-    p_obs.add_argument("--out", default="recordings")
+    p_obs.add_argument("--record", action="store_const", const=True, default=None,
+                       help="write each frame to --out"
+                            " (default: capture.record.enabled from config)")
+    p_obs.add_argument("--record-max-files", type=int, default=None,
+                       help="max frames to keep before rotation"
+                            " (default: capture.record.max_files from config, 1000)")
+    p_obs.add_argument("--out", default=None,
+                       help="output directory"
+                            " (default: capture.record.directory from config, else recordings)")
     p_obs.add_argument(
         "--config", default=None,
         help="YAML config file (default: config/default.yaml); "
-             "provides defaults for --backend/--region/--scale/--fps/--monitor",
+             "provides defaults for --backend/--region/--scale/--fps/--monitor"
+             "/--record/--record-max-files",
     )
     p_obs.set_defaults(func=_observe)
 

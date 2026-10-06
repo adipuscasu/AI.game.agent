@@ -217,6 +217,82 @@ def test_cli_capture_fps_from_config_is_a_ceiling(tmp_path, monkeypatch):
     )
 
 
+# --- config-driven recording (record.* must be honored, like the other knobs) ---
+#
+# The ``capture.record.{enabled,directory,max_files}`` block was loaded and
+# validated but never consulted by the CLI: observe's record settings were
+# forced to the flag/CLI defaults (off / --out / 1000) no matter what the
+# config said. Precedence now matches the sibling capture knobs: an
+# explicitly-passed flag wins, otherwise the loaded config, otherwise the code
+# default.
+
+def test_cli_observe_honors_record_enabled_from_config(tmp_path):
+    """record.enabled: true in config turns on observe recording without --record.
+
+    Pre-fix: the config record block was ignored, so no frames were written.
+    """
+    cfg = tmp_path / "cap.yaml"
+    rec = tmp_path / "recs"
+    cfg.write_text(
+        "capture:\n"
+        "  backend: mock\n"
+        "  record:\n"
+        "    enabled: true\n"
+        f"    directory: {rec}\n"
+        "    max_files: 1000\n",
+        encoding="utf-8",
+    )
+    rc = main(["observe", "--config", str(cfg), "--backend", "mock", "--frames", "3", "--fps", "0"])
+    assert rc == 0
+    pngs = list(rec.glob("*.png"))
+    assert len(pngs) == 3, f"expected 3 recorded frames in config dir {rec}, got {len(pngs)}"
+
+
+def test_cli_observe_honors_record_max_files_from_config(tmp_path):
+    """record.max_files in config drives rotation when --record-max-files is unset."""
+    cfg = tmp_path / "cap.yaml"
+    rec = tmp_path / "recs"
+    cfg.write_text(
+        "capture:\n"
+        "  backend: mock\n"
+        "  record:\n"
+        "    enabled: true\n"
+        f"    directory: {rec}\n"
+        "    max_files: 2\n",
+        encoding="utf-8",
+    )
+    rc = main(["observe", "--config", str(cfg), "--backend", "mock", "--frames", "5", "--fps", "0"])
+    assert rc == 0
+    assert len(list(rec.glob("*.png"))) == 2, "config record.max_files=2 must rotate to 2"
+
+
+def test_cli_observe_record_flag_beats_config(tmp_path):
+    """Each record flag (--record / --record-max-files / --out) wins over config."""
+    cfg = tmp_path / "cap.yaml"
+    rec = tmp_path / "config_dir"  # config says: off, this dir, keep 2
+    cfg.write_text(
+        "capture:\n"
+        "  backend: mock\n"
+        "  record:\n"
+        "    enabled: false\n"
+        f"    directory: {rec}\n"
+        "    max_files: 2\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "flag_dir"  # flag says: on, this dir, keep 3
+    rc = main([
+        "observe", "--config", str(cfg), "--backend", "mock", "--frames", "5", "--fps", "0",
+        "--record",
+        "--record-max-files", "3",
+        "--out", str(out),
+    ])
+    assert rc == 0
+    assert len(list(out.glob("*.png"))) == 3, (
+        "flag --record-max-files=3 must beat config max_files=2"
+    )
+    assert not list(rec.glob("*.png")), "frames must go to the flag --out dir, not the config dir"
+
+
 def test_cli_logging_respects_config_directory_and_level(tmp_path, monkeypatch):
     """The log file goes to ``logging.directory`` and DEBUG is enabled per config."""
 
