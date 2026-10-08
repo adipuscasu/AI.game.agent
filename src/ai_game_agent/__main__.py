@@ -328,6 +328,9 @@ def _build_perception(args: argparse.Namespace, cfg) -> Perception:
         ui_zones=ui_zones,
         ocr_enabled=bool(ocr_regions),
         ocr_regions=tuple(ocr_regions),
+        # Carry the configured OCR noise floor through verbatim — omitting it
+        # would silently reset it to the 0.5 default (review P1).
+        ocr_min_confidence=perception.ocr_min_confidence,
         objects_enabled=bool(object_colors),
         object_colors=tuple(object_colors),
     )

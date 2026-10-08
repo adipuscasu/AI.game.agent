@@ -714,3 +714,106 @@ def test_resolve_template_path_is_cwd_independent(tmp_path) -> None:
         assert resolved.is_file()
     finally:
         os.chdir(_repo_root())
+
+
+# ---------------------------------------------------------------------------
+# P1 regression: configured OCR ``min_confidence`` must survive the CLI.
+#
+# ``load_config()`` maps ``perception.ocr.min_confidence`` into the public
+# ``PerceptionConfig`` and the pipeline gates on it, but ``_build_perception()``
+# rebuilt a fresh ``PerceptionConfig`` and omitted the field, silently resetting
+# it to the ``0.5`` default. A non-default configured value must carry through.
+# ---------------------------------------------------------------------------
+
+
+class _FakeOcrEngine:
+    """Stand-in for ``TesseractEngine`` returning one fixed-confidence read."""
+
+    def __init__(self, confidence: float) -> None:
+        self._confidence = confidence
+
+    def read(self, frame: object, bbox: object):
+        from ai_game_agent.perception.observation import TextRegion
+
+        return TextRegion(text="12 / 12", bbox=bbox, confidence=self._confidence)
+
+
+def _ocr_config_yaml(tmp_path) -> str:
+    """Write a perception config with a strict (0.9) OCR noise floor."""
+    cfg_path = tmp_path / "ocr_threshold.yaml"
+    cfg_path.write_text(
+        "perception:\n"
+        "  ocr:\n"
+        "    enabled: true\n"
+        "    min_confidence: 0.9\n"
+        "    regions:\n"
+        "      - name: health\n"
+        "        x: 0\n"
+        "        y: 0\n"
+        "        width: 100\n"
+        "        height: 30\n",
+        encoding="utf-8",
+    )
+    return str(cfg_path)
+
+
+def test_build_perception_keeps_configured_ocr_floor(tmp_path) -> None:
+    """``_build_perception()`` must carry the configured OCR noise floor.
+
+    Asserts the exact spot the review flagged: the config layer holds the
+    non-default ``0.9`` value, and ``_build_perception()`` must NOT reset it to
+    the ``0.5`` default when it reconstructs the ``PerceptionConfig``.
+    """
+    import argparse
+
+    cfg = load_config(_ocr_config_yaml(tmp_path))
+    # Sanity: the config layer really does carry the non-default value ...
+    assert cfg.perception.ocr_min_confidence == 0.9
+
+    args = argparse.Namespace(no_templates=False, no_ocr=False, no_objects=False)
+    perception = cli._build_perception(args, cfg)
+    got = perception.config.ocr_min_confidence
+    assert got == 0.9, (
+        "_build_perception() dropped the configured ocr_min_confidence "
+        f"(got {got!r}, expected 0.9)"
+    )
+
+
+def test_cli_analyze_drops_below_ocr_floor(tmp_path, monkeypatch, capsys) -> None:
+    """A 0.89 read must be dropped when the configured floor is 0.9.
+
+    Behavioral end-to-end proof through ``analyze``: with the floor correctly
+    plumbed, a sub-threshold OCR result is rejected. Under the bug (floor reset
+    to 0.5) the same 0.89 read would be accepted.
+    """
+    import json
+
+    import ai_game_agent.perception.ocr as ocr_mod
+
+    cfg = _ocr_config_yaml(tmp_path)
+    # Route the pipeline's lazily-imported engine to our fixed-confidence fake.
+    monkeypatch.setattr(ocr_mod, "TesseractEngine", lambda: _FakeOcrEngine(0.89))
+
+    assert main(["analyze", "--backend", "mock", "--config", cfg]) == 0
+    obs = json.loads(capsys.readouterr().out)
+    assert obs["text_regions"] == []
+
+
+def test_cli_analyze_keeps_at_or_above_ocr_floor(tmp_path, monkeypatch, capsys) -> None:
+    """A 0.95 read must be KEPT when the configured floor is 0.9.
+
+    Guards against a degenerate fix that simply turns OCR off; the gate must be
+    driven by the configured threshold, dropping strictly-below and keeping the
+    rest.
+    """
+    import json
+
+    import ai_game_agent.perception.ocr as ocr_mod
+
+    cfg = _ocr_config_yaml(tmp_path)
+    monkeypatch.setattr(ocr_mod, "TesseractEngine", lambda: _FakeOcrEngine(0.95))
+
+    assert main(["analyze", "--backend", "mock", "--config", cfg]) == 0
+    obs = json.loads(capsys.readouterr().out)
+    assert len(obs["text_regions"]) == 1
+    assert obs["text_regions"][0]["text"] == "12 / 12"
