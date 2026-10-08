@@ -1,4 +1,4 @@
-"""Command-line interface for the AI game agent (Phase 1: screen observation).
+"""Command-line interface for the AI game agent.
 
 Subcommands
 -----------
@@ -12,15 +12,6 @@ Subcommands
     *ceiling*, not a guarantee: each iteration does work and then sleeps, so
     the achieved rate approaches ``--fps`` from below.
 
-Both commands are safe to run headless with ``--backend mock --fps 0``:
-``fps=0`` disables real pacing (no sleeps), which is what the test suite and
-CI rely on.
-
-Usage::
-
-    ai-game-agent capture --backend mss --out shots/
-    ai-game-agent observe --backend mock --frames 30 --fps 0 --record --out rec/
-
 ``analyze``
     Run one capture and pass the frame through the perception pipeline
     (template matching → UI zones → OCR → object blobs), printing the
@@ -30,6 +21,10 @@ Usage::
     can be individually disabled with ``--no-templates`` / ``--no-ocr`` /
     ``--no-objects``. With nothing configured, the observation is empty
     (Phase 1 behavior).
+
+``capture`` and ``observe`` are safe to run headless with ``--backend mock
+--fps 0``: ``fps=0`` disables real pacing (no sleeps), which is what the
+test suite and CI rely on.
 
 Usage::
 

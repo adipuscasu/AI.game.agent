@@ -6,12 +6,12 @@
 #   ai-game-agent analyze --config config/fulltest.yaml                  # real screen (mss)
 #   ai-game-agent analyze --config config/fulltest.yaml --backend mock   # headless demo
 #
-# The heavy detectors need the optional extras (already covered by `.[dev]`):
+# The heavy detectors need the optional extras (not part of `.[dev]`):
 #
 #   pip install ai-game-agent[vision,ocr]
 #
-# A missing extra never crashes `analyze`: that subsystem reports a clean,
-# named error in `detector_errors` and the rest of the observation stands.
+# A missing configured dependency causes a clean `analyze` error with a
+# non-zero exit — no partial observation, no crash.
 #
 # All ui_zones / ocr.regions are anchored at the top-left and small enough to
 # fit inside the 128x72 mock frame, so the headless run stays clean. On a real
