@@ -29,6 +29,16 @@ from ai_game_agent.config import CaptureConfig
 # it never deletes unrelated PNGs sharing the directory.
 _FRAME_FILE_RE = re.compile(r"^frame_\d{8}T\d{12}(?:-\d+)?\.png$")
 
+# M3: hard safety cap on the byte size of any frame Frame.resize() will
+# allocate. A finite-but-enormous scale (e.g. a 4K frame @ 1000x -> ~2.5 TB)
+# would otherwise drive bytearray() to attempt a multi-terabyte allocation
+# that fails with MemoryError or OOM-kills the interpreter. Rejecting such a
+# scale with a clean CaptureError *before* the allocation is attempted (rather
+# than attempting it and catching the failure) keeps resize() total and
+# preserves the CLI contract: impractical parameters -> CaptureError, never a
+# traceback.
+_MAX_FRAME_BYTES = 512 * 1024 * 1024  # 512 MiB
+
 
 class CaptureError(Exception):
     """Raised when screen capture fails (PERCEPTION_ERROR class)."""
@@ -86,7 +96,10 @@ class Frame:
         source pixel, so the result is deterministic and needs no image library.
 
         Raises:
-            CaptureError: if ``scale`` is not a positive finite number.
+            CaptureError: if ``scale`` is not a positive finite number, or if
+                the scaled frame would exceed the :data:`_MAX_FRAME_BYTES`
+                safety cap (a finite-but-huge scale is rejected before any
+                allocation is attempted).
         """
         if not scale > 0:
             raise CaptureError(f"scale must be > 0, got {scale!r}")
@@ -95,11 +108,22 @@ class Frame:
         try:
             new_w = max(1, int(self.width * scale))
             new_h = max(1, int(self.height * scale))
-            out = bytearray(new_w * new_h * 3)
         except OverflowError as exc:
             raise CaptureError(
-                f"scale {scale!r} produces a frame too large to allocate: {exc}"
+                f"scale {scale!r} produces non-finite dimensions: {exc}"
             ) from exc
+        # Safety boundary: reject a finite-but-huge scale before attempting the
+        # allocation. A huge bytearray() would raise MemoryError or OOM-kill the
+        # process; catching that after the fact means we first attempted an
+        # absurd allocation. A deterministic cap keeps the "invalid/impractical
+        # parameters -> clean CaptureError" contract (see _MAX_FRAME_BYTES).
+        required_bytes = new_w * new_h * 3
+        if required_bytes > _MAX_FRAME_BYTES:
+            raise CaptureError(
+                f"scale {scale!r} would require {required_bytes} bytes "
+                f"({new_w}x{new_h}); maximum is {_MAX_FRAME_BYTES} bytes"
+            )
+        out = bytearray(required_bytes)
         for dst_row in range(new_h):
             src_row = min(self.height - 1, int(dst_row / scale))
             src_base = src_row * self.width * 3
