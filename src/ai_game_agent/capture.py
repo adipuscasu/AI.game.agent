@@ -236,7 +236,9 @@ class MssBackend(CaptureBackend):
         # monitors[n] for n >= 2 is the (n-1)th secondary. Default is 1 so a
         # bare capture is the primary monitor, not the black-banded virtual
         # desktop (see docs/manual-testing.md).
-        shot = self._screen.grab(self._screen.monitors[self._monitor])
+        shot = self._screen.grab(
+            self._select_monitor(self._screen, self._monitor)
+        )
         size = shot.size
         # mss 9 exposes shot.size as a dict; mss >= 10 as a Size object.
         if isinstance(size, dict):
@@ -249,6 +251,37 @@ class MssBackend(CaptureBackend):
                 f"unexpected mss frame size: {len(raw)} bytes for {width}x{height}"
             )
         return Frame(width, height, raw, datetime.now(UTC), self.name)
+
+    @staticmethod
+    def _select_monitor(screen: object, monitor: int) -> object:
+        """Validate the configured monitor index against the live ``monitors`` list.
+
+        Only the mss backend knows how many monitors exist at runtime (0 = the
+        whole virtual screen, 1 = primary, 2+ = secondaries), so the bounds
+        check lives here rather than in :class:`CaptureConfig` (whose ``ge=0``
+        validator cannot see the runtime list). Reading ``screen.monitors`` and
+        indexing it both happen here so a missing collection (``AttributeError``)
+        or an out-of-range index (``IndexError``) surface as a :class:`CaptureError`
+        instead of leaking a low-level exception (the capture layer's contract
+        is one error type for backend failures).
+        """
+        try:
+            monitors = screen.monitors
+        except AttributeError as exc:
+            raise CaptureError(
+                f"mss backend did not expose a monitor list: {exc}"
+            ) from exc
+        if not isinstance(monitors, (list, tuple)):
+            raise CaptureError(
+                f"mss backend monitor list has unexpected type "
+                f"{type(monitors).__name__}"
+            )
+        if not 0 <= monitor < len(monitors):
+            raise CaptureError(
+                f"monitor index {monitor} is out of range "
+                f"(available: 0..{len(monitors) - 1})"
+            )
+        return monitors[monitor]
 
 
 class Capture:

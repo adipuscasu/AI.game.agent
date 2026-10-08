@@ -115,6 +115,45 @@ def test_mss_backend_selects_monitor_from_config():
         assert fake.last_monitor == monitor
 
 
+def test_mss_backend_out_of_range_monitor_raises_capture_error():
+    """A configured monitor index that exceeds the live ``monitors`` list must
+    surface as a ``CaptureError`` (the capture layer's single error type),
+    not a raw ``IndexError`` (regression: review P2-2 — ``--monitor 999`` used
+    to leak ``IndexError: list index out of range``)."""
+    backend, fake = make_backend(FakeScreenShot(4, 2, bytes((7, 8, 9)) * 8), monitor=5)
+    backend.open()
+    try:
+        with pytest.raises(CaptureError, match="out of range"):
+            backend.grab()
+    finally:
+        backend.close()
+    # The backend must fail before ever asking mss for a monitor.
+    assert fake.last_monitor is None
+
+
+class _ScreenWithoutMonitors:
+    """A screen object that does not expose a ``monitors`` collection."""
+
+    def grab(self, monitor):  # pragma: no cover - never reached in the test
+        raise AssertionError("grab() must not be called when monitors is missing")
+
+    def close(self):
+        pass
+
+
+def test_mss_backend_missing_monitors_list_raises_capture_error():
+    """If the screen object does not expose ``monitors`` at all, that must
+    also be a ``CaptureError`` (attribute access on ``.monitors`` would leak
+    ``AttributeError``)."""
+    backend = MssBackend(mss_factory=lambda: _ScreenWithoutMonitors(), monitor=1)
+    backend.open()
+    try:
+        with pytest.raises(CaptureError, match="monitor list"):
+            backend.grab()
+    finally:
+        backend.close()
+
+
 def test_mss_backend_defaults_to_primary():
     """With no monitor configured, the factory must default to monitors[1]
     (primary), matching the documented "full primary monitor" behavior.
