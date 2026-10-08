@@ -14,6 +14,7 @@ Design rules:
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -89,9 +90,16 @@ class Frame:
         """
         if not scale > 0:
             raise CaptureError(f"scale must be > 0, got {scale!r}")
-        new_w = max(1, int(self.width * scale))
-        new_h = max(1, int(self.height * scale))
-        out = bytearray(new_w * new_h * 3)
+        if not math.isfinite(scale):
+            raise CaptureError(f"scale must be finite, got {scale!r}")
+        try:
+            new_w = max(1, int(self.width * scale))
+            new_h = max(1, int(self.height * scale))
+            out = bytearray(new_w * new_h * 3)
+        except OverflowError as exc:
+            raise CaptureError(
+                f"scale {scale!r} produces a frame too large to allocate: {exc}"
+            ) from exc
         for dst_row in range(new_h):
             src_row = min(self.height - 1, int(dst_row / scale))
             src_base = src_row * self.width * 3

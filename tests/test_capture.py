@@ -194,6 +194,16 @@ def test_frame_resize_min_size_and_invalid_scale():
         frame.resize(0.0)
     with pytest.raises(CaptureError):
         frame.resize(-1.0)
+    # Non-finite and enormous scales must fail cleanly with CaptureError, not
+    # leak a raw OverflowError (the docstring promises "positive finite").
+    with pytest.raises(CaptureError):
+        frame.resize(float("inf"))
+    with pytest.raises(CaptureError):
+        frame.resize(float("-inf"))
+    with pytest.raises(CaptureError):
+        frame.resize(float("nan"))
+    with pytest.raises(CaptureError):
+        frame.resize(1e300)
 
 
 def test_capture_applies_scale_after_region():
