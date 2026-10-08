@@ -230,6 +230,29 @@ def _observe(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+def _resolve_template_path(path: str | Path) -> Path:
+    """Anchor a configured template path to the repository root.
+
+    The project convention (README, docs/manual-testing.md) is to run the CLI
+    from the repository root, and the shipped reference config
+    (``config/fulltest.yaml``) uses repo-relative paths such as
+    ``assets/templates/loot_glow.png``. Resolving those against the process
+    CWD made the template matcher fail-fast with ``PerceptionError``
+    ("template file not found") whenever ``analyze``/``capture`` ran from
+    anywhere else — review P2-3.
+
+    Absolute paths are used as-is. Relative paths are anchored to the repo
+    root, which is stable because ``__main__.py`` lives at
+    ``src/ai_game_agent/__main__.py`` inside the repo: three parent hops
+    (package dir → ``src`` → repo root) give the root regardless of CWD.
+    """
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    repo_root = Path(__file__).resolve().parents[2]
+    return repo_root / p
+
+
 def _build_perception(args: argparse.Namespace, cfg) -> Perception:
     """Assemble a :class:`Perception` from the loaded config and CLI flags.
 
@@ -256,10 +279,17 @@ def _build_perception(args: argparse.Namespace, cfg) -> Perception:
         # Lazy import: only when the template subsystem is actually
         # selected, so `perception.enabled=false` (or a template-free
         # config) imports no OpenCV-backed implementation at all.
+        # Resolve relative template paths against the repo root so a
+        # config with ``templates: assets/templates/x.png`` works from
+        # any CWD (review P2-3), matching the documented convention.
+        # Absolute paths pass through unchanged.
+        resolved_templates = {
+            name: str(_resolve_template_path(p)) for name, p in templates_cfg.items()
+        }
         from ai_game_agent.perception.template import CvTemplateMatcher
 
         template_matcher = CvTemplateMatcher(
-            templates_cfg, threshold=perception.template_threshold
+            resolved_templates, threshold=perception.template_threshold
         )
     ui_zones = perception.ui_zones
     if getattr(args, "no_templates", False):

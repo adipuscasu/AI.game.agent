@@ -1,5 +1,6 @@
 import json
 import logging
+from pathlib import Path
 
 import ai_game_agent.__main__ as cli
 from ai_game_agent.__main__ import main
@@ -671,3 +672,45 @@ def test_cli_imports_cleanly_without_vision_extra():
         f"--- stderr ---\n{result.stderr}"
     )
     assert "imported-ok" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# P2-3: relative template paths resolve against the repository root
+# ---------------------------------------------------------------------------
+
+
+def _repo_root() -> Path:
+    # ``cli`` is the ``ai_game_agent.__main__`` module (imported via
+    # ``import ai_game_agent.__main__ as cli``), so its ``__file__`` is
+    # ``src/ai_game_agent/__main__.py`` and parents[2] is the repo root.
+    return Path(cli.__file__).resolve().parents[2]
+
+
+def test_resolve_template_path_absolute_is_unchanged(tmp_path) -> None:
+    # Absolute paths are used as-is (no anchoring to the repo root).
+    abs_path = tmp_path / "absolute.png"
+    assert cli._resolve_template_path(abs_path) == abs_path
+    assert cli._resolve_template_path(str(abs_path)) == abs_path
+
+
+def test_resolve_template_path_relative_anchors_to_repo_root(tmp_path) -> None:
+    # A repo-relative path (like the one shipped in config/fulltest.yaml)
+    # must resolve to <repo_root>/assets/templates/... regardless of CWD.
+    resolved = cli._resolve_template_path("assets/templates/loot_glow.png")
+    assert resolved == _repo_root() / "assets" / "templates" / "loot_glow.png"
+    # And the shipped asset actually exists at that resolved location.
+    assert resolved.is_file()
+
+
+def test_resolve_template_path_is_cwd_independent(tmp_path) -> None:
+    # Running the resolver from a foreign CWD must still anchor to the repo
+    # root, not the process CWD (the original P2-3 bug).
+    import os
+
+    os.chdir(tmp_path)
+    try:
+        resolved = cli._resolve_template_path("assets/templates/target_frame.png")
+        assert resolved == _repo_root() / "assets" / "templates" / "target_frame.png"
+        assert resolved.is_file()
+    finally:
+        os.chdir(_repo_root())

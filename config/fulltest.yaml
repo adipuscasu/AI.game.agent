@@ -34,7 +34,7 @@ perception:
   template_threshold: 0.8
 
   # 1) Template matching — locate the loot-glow icon anywhere on screen.
-  #    Path is resolved relative to the working directory.
+  #    Relative paths resolve against the repository root (works from any CWD).
   templates:
     loot_glow: assets/templates/loot_glow.png
 
