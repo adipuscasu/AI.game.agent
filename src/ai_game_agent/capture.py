@@ -14,6 +14,7 @@ Design rules:
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,6 +28,16 @@ from ai_game_agent.config import CaptureConfig
 # ``.png``). Rotation must only ever consider files matching this pattern so
 # it never deletes unrelated PNGs sharing the directory.
 _FRAME_FILE_RE = re.compile(r"^frame_\d{8}T\d{12}(?:-\d+)?\.png$")
+
+# M3: hard safety cap on the byte size of any frame Frame.resize() will
+# allocate. A finite-but-enormous scale (e.g. a 4K frame @ 1000x -> ~2.5 TB)
+# would otherwise drive bytearray() to attempt a multi-terabyte allocation
+# that fails with MemoryError or OOM-kills the interpreter. Rejecting such a
+# scale with a clean CaptureError *before* the allocation is attempted (rather
+# than attempting it and catching the failure) keeps resize() total and
+# preserves the CLI contract: impractical parameters -> CaptureError, never a
+# traceback.
+_MAX_FRAME_BYTES = 512 * 1024 * 1024  # 512 MiB
 
 
 class CaptureError(Exception):
@@ -85,13 +96,34 @@ class Frame:
         source pixel, so the result is deterministic and needs no image library.
 
         Raises:
-            CaptureError: if ``scale`` is not a positive finite number.
+            CaptureError: if ``scale`` is not a positive finite number, or if
+                the scaled frame would exceed the :data:`_MAX_FRAME_BYTES`
+                safety cap (a finite-but-huge scale is rejected before any
+                allocation is attempted).
         """
         if not scale > 0:
             raise CaptureError(f"scale must be > 0, got {scale!r}")
-        new_w = max(1, int(self.width * scale))
-        new_h = max(1, int(self.height * scale))
-        out = bytearray(new_w * new_h * 3)
+        if not math.isfinite(scale):
+            raise CaptureError(f"scale must be finite, got {scale!r}")
+        try:
+            new_w = max(1, int(self.width * scale))
+            new_h = max(1, int(self.height * scale))
+        except OverflowError as exc:
+            raise CaptureError(
+                f"scale {scale!r} produces non-finite dimensions: {exc}"
+            ) from exc
+        # Safety boundary: reject a finite-but-huge scale before attempting the
+        # allocation. A huge bytearray() would raise MemoryError or OOM-kill the
+        # process; catching that after the fact means we first attempted an
+        # absurd allocation. A deterministic cap keeps the "invalid/impractical
+        # parameters -> clean CaptureError" contract (see _MAX_FRAME_BYTES).
+        required_bytes = new_w * new_h * 3
+        if required_bytes > _MAX_FRAME_BYTES:
+            raise CaptureError(
+                f"scale {scale!r} would require {required_bytes} bytes "
+                f"({new_w}x{new_h}); maximum is {_MAX_FRAME_BYTES} bytes"
+            )
+        out = bytearray(required_bytes)
         for dst_row in range(new_h):
             src_row = min(self.height - 1, int(dst_row / scale))
             src_base = src_row * self.width * 3
@@ -174,7 +206,7 @@ def create_backend(config: CaptureConfig):
                 "the 'mss' backend is not installed; "
                 "install it with 'pip install mss' or set capture.backend to 'mock'"
             )
-        return MssBackend()
+        return MssBackend(monitor=config.monitor)
     raise CaptureError(f"unknown capture backend: {config.backend!r}")
 
 
@@ -196,8 +228,13 @@ class MssBackend(CaptureBackend):
 
     name = "mss"
 
-    def __init__(self, mss_factory: Callable[[], object] | None = None) -> None:
+    def __init__(
+        self,
+        mss_factory: Callable[[], object] | None = None,
+        monitor: int = 1,
+    ) -> None:
         self._factory = mss_factory
+        self._monitor = monitor
         self._screen: object | None = None
 
     def open(self) -> None:
@@ -218,9 +255,14 @@ class MssBackend(CaptureBackend):
     def grab(self) -> Frame:
         if self._screen is None:
             raise CaptureError("mss backend not opened; call open() first")
-        # mss >= 10 requires an explicit monitor; monitors[0] is the whole
-        # virtual screen (same as the legacy no-argument grab).
-        shot = self._screen.grab(self._screen.monitors[0])
+        # mss >= 10 requires an explicit monitor. mss monitors[0] is the whole
+        # virtual screen (all monitors); monitors[1] is the primary, and
+        # monitors[n] for n >= 2 is the (n-1)th secondary. Default is 1 so a
+        # bare capture is the primary monitor, not the black-banded virtual
+        # desktop (see docs/manual-testing.md).
+        shot = self._screen.grab(
+            self._select_monitor(self._screen, self._monitor)
+        )
         size = shot.size
         # mss 9 exposes shot.size as a dict; mss >= 10 as a Size object.
         if isinstance(size, dict):
@@ -233,6 +275,37 @@ class MssBackend(CaptureBackend):
                 f"unexpected mss frame size: {len(raw)} bytes for {width}x{height}"
             )
         return Frame(width, height, raw, datetime.now(UTC), self.name)
+
+    @staticmethod
+    def _select_monitor(screen: object, monitor: int) -> object:
+        """Validate the configured monitor index against the live ``monitors`` list.
+
+        Only the mss backend knows how many monitors exist at runtime (0 = the
+        whole virtual screen, 1 = primary, 2+ = secondaries), so the bounds
+        check lives here rather than in :class:`CaptureConfig` (whose ``ge=0``
+        validator cannot see the runtime list). Reading ``screen.monitors`` and
+        indexing it both happen here so a missing collection (``AttributeError``)
+        or an out-of-range index (``IndexError``) surface as a :class:`CaptureError`
+        instead of leaking a low-level exception (the capture layer's contract
+        is one error type for backend failures).
+        """
+        try:
+            monitors = screen.monitors
+        except AttributeError as exc:
+            raise CaptureError(
+                f"mss backend did not expose a monitor list: {exc}"
+            ) from exc
+        if not isinstance(monitors, (list, tuple)):
+            raise CaptureError(
+                f"mss backend monitor list has unexpected type "
+                f"{type(monitors).__name__}"
+            )
+        if not 0 <= monitor < len(monitors):
+            raise CaptureError(
+                f"monitor index {monitor} is out of range "
+                f"(available: 0..{len(monitors) - 1})"
+            )
+        return monitors[monitor]
 
 
 class Capture:

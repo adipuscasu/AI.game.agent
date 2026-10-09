@@ -194,6 +194,41 @@ def test_frame_resize_min_size_and_invalid_scale():
         frame.resize(0.0)
     with pytest.raises(CaptureError):
         frame.resize(-1.0)
+    # Non-finite and enormous scales must fail cleanly with CaptureError, not
+    # leak a raw OverflowError (the docstring promises "positive finite").
+    with pytest.raises(CaptureError):
+        frame.resize(float("inf"))
+    with pytest.raises(CaptureError):
+        frame.resize(float("-inf"))
+    with pytest.raises(CaptureError):
+        frame.resize(float("nan"))
+    with pytest.raises(CaptureError):
+        frame.resize(1e300)
+
+
+def test_frame_resize_rejects_finite_scale_exceeding_max_frame_bytes():
+    # A finite-but-enormous scale produces a required buffer that fits in
+    # Python's integer range (so no OverflowError) yet is impossible to
+    # allocate: pre-fix, resize() attempted the allocation and the
+    # interpreter died with MemoryError or an OOM-kill (SIGKILL, 137).
+    # The max-frame-size guard must reject it with a clean CaptureError
+    # *before* any allocation is attempted — running this test under a low
+    # `ulimit -v` proves no large allocation was tried (a 60 GB attempt
+    # would raise MemoryError and fail the test instead).
+    frame = _gradient_frame(4, 2)
+    # 4x2 @ 5e4 -> 200000x100000 pixels = 6e10 bytes (~60 GB).
+    with pytest.raises(CaptureError, match="bytes"):
+        frame.resize(5e4)
+
+
+def test_frame_resize_allows_scale_within_max_frame_bytes():
+    # A scale that stays under the 512 MiB cap must still work, so the
+    # guard does not reject practical upscales.
+    frame = _gradient_frame(4, 2)
+    # 4x2 @ 300 -> 1200x600 pixels = 2.16 MB, well under the cap.
+    resized = frame.resize(300)
+    assert (resized.width, resized.height) == (1200, 600)
+    assert len(resized.pixels) == 1200 * 600 * 3
 
 
 def test_capture_applies_scale_after_region():

@@ -19,8 +19,12 @@ capture:
   # "capture" extra). Use "mock" for CI / replay without a desktop session.
   backend: mss
   # Optional region of interest in pixels: {x, y, width, height}.
-  # null = capture the full primary monitor.
+  # null = capture the whole selected monitor (see ``monitor`` below).
   region: null
+  # mss monitor selector (mss monitors[] index): 1 = primary (default),
+  # 2+ = (n-1)th secondary, 0 = the whole virtual screen (all monitors).
+  # Ignored by the mock backend.
+  monitor: 1
   # Target capture rate; frames closer together are dropped.
   fps: 30
   # Optional downscale factor applied after capture (1.0 = no scaling).
@@ -37,6 +41,49 @@ safety:
     - F12
   max_action_duration_ms: 5000
   max_consecutive_actions: 50
+
+# Perception (Phase 2). Runs the cheap, deterministic detectors: template
+# matching, UI-zone checks, OCR, and color-blob object detection. With nothing
+# configured below, the net effect is an empty observation (Phase 1 behavior).
+# Requires the "vision" extra for templates / blobs and the "ocr" extra + a
+# Tesseract install for OCR.
+perception:
+  # Master switch (the CLI --no-* flags opt out of individual subsystems).
+  enabled: true
+  # Minimum normalized match score (0..1) for a template hit to count.
+  template_threshold: 0.8
+  # Logical name -> PNG path (repo-relative). Commit tiny samples to
+  # assets/templates/<name>.png and list them here to make `analyze` demoable.
+  templates: {}
+    # target_frame: assets/templates/target_frame.png
+    # loot_glow: assets/templates/loot_glow.png
+  # Configured UI regions to inspect. `check` is one of: presence, brightness,
+  # color_present. Example (see docs/phase-2-implementation-plan.md §5.2):
+  # ui_zones:
+  #   - name: action_bar
+  #     x: 640
+  #     y: 940
+  #     width: 640
+  #     height: 120
+  #     check: brightness
+  ui_zones: []
+  # OCR: default off (needs the "ocr" extra and a Tesseract install).
+  # (The backend is fixed to Tesseract; there is no engine selector.)
+  ocr:
+    enabled: false
+    # regions:
+    #   - {name: health_bar, x: 10, y: 20, width: 100, height: 20}
+    regions: []
+    # Noise floor: recognized text with mean confidence strictly below this
+    # is dropped (Tesseract emits garbage on real frames; 0.34 "i" was one).
+    # Set to 0.0 to disable the gate.
+    min_confidence: 0.5
+  # Basic object detection (color blobs). Default off.
+  objects:
+    enabled: false
+    # colors:
+    #   - {name: loot_glow, rgb: [255, 200, 0], tolerance: 40}
+    colors: []
 
 # Logging.
 logging:

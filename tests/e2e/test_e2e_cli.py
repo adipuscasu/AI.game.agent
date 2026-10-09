@@ -16,6 +16,7 @@ Run with::
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -196,3 +197,115 @@ def test_unknown_backend_reports_error(tmp_path: Path) -> None:
     assert "error:" in result.stderr
     assert result.stdout == ""
     assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 – ``analyze`` subcommand
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+def test_analyze_prints_json(tmp_path: Path) -> None:
+    """analyze prints a single-line JSON observation on stdout."""
+    result = run_cli("analyze", "--backend", "mock")
+    assert result.returncode == 0, result.stderr
+    obs = json.loads(result.stdout)
+    # Core shape: observation is a JSON object with the expected keys.
+    assert isinstance(obs, dict)
+    assert isinstance(obs.get("templates"), list)
+    assert isinstance(obs.get("text_regions"), list)
+    assert isinstance(obs.get("objects"), list)
+    # MockBackend default frame dimensions.
+    assert obs.get("frame_width") == 128
+    assert obs.get("frame_height") == 72
+    # stderr must be empty on success.
+    assert result.stderr == ""
+
+
+@pytest.mark.e2e
+def test_analyze_pretty_prints_indented_json() -> None:
+    """--pretty produces indented (multi-line) JSON."""
+    result = run_cli("analyze", "--backend", "mock", "--pretty")
+    assert result.returncode == 0, result.stderr
+    # Indented JSON should span more than one line.
+    assert len(result.stdout.strip().splitlines()) > 1
+    obs = json.loads(result.stdout)  # still valid JSON
+    assert obs.get("frame_width") == 128
+
+
+@pytest.mark.e2e
+def test_analyze_disabled_subsystems() -> None:
+    """--no-ocr --no-objects suppress text and object regions."""
+    result = run_cli("analyze", "--backend", "mock", "--no-ocr", "--no-objects")
+    assert result.returncode == 0, result.stderr
+    obs = json.loads(result.stdout)
+    assert obs.get("text_regions") == []
+    assert obs.get("objects") == []
+
+
+@pytest.mark.e2e
+def test_analyze_config_file(tmp_path: Path) -> None:
+    """analyze --config loads a config file and respects its perception block."""
+    cfg = tmp_path / "analyze_config.yaml"
+    cfg.write_text(
+        """\
+perception:
+  enabled: true
+  templates: {}
+  ui_zones: []
+  ocr:
+    enabled: false
+  objects:
+    enabled: false
+"""
+    )
+    result = run_cli("analyze", "--backend", "mock", "--config", str(cfg))
+    assert result.returncode == 0, result.stderr
+    obs = json.loads(result.stdout)
+    # OCR and objects disabled in config → empty lists.
+    assert obs.get("text_regions") == []
+    assert obs.get("objects") == []
+
+
+@pytest.mark.e2e
+def test_analyze_fulltest_config_fires_all_subsystems() -> None:
+    """config/fulltest.yaml exercises every perception subsystem headless.
+
+    The mock backend emits a deterministic uniform frame, so this is a stable
+    non-empty-output contract for the full-perception config: a *clean* run
+    (no detector errors — the template PNG loads, OCR runs) with real hits
+    from the detectors that can fire on a uniform frame.
+    """
+    result = run_cli("analyze", "--backend", "mock", "--config", "config/fulltest.yaml")
+    assert result.returncode == 0, result.stderr
+    obs = json.loads(result.stdout)
+    # Clean run: all four subsystems executed without error.
+    assert obs.get("detector_errors") == []
+    # ui_zones fired (brightness + color_present checks).
+    zones = {z["zone"] for z in obs.get("ui_zones", [])}
+    assert {"health", "resource"} <= zones
+    # objects fired (the frame-color blob detector).
+    assert "frame_color" in {o["kind"] for o in obs.get("objects", [])}
+    # A blank frame has no icon/text: "ran but found nothing" is the correct
+    # outcome for templates and OCR — not an error.
+    assert obs.get("templates") == []
+    assert obs.get("text_regions") == []
+
+
+@pytest.mark.e2e
+def test_analyze_bad_config_reports_error(tmp_path: Path) -> None:
+    """analyze --config with a malformed file ⇒ exit 1, error: on stderr, empty stdout."""
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("perception: [not, a, dict]\n")
+    result = run_cli("analyze", "--backend", "mock", "--config", str(bad))
+    assert result.returncode == 1
+    assert "error:" in result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.e2e
+def test_analyze_unknown_backend_reports_error() -> None:
+    result = run_cli("analyze", "--backend", "doesnotexist")
+    assert result.returncode == 1
+    assert "error:" in result.stderr
+    assert result.stdout == ""

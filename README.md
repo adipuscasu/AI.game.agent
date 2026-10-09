@@ -18,6 +18,20 @@ The initial target is **World of Warcraft**, with the long-term goal of providin
 * 🧠 Short-term and persistent agent memory
 * 🛑 Independent emergency-stop and safety mechanisms
 * 📊 Detailed decision and action logging
+
+## Testing and Development Workflow
+
+The project follows a strict Test-Driven Development (TDD) lifecycle.
+
+**Unit and Integration Testing:**
+The unit and integration test suite is managed by `pytest`. The stable command to run all tests is:
+
+\`\`\`bash
+uv run pytest
+\`\`\`
+
+The currently detected version of `pytest` is 9.1.1. Remember to run tests from the root directory of the workspace.
+
 * 🔬 Replay and testing of recorded sessions
 * 🧩 Game-independent core with pluggable game adapters
 * 🏠 Designed for local execution and privacy
@@ -84,14 +98,18 @@ section 15) ships with this release:
   per `capture.fps`; `FpsMeter` reports the measured rate over a run.
 * **Recording** — `Recorder` writes each frame as PNG to `record.directory`,
   rotating out the oldest files beyond `record.max_files`.
-* **Screenshot viewer (CLI)** — `ai-game-agent` exposes two subcommands:
-  `capture` (single frame) and `observe` (loop + measured FPS).
+* **Screenshot viewer (CLI)** — `ai-game-agent` exposes three subcommands:
+  `capture` (single frame), `observe` (loop + measured FPS), and
+  `analyze` (one frame through the Phase 2 perception pipeline, JSON out).
 
 ### CLI usage
 
 ```powershell
 # One screenshot from the primary monitor, saved to ./screenshots
 uv run ai-game-agent capture --backend mss --out shots/
+
+# Select a different monitor (1=primary default, 2+=secondary, 0=whole virtual screen)
+uv run ai-game-agent capture --backend mss --monitor 2 --out shots/
 
 # A 30-frame capture loop with measured FPS (no recording)
 uv run ai-game-agent observe --backend mss --frames 30 --fps 30
@@ -102,6 +120,31 @@ uv run ai-game-agent observe --backend mock --frames 5 --fps 0 --record --out re
 # Region of interest (x,y,width,height)
 uv run ai-game-agent capture --backend mss --region 0,0,1920,1080 --out shots/
 ```
+
+### Phase 2: perception (`analyze`)
+
+`analyze` captures one frame and runs it through the perception pipeline —
+UI region detection, template matching, OCR, and color-blob object detection
+— printing the structured `Observation` as JSON on stdout.
+
+```powershell
+# One frame from the mock backend, printed as JSON (CI-friendly, headless)
+uv run ai-game-agent analyze --backend mock --fps 0
+
+# Real capture from screen region 640,360 at 1920x1080, scaled 0.5x
+uv run ai-game-agent analyze --backend mss --region 640,360,1920,1080 --scale 0.5
+
+# Disable individual subsystems (OCR needs the "ocr" extra + Tesseract)
+uv run ai-game-agent analyze --no-ocr --no-objects --no-templates
+
+# Full-perception demo: every subsystem on (needs .[vision,ocr]); the mock
+# frame makes the ui-zone / object hits deterministic headless
+uv run ai-game-agent analyze --config config/fulltest.yaml --backend mock --fps 0
+```
+
+Shared options with `capture`/`observe`: `--backend` (default `mss`), `--monitor` (1=primary default, 2+=secondary, 0=whole virtual screen), `--config`,
+`--region`, `--scale`, `--fps`, `--no-templates`, `--no-ocr`, `--no-objects`,
+`--pretty`, `-o/--out`. Errors go to `stderr` with an `error:` prefix and exit 1.
 
 `--fps 0` disables pacing (no sleeps) and is the right choice for tests,
 CI, and fast debug runs. All CLI options default to the values in
