@@ -26,6 +26,12 @@ jobs:
           python-version: "3.11"
           enable-cache: false
 
+      - name: Install Python 3.11
+        # setup-uv's python-version input only sets UV_PYTHON; it does not
+        # install the interpreter. Install it explicitly so the find below and
+        # uv sync have a guaranteed interpreter on a clean runner.
+        run: uv python install 3.11
+
       - name: Show tool versions
         run: |
           uv --version
