@@ -1,40 +1,42 @@
 name: CI
 
 on:
-  pull_request:
   push:
-    branches:
-      - develop
-      - main
+    branches: [develop, "feature/**"]
+  pull_request:
+    branches: [develop]
+
+permissions:
+  contents: read
 
 jobs:
-  quality:
+  test:
+    name: Test (Python 3.11)
     runs-on: ubuntu-latest
+
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.11"
-          enable-cache: true
+          enable-cache: false
 
       - name: Show tool versions
-        run: uv --version && python --version
+        run: |
+          uv --version
+          uv python find 3.11
 
-      - name: Install project + all extras
-        # All optional extras (capture / dev / vision / ocr) are installed so
-        # the OpenCV + Tesseract code paths are exercised. The bare-env contract
-        # is still enforced by tests/test_cli.py, which blocks cv2/numpy in a
-        # subprocess via a meta_path importer — independent of what is installed.
-        run: uv sync --all-extras
+      - name: Install dependencies
+        run: uv sync --all-extras --locked
 
-      - name: Verify lockfile is in sync
+      - name: Check lockfile
         run: uv lock --check
 
-      - name: Lint (ruff)
+      - name: Lint
         run: uv run ruff check src tests
 
-      - name: Test (pytest)
-        run: uv run pytest tests/ -q
+      - name: Test
+        run: uv run pytest
