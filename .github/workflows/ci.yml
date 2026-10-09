@@ -32,6 +32,13 @@ jobs:
         # uv sync have a guaranteed interpreter on a clean runner.
         run: uv python install 3.11
 
+      - name: Install tesseract-ocr
+        # The `ocr` extra installs pytesseract, a pure-Python wrapper that
+        # shells out to the `tesseract` binary, which uv/pip cannot provide.
+        # The full-perception e2e test asserts a clean OCR run, so install
+        # the system binary here (a dev box has it; a clean runner does not).
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+
       - name: Show tool versions
         run: |
           uv --version
