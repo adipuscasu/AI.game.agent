@@ -95,6 +95,44 @@ class _AIConfig(BaseModel):
     base_url: str = "http://localhost:11434"
 
 
+class _InputConfig(BaseModel):
+    """Input control settings (Phase 3, step 2).
+
+    ``backend`` selects the input backend (``mock`` | ``windows``); ``mode``
+    is the default operating mode.
+
+    Layer split (matches the tests):
+    * the **config** layer fails fast on unknown *keys* (``extra="forbid"``,
+      e.g. a ``backends:`` typo) and validates the ``mode`` against the closed
+      ``OperationMode`` set — a bad mode is a schema error at load;
+    * the **factory** (:func:`~ai_game_agent.actions.base.create_backend`) owns
+      the ``backend`` *value*: it normalizes case/whitespace (``"  MOCK "`` ->
+      mock) and raises :class:`ActionError` for an unknown name. So this model
+      does NOT closed-set-validate ``backend`` — the constructor stays
+      permissive so the factory can apply its selection contract.
+
+    The canonical ``mode`` spellings are the ``OperationMode``
+    (``actions/modes.py``, step 3) string values.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    backend: str = "mock"
+    # The default operating mode. OBSERVE_ONLY is the safe default: the
+    # shipped CLI emits no OS input unless explicitly promoted.
+    mode: str = "observe_only"
+    # The emergency-stop hotkey is defined in the safety block
+    # (safety.emergency_stop_keys) and read through by the Windows adapter.
+
+    @field_validator("mode")
+    @classmethod
+    def _mode_is_known(cls, v: str) -> str:
+        allowed = ("observe_only", "assisted", "semi_autonomous", "autonomous")
+        if v not in allowed:
+            raise ValueError(f"invalid input.mode {v!r}; expected one of {list(allowed)}")
+        return v
+
+
 class _SafetyConfig(BaseModel):
     """Safety / emergency-stop settings (Phase 3+)."""
 
@@ -103,6 +141,9 @@ class _SafetyConfig(BaseModel):
     emergency_stop_keys: tuple[str, ...] = ("F12",)
     max_action_duration_ms: int = Field(default=5000, gt=0)
     max_consecutive_actions: int = Field(default=50, gt=0)
+    # Bounded retry: after this many backend errors the executor PAUSES
+    # (never an infinite loop). Phase 3, step 4.
+    max_backend_errors: int = Field(default=3, gt=0)
 
 
 _VALID_LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"})
@@ -253,6 +294,7 @@ class _Config(BaseModel):
 
     ai: _AIConfig = Field(default_factory=_AIConfig)
     capture: _CaptureConfig = Field(default_factory=_CaptureConfig)
+    input: _InputConfig = Field(default_factory=_InputConfig)
     safety: _SafetyConfig = Field(default_factory=_SafetyConfig)
     logging: _LoggingConfig = Field(default_factory=_LoggingConfig)
     perception: _PerceptionConfig = Field(default_factory=_PerceptionConfig)
@@ -489,12 +531,14 @@ class SafetyConfig(_FrozenConfig):
         emergency_stop_keys: tuple[str, ...] = ("F12",),
         max_action_duration_ms: int = 5000,
         max_consecutive_actions: int = 50,
+        max_backend_errors: int = 3,
     ) -> None:
         super().__init__(
             _SafetyConfig(
                 emergency_stop_keys=emergency_stop_keys,
                 max_action_duration_ms=max_action_duration_ms,
                 max_consecutive_actions=max_consecutive_actions,
+                max_backend_errors=max_backend_errors,
             )
         )
 
@@ -509,6 +553,11 @@ class SafetyConfig(_FrozenConfig):
     @property
     def max_consecutive_actions(self) -> int:
         return self._m.max_consecutive_actions
+
+    @property
+    def max_backend_errors(self) -> int:
+        """How many consecutive backend I/O failures before a safe pause."""
+        return self._m.max_backend_errors
 
 
 class LoggingConfig(_FrozenConfig):
@@ -631,10 +680,32 @@ class PerceptionConfig(_FrozenConfig):
         return [c.model_dump(mode="json") for c in self._m.objects.colors]
 
 
+class InputConfig(_FrozenConfig):
+    """Input / action-execution settings (Phase 3+).
+
+    ``backend`` selects the :class:`~ai_game_agent.actions.base.InputBackend`
+    (``mock`` for headless/CI, ``windows`` for the real pynput backend); ``mode``
+    is the initial :class:`~ai_game_agent.actions.modes.OperationMode`.
+    """
+
+    __slots__ = ()
+
+    def __init__(self, backend: str = "mock", mode: str = "observe_only") -> None:
+        super().__init__(_InputConfig(backend=backend, mode=mode))
+
+    @property
+    def backend(self) -> str:
+        return self._m.backend
+
+    @property
+    def mode(self) -> str:
+        return self._m.mode
+
+
 class Config:
     """Top-level configuration object for the agent."""
 
-    __slots__ = ("ai", "capture", "safety", "logging", "perception")
+    __slots__ = ("ai", "capture", "safety", "logging", "perception", "input")
 
     def __init__(
         self,
@@ -643,18 +714,20 @@ class Config:
         safety: SafetyConfig | None = None,
         logging: LoggingConfig | None = None,
         perception: PerceptionConfig | None = None,
+        input: InputConfig | None = None,
     ) -> None:
         self.ai = ai if ai is not None else AIConfig()
         self.capture = capture if capture is not None else CaptureConfig()
         self.safety = safety if safety is not None else SafetyConfig()
         self.logging = logging if logging is not None else LoggingConfig()
         self.perception = perception if perception is not None else PerceptionConfig()
+        self.input = input if input is not None else InputConfig()
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
             f"Config(ai={self.ai!r}, capture={self.capture!r}, "
             f"safety={self.safety!r}, logging={self.logging!r}, "
-            f"perception={self.perception!r})"
+            f"perception={self.perception!r}, input={self.input!r})"
         )
 
 
@@ -682,8 +755,10 @@ def _config_from_model(model: _Config) -> Config:
             tuple(model.safety.emergency_stop_keys),
             model.safety.max_action_duration_ms,
             model.safety.max_consecutive_actions,
+            model.safety.max_backend_errors,
         ),
         logging=LoggingConfig(model.logging.level, model.logging.directory),
+        input=InputConfig(model.input.backend, model.input.mode),
         perception=PerceptionConfig(
             enabled=model.perception.enabled,
             template_threshold=model.perception.template_threshold,

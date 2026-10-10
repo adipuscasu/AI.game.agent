@@ -23,9 +23,13 @@ from ai_game_agent.actions.base import (
     ActionError,
     ActionQueueError,
     ActionValidationError,
+    InputBackend,
     InputBackendError,
+    Keyboard,
     ModeViolation,
+    Mouse,
     SafetyViolation,
+    create_backend,
 )
 
 __all__ = [
@@ -36,9 +40,13 @@ __all__ = [
     "ActionQueueError",
     "ActionResult",
     "ActionValidationError",
+    "InputBackend",
     "InputBackendError",
+    "Keyboard",
     "ModeViolation",
+    "Mouse",
     "SCHEMA_VERSION",
     "SafetyViolation",
+    "create_backend",
     "validate_action",
 ]
