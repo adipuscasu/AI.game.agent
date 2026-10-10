@@ -47,6 +47,24 @@ import sys
 import time
 from pathlib import Path
 
+# Phase 3 action execution. ``create_backend``/``SafetyGuard``/``Executor`` are
+# dependency-free (no pynput at import time); the ``windows`` backend is
+# imported lazily by ``create_backend`` only when selected, so a bare venv
+# without the ``input`` extra stays importable (the contract the
+# bare-import test asserts).
+from ai_game_agent.actions import (
+    ActionError,
+    ActionKind,
+    ActionLog,
+    InputBackendError,
+    ModeViolation,
+    SafetyGuard,
+    SafetyViolation,
+)
+from ai_game_agent.actions.action import Action
+from ai_game_agent.actions.base import create_backend
+from ai_game_agent.actions.executor import Executor
+from ai_game_agent.actions.modes import OperationMode
 from ai_game_agent.capture import Capture, CaptureError, FpsMeter, save_frame
 from ai_game_agent.config import (
     CaptureConfig,
@@ -373,6 +391,211 @@ def _analyze(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+def _build_executor(
+    cfg: Config,
+    backend_name: str | None = None,
+    mode: OperationMode | None = None,
+) -> tuple[Executor, object]:
+    """Wire backend + guard + executor from config.
+
+    ``backend_name`` (a ``--backend`` CLI flag) overrides ``cfg.input.backend``;
+    ``mode`` (a ``--mode`` CLI flag) overrides ``cfg.input.mode``. Otherwise the
+    config values are used, so a YAML edit changes behavior without touching code.
+
+    Raises:
+        InputBackendError: the ``windows`` backend needs pynput (``input`` extra).
+        ActionError: unknown backend name (the factory owns rejection).
+    """
+    from ai_game_agent.actions.modes import OperationMode
+    from ai_game_agent.config import InputConfig
+
+    mode = mode if mode is not None else OperationMode(cfg.input.mode)
+    backend_name = backend_name if backend_name is not None else cfg.input.backend
+    backend = create_backend(InputConfig(backend=backend_name, mode=cfg.input.mode))
+    # Bounds come from the safety config (cfg.safety.*); only the mode is
+    # overridable by the CLI flag. SafetyGuard.from_config already wires mode
+    # from cfg.input.mode, so for the CLI-override case we re-apply the mode.
+    guard = SafetyGuard(
+        mode=mode,
+        max_action_duration_ms=cfg.safety.max_action_duration_ms,
+        max_consecutive_actions=cfg.safety.max_consecutive_actions,
+        max_backend_errors=cfg.safety.max_backend_errors,
+    )
+    return Executor(backend=backend, safety=guard), backend
+
+
+def _resolve_actions(args: argparse.Namespace) -> list[Action]:
+    """Resolve the actions to run: ``--do`` (repeatable) → built-in demo.
+
+    ``--do`` flags *append* in command-line order (a batch is the union of all
+    flags). When no ``--do`` is present, the built-in 5-action demo is the
+    default — this is the path the plan's §7.2 config-file test exercises
+    (``act --config`` with no explicit actions).
+    """
+    do_specs: list[str] = list(getattr(args, "do", None) or [])
+    if do_specs:
+        actions: list[Action] = []
+        for spec in do_specs:
+            actions.extend(_parse_action_args(spec))
+        if not actions:
+            raise ActionError("act: --do specified no valid actions")
+        return actions
+    # Default: the built-in demo (also triggered explicitly by --demo).
+    return _demo_actions()
+
+
+def _demo_actions() -> list[Action]:
+    """The built-in 5-action demo (plan §7.2): a recognizable, low-risk sequence."""
+    return [
+        Action(kind=ActionKind.KEY_PRESS, key="space"),
+        Action(kind=ActionKind.MOUSE_MOVE, x=320, y=180),
+        Action(kind=ActionKind.MOUSE_CLICK, button="left", clicks=1),
+        Action(kind=ActionKind.KEY_HOLD, key="w", duration_ms=150),
+        Action(kind=ActionKind.DELAY, duration_ms=50),
+    ]
+
+
+def _act(args: argparse.Namespace, cfg: Config) -> int:
+    """Run one (or a batch of) action(s) through the Executor and print an
+    :class:`ActionLog` as JSON.
+
+    Mode precedence: ``--mode`` > ``cfg.input.mode`` > the ``observe_only``
+    safe default (the config default). Under ``OBSERVE_ONLY`` the gate holds
+    end to end: the log is printed with ``results == []`` and ``stopped ==
+    False`` — nothing reaches the backend. A ``ModeViolation`` or
+    :class:`SafetyViolation` from the guard is recorded as a failed result for
+    that action and **halts the batch** (``stopped == True``); a per-action
+    backend failure is recorded and the batch continues.
+    """
+    from ai_game_agent.actions.modes import OperationMode
+
+    mode = OperationMode(getattr(args, "mode", None) or cfg.input.mode)
+    backend_name = getattr(args, "backend", None)
+    executor, backend = _build_executor(cfg, backend_name, mode)
+
+    actions = _resolve_actions(args)
+
+    # OBSERVE_ONLY: the gate holds without opening a backend or performing
+    # anything — the log says so, with zero results and no stop.
+    if mode is OperationMode.OBSERVE_ONLY:
+        log.info("act: mode=observe_only — gate held, no input emitted")
+        action_log = ActionLog(results=(), stopped=False)
+        _print_action_log(action_log, args)
+        return 0
+
+    backend.open()
+    try:
+        log.info(
+            "act: backend=%s mode=%s actions=%d",
+            getattr(backend, "name", "unknown"),
+            mode.value,
+            len(actions),
+        )
+        results = []
+        stopped = False
+        stop_reason: str | None = None
+        for action in actions:
+            try:
+                results.append(executor.execute(action))
+            except ModeViolation as exc:
+                # Policy gate: record the failure and stop — a mode violation
+                # means the *mode* rejects further input, not just this action.
+                results.append(_failed_result(action, exc, executor.stopped))
+                stopped = True
+                stop_reason = f"mode gate: {exc}"
+                break
+            except SafetyViolation as exc:
+                # Bound violation: record and stop — the batch has exceeded a
+                # configured safety bound.
+                results.append(_failed_result(action, exc, executor.stopped))
+                stopped = True
+                stop_reason = f"safety bound: {exc}"
+                break
+    finally:
+        backend.close()
+
+    action_log = ActionLog(
+        results=tuple(results),
+        stopped=stopped or executor.stopped,
+        stop_reason=stop_reason or executor.stop_reason,
+    )
+    _print_action_log(action_log, args)
+    return 0
+
+
+def _failed_result(action: Action, exc: Exception, stop_event: bool) -> object:
+    """A failed :class:`ActionResult` for a guard violation (not a backend error)."""
+    from ai_game_agent.actions.action import ActionResult
+
+    return ActionResult(
+        action=action,
+        ok=False,
+        error=str(exc),
+        stop_event=stop_event,
+    )
+
+
+def _print_action_log(action_log: ActionLog, args: argparse.Namespace) -> None:
+    """Print the ActionLog as JSON, honoring ``--pretty``."""
+    if getattr(args, "pretty", False):
+        print(json.dumps(action_log.to_dict(), indent=2))
+    else:
+        print(json.dumps(action_log.to_dict(), sort_keys=True))
+
+
+def _parse_action_args(spec: str | None) -> list[Action]:
+    """Parse the ``--do`` spec(s) into validated :class:`Action` objects.
+
+    Accepts a compact spec: ``key:a``, ``hold:a:100``, ``move:100,200``,
+    ``click:left:1``, ``down:left``, ``up:left``, ``scroll:3``, ``delay:200``.
+    Multiple ``--do`` flags build a batch (FIFO). Validation failures raise
+    :class:`~ai_game_agent.actions.base.ActionValidationError` (a clean CLI
+    error, not a traceback).
+    """
+    if not spec:
+        raise ValueError("act: --do is required (e.g. --do key:a)")
+    actions: list[Action] = []
+    for raw in spec.split(";"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        head, _, rest = raw.partition(":")
+        head = head.strip().lower()
+        if head == "key":
+            actions.append(Action(kind=ActionKind.KEY_PRESS, key=rest.strip()))
+        elif head == "hold":
+            key, _, ms = rest.partition(":")
+            actions.append(Action(kind=ActionKind.KEY_HOLD, key=key.strip(),
+                                  duration_ms=int(ms or 0)))
+        elif head == "move":
+            x, _, y = rest.partition(",")
+            actions.append(Action(kind=ActionKind.MOUSE_MOVE,
+                                  x=int(x), y=int(y)))
+        elif head == "click":
+            button, _, clicks = rest.partition(":")
+            actions.append(Action(kind=ActionKind.MOUSE_CLICK,
+                                  button=button.strip() or "left",
+                                  clicks=int(clicks or 1)))
+        elif head == "down":
+            actions.append(Action(kind=ActionKind.MOUSE_DOWN,
+                                  button=rest.strip() or "left"))
+        elif head == "up":
+            actions.append(Action(kind=ActionKind.MOUSE_UP,
+                                  button=rest.strip() or "left"))
+        elif head == "scroll":
+            actions.append(Action(kind=ActionKind.MOUSE_SCROLL,
+                                  scroll=int(rest or 0)))
+        elif head == "delay":
+            actions.append(Action(kind=ActionKind.DELAY,
+                                  duration_ms=int(rest or 0)))
+        else:
+            raise ValueError(
+                f"act: unknown --do kind {head!r} "
+                "(use key/hold/move/click/down/up/scroll/delay)"
+            )
+    return actions
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ai-game-agent", description=__doc__)
     sub = parser.add_subparsers(dest="command")
@@ -434,6 +657,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_obs.set_defaults(func=_observe)
 
+    p_act = sub.add_parser(
+        "act",
+        help="Execute one or more input actions through the Executor (Phase 3).",
+    )
+    p_act.add_argument("--do", action="append",
+                       help="action spec (repeatable; ';'-separated for a batch): "
+                            "key:a | hold:a:100 | move:100,200 | click:left:1 | "
+                            "down:left | up:left | scroll:3 | delay:200")
+    p_act.add_argument("--demo", action="store_true",
+                       help="run the built-in 5-action demo (default when --do "
+                            "is absent)")
+    p_act.add_argument("--mode", default=None,
+                       choices=["observe_only", "assisted", "semi_autonomous",
+                                "autonomous"],
+                       help="operation mode (default: input.mode from config, "
+                            "observe_only)")
+    p_act.add_argument("--backend", default=None,
+                       help="input backend (mock | windows); default from config")
+    p_act.add_argument("--record", action="store_true",
+                       help="record the ActionLog to --record-dir (default: "
+                            "off)")
+    p_act.add_argument("--record-dir", default=None,
+                       help="directory for recorded ActionLog JSON (default: "
+                            "recordings)")
+    p_act.add_argument("--confirm", action="store_true",
+                       help="required for --backend windows in non-observe_only "
+                            "modes (no-op for mock)")
+    p_act.add_argument("--pretty", action="store_true",
+                       help="pretty-print the JSON result")
+    p_act.add_argument(
+        "--config", default=None,
+        help="YAML config file (default: config/default.yaml); "
+             "provides defaults for --backend/--mode and the safety bounds",
+    )
+    p_act.set_defaults(func=_act)
+
     p_an = sub.add_parser(
         "analyze", help="Capture one frame and print the perception Observation as JSON."
     )
@@ -479,11 +738,22 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config(getattr(args, "config", None))
         _setup_logging(cfg)
         return int(args.func(args, cfg))
-    except (ValueError, CaptureError, ConfigError, PerceptionError, OSError) as exc:
+    except (
+        ValueError,
+        CaptureError,
+        ConfigError,
+        PerceptionError,
+        OSError,
+        ActionError,
+        InputBackendError,
+        ModeViolation,
+    ) as exc:
         # OSError covers genuine I/O failures (permission, full disk,
         # read-only target) raised by save_frame/Recorder while writing
-        # frames; translating it here keeps the CLI's clean "error:" +
-        # exit-1 contract instead of a raw traceback (N2).
+        # frames; ActionError/InputBackendError/ModeViolation cover the Phase 3
+        # action path (unknown backend, missing pynput, mode gate). Translating
+        # all of these here keeps the CLI's clean "error:" + exit-1 contract
+        # instead of a raw traceback (N2).
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

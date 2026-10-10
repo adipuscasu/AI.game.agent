@@ -817,3 +817,39 @@ def test_cli_analyze_keeps_at_or_above_ocr_floor(tmp_path, monkeypatch, capsys) 
     obs = json.loads(capsys.readouterr().out)
     assert len(obs["text_regions"]) == 1
     assert obs["text_regions"][0]["text"] == "12 / 12"
+
+
+# --- Phase 3: `act` subcommand -------------------------------------------------
+
+
+def test_cli_act_demo_autonomous_executes(capsys) -> None:
+    """AUTONOMOUS demo: exit 0, valid ActionLog JSON, results executed."""
+    rc = main(["act", "--backend", "mock", "--demo", "--mode", "autonomous"])
+    assert rc == 0
+    log = json.loads(capsys.readouterr().out)
+    assert isinstance(log["results"], list) and len(log["results"]) > 0
+    assert log["stopped"] is False
+
+
+def test_cli_act_observe_only_emits_nothing(capsys) -> None:
+    """OBSERVE_ONLY: the gate holds end to end — zero results, not stopped."""
+    rc = main(["act", "--backend", "mock", "--demo", "--mode", "observe_only"])
+    assert rc == 0
+    log = json.loads(capsys.readouterr().out)
+    assert log["results"] == []
+    assert log["stopped"] is False
+
+
+def test_cli_act_do_batch_runs(capsys) -> None:
+    """Two ``--do`` flags form a batch (append-list), both execute ok."""
+    rc = main(
+        [
+            "act", "--backend", "mock", "--mode", "autonomous",
+            "--do", "key:a", "--do", "click:left:1",
+        ]
+    )
+    assert rc == 0
+    log = json.loads(capsys.readouterr().out)
+    assert log["stopped"] is False
+    assert len(log["results"]) == 2
+    assert all(r["ok"] is True for r in log["results"])
