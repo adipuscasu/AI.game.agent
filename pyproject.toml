@@ -52,6 +52,15 @@ ocr = [
     # self-contained.
     "Pillow>=10.0",
 ]
+# Phase 3 input control. ``pynput`` backs the ``windows`` backend
+# (real mouse/keyboard I/O + the emergency-stop hotkey listener). Optional:
+# the core package, the action contract, the mock backend, and the full test
+# suite import and run without it (headless/CI). Install only on the target
+# Windows machine — a 9p/drvfs-shared venv must not be re-synced across OSes,
+# which would prune the other side's platform packages.
+input = [
+    "pynput>=1.7,<2",
+]
 
 [project.scripts]
 ai-game-agent = "ai_game_agent.__main__:main"
