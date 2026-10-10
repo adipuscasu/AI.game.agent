@@ -31,6 +31,9 @@ from ai_game_agent.actions.base import (
     SafetyViolation,
     create_backend,
 )
+from ai_game_agent.actions.modes import OperationMode
+from ai_game_agent.actions.queue import ActionQueue, ActionRequest
+from ai_game_agent.actions.safety import ExecutorState, SafetyGuard
 
 __all__ = [
     "Action",
@@ -40,13 +43,18 @@ __all__ = [
     "ActionQueueError",
     "ActionResult",
     "ActionValidationError",
+    "ExecutorState",
     "InputBackend",
     "InputBackendError",
     "Keyboard",
     "ModeViolation",
     "Mouse",
+    "OperationMode",
     "SCHEMA_VERSION",
+    "SafetyGuard",
     "SafetyViolation",
+    "ActionQueue",
+    "ActionRequest",
     "create_backend",
     "validate_action",
 ]

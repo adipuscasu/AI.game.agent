@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from ai_game_agent.actions import Action, OperationMode, SafetyGuard
+from ai_game_agent.actions import Action, ActionKind, OperationMode, SafetyGuard
 from ai_game_agent.actions.base import (
     ActionError,
     ActionValidationError,
@@ -54,14 +54,14 @@ def test_mode_allows_input():
 def test_observe_only_gate_blocks_all_action_kinds():
     guard = SafetyGuard(mode=OperationMode.OBSERVE_ONLY)
     kinds = (
-        ("key_press", Action(kind="key_press", key="w")),
-        ("key_hold", Action(kind="key_hold", key="w", duration_ms=100)),
-        ("mouse_move", Action(kind="mouse_move", x=10, y=20)),
-        ("mouse_click", Action(kind="mouse_click")),
-        ("mouse_down", Action(kind="mouse_down", button="left")),
-        ("mouse_up", Action(kind="mouse_up", button="left")),
-        ("mouse_scroll", Action(kind="mouse_scroll", scroll=3)),
-        ("delay", Action(kind="delay", duration_ms=100)),
+        ("key_press", Action(kind=ActionKind.KEY_PRESS, key="w")),
+        ("key_hold", Action(kind=ActionKind.KEY_HOLD, key="w", duration_ms=100)),
+        ("mouse_move", Action(kind=ActionKind.MOUSE_MOVE, x=10, y=20)),
+        ("mouse_click", Action(kind=ActionKind.MOUSE_CLICK)),
+        ("mouse_down", Action(kind=ActionKind.MOUSE_DOWN, button="left")),
+        ("mouse_up", Action(kind=ActionKind.MOUSE_UP, button="left")),
+        ("mouse_scroll", Action(kind=ActionKind.MOUSE_SCROLL, scroll=3)),
+        ("delay", Action(kind=ActionKind.DELAY, duration_ms=100)),
     )
     for name, action in kinds:
         with pytest.raises(ModeViolation) as excinfo:
@@ -75,14 +75,14 @@ def test_mode_gate_is_mode_scoped_not_backend_scoped():
     # otherwise-valid action under OBSERVE_ONLY is rejected identically.
     guard = SafetyGuard(mode=OperationMode.OBSERVE_ONLY)
     with pytest.raises(ModeViolation):
-        guard.check(Action(kind="key_press", key="w"))
+        guard.check(Action(kind=ActionKind.KEY_PRESS, key="w"))
     with pytest.raises(ModeViolation):
-        guard.check(Action(kind="mouse_scroll", scroll=1))
+        guard.check(Action(kind=ActionKind.MOUSE_SCROLL, scroll=1))
 
 
 def test_autonomous_gate_allows():
     guard = SafetyGuard(mode=OperationMode.AUTONOMOUS)
-    guard.check(Action(kind="key_press", key="w"))  # no raise
+    guard.check(Action(kind=ActionKind.KEY_PRESS, key="w"))  # no raise
 
 
 def test_assisted_gate_allows_execution_but_reports_violations():
@@ -90,9 +90,9 @@ def test_assisted_gate_allows_execution_but_reports_violations():
     # bound violations are *reported* (raised for the executor to catch and
     # convert into a proposal/report), never silently executed.
     guard = SafetyGuard(mode=OperationMode.ASSISTED)
-    guard.check(Action(kind="key_press", key="w"))  # allowed
+    guard.check(Action(kind=ActionKind.KEY_PRESS, key="w"))  # allowed
     with pytest.raises(SafetyViolation):
-        guard.check(Action(kind="delay", duration_ms=10**9))  # reported
+        guard.check(Action(kind=ActionKind.DELAY, duration_ms=10**9))  # reported
 
 
 # --- Bounds: duration / delay ------------------------------------------------
@@ -100,61 +100,74 @@ def test_assisted_gate_allows_execution_but_reports_violations():
 
 def test_duration_within_bound_passes():
     guard = SafetyGuard(mode=OperationMode.AUTONOMOUS)
-    guard.check(Action(kind="delay", duration_ms=5000))  # == max (default 5000)
+    guard.check(Action(kind=ActionKind.DELAY, duration_ms=5000))  # == max (default 5000)
 
 
 def test_duration_over_bound_raises():
     guard = SafetyGuard(mode=OperationMode.AUTONOMOUS)
     with pytest.raises(SafetyViolation) as excinfo:
-        guard.check(Action(kind="delay", duration_ms=5001))
+        guard.check(Action(kind=ActionKind.DELAY, duration_ms=5001))
     assert "5000" in str(excinfo.value)  # message names the bound
 
 
 def test_hold_duration_over_bound_raises():
     guard = SafetyGuard(mode=OperationMode.AUTONOMOUS)
     with pytest.raises(SafetyViolation):
-        guard.check(Action(kind="key_hold", key="w", duration_ms=5001))
+        guard.check(Action(kind=ActionKind.KEY_HOLD, key="w", duration_ms=5001))
 
 
 def test_delay_field_is_bounded_too():
     guard = SafetyGuard(mode=OperationMode.AUTONOMOUS)
-    guard.check(Action(kind="delay", duration_ms=1000, delay_ms=5000))
+    guard.check(Action(kind=ActionKind.DELAY, duration_ms=1000, delay_ms=5000))
     with pytest.raises(SafetyViolation):
-        guard.check(Action(kind="delay", duration_ms=1000, delay_ms=5001))
+        guard.check(Action(kind=ActionKind.DELAY, duration_ms=1000, delay_ms=5001))
 
 
 def test_negative_timing_rejected_by_contract_not_guard():
     # The Action contract forbids negative timing at construction; the guard
     # never sees them (defense in depth: the contract is the first line).
     with pytest.raises(ActionValidationError):
-        Action(kind="delay", duration_ms=-1)
+        Action(kind=ActionKind.DELAY, duration_ms=-1)
 
 
 def test_custom_duration_bound_from_config():
-    cfg = Config(safety=SafetyConfig(max_action_duration_ms=100))
+    cfg = Config(
+        input=InputConfig(mode="autonomous"),
+        safety=SafetyConfig(max_action_duration_ms=100),
+    )
     guard = SafetyGuard.from_config(cfg)
-    guard.check(Action(kind="delay", duration_ms=100))
+    guard.check(Action(kind=ActionKind.DELAY, duration_ms=100))
     with pytest.raises(SafetyViolation):
-        guard.check(Action(kind="delay", duration_ms=101))
+        guard.check(Action(kind=ActionKind.DELAY, duration_ms=101))
 
 
-# --- Bounds: coordinates ------------------------------------------------------
+def test_mode_gate_fires_before_bound_check():
+    # The OBSERVE_ONLY gate is checked before any bound: an action that is
+    # also over the duration bound is rejected as a *mode* violation, not a
+    # bound violation — the mode is the safety story.
+    cfg = Config(safety=SafetyConfig(max_action_duration_ms=1))
+    guard = SafetyGuard.from_config(cfg)
+    with pytest.raises(ModeViolation):
+        guard.check(Action(kind=ActionKind.DELAY, duration_ms=10**9))
 
 
-def test_coordinates_must_be_non_negative():
+# --- Coordinate sanity lives in the Action contract, not the guard ------------
+
+
+def test_coordinate_sanity_lives_in_the_action_contract():
+    # Negative *absolute* coordinates are rejected at the Action contract
+    # (the single source of truth — the guard cannot receive such an action;
+    # it is unconstructable). (0, 0) is a valid absolute coordinate, and
+    # relative deltas may legitimately be negative.
+    with pytest.raises(ActionValidationError):
+        Action(kind=ActionKind.MOUSE_MOVE, x=-1, y=0)
+    with pytest.raises(ActionValidationError):
+        Action(kind=ActionKind.MOUSE_MOVE, x=0, y=-1)
+
     guard = SafetyGuard(mode=OperationMode.AUTONOMOUS)
-    guard.check(Action(kind="mouse_move", x=0, y=0))  # (0, 0) is valid
-    with pytest.raises(SafetyViolation):
-        guard.check(Action(kind="mouse_move", x=-1, y=0))
-    with pytest.raises(SafetyViolation):
-        guard.check(Action(kind="mouse_move", x=0, y=-1))
-
-
-def test_coordinate_sanity_is_kind_scoped():
-    # Only kinds that carry coordinates are checked; a key action never
-    # triggers the coordinate path.
-    guard = SafetyGuard(mode=OperationMode.AUTONOMOUS)
-    guard.check(Action(kind="key_press", key="w", x=None, y=None))
+    guard.check(Action(kind=ActionKind.MOUSE_MOVE, x=0, y=0))
+    guard.check(Action(kind=ActionKind.MOUSE_MOVE, x=-10, y=5, relative=True))
+    guard.check(Action(kind=ActionKind.KEY_PRESS, key="w", x=None, y=None))
 
 
 # --- Batch bound: max_consecutive_actions ------------------------------------
@@ -163,24 +176,24 @@ def test_coordinate_sanity_is_kind_scoped():
 def test_consecutive_actions_within_bound_pass():
     guard = SafetyGuard(mode=OperationMode.AUTONOMOUS)
     for _ in range(50):  # default max is 50
-        guard.check(Action(kind="key_press", key="w"))
+        guard.check(Action(kind=ActionKind.KEY_PRESS, key="w"))
 
 
 def test_consecutive_actions_over_bound_raises():
     guard = SafetyGuard(mode=OperationMode.AUTONOMOUS)
     for _ in range(50):
-        guard.check(Action(kind="key_press", key="w"))
+        guard.check(Action(kind=ActionKind.KEY_PRESS, key="w"))
     with pytest.raises(SafetyViolation) as excinfo:
-        guard.check(Action(kind="key_press", key="w"))  # 51st
+        guard.check(Action(kind=ActionKind.KEY_PRESS, key="w"))  # 51st
     assert "50" in str(excinfo.value)
 
 
 def test_batch_counter_resets():
     guard = SafetyGuard(mode=OperationMode.AUTONOMOUS)
     for _ in range(50):
-        guard.check(Action(kind="key_press", key="w"))
+        guard.check(Action(kind=ActionKind.KEY_PRESS, key="w"))
     guard.reset_batch()
-    guard.check(Action(kind="key_press", key="w"))  # new batch, no raise
+    guard.check(Action(kind=ActionKind.KEY_PRESS, key="w"))  # new batch, no raise
 
 
 # --- Backend error bound (bounded retry, no infinite loops) ------------------
@@ -202,6 +215,19 @@ def test_backend_error_counter_resets_on_success():
     guard.record_success()  # one success clears the consecutive count
     assert guard.backend_errors == 0
     assert not guard.should_pause
+
+
+def test_counters_are_per_guard_instance():
+    # Documented semantics: counters are per guard instance (each executor
+    # run uses a fresh guard or reset_batch), never shared across instances.
+    a = SafetyGuard(mode=OperationMode.AUTONOMOUS)
+    b = SafetyGuard(mode=OperationMode.AUTONOMOUS)
+    a.check(Action(kind=ActionKind.KEY_PRESS, key="w"))
+    a.record_backend_error()
+    assert a.batch_count == 1
+    assert a.backend_errors == 1
+    assert b.batch_count == 0
+    assert b.backend_errors == 0
 
 
 def test_custom_backend_error_bound():
@@ -268,6 +294,19 @@ def test_invalid_mode_rejected_at_config_layer():
 
     with pytest.raises(ValidationError):
         InputConfig(mode="obseve_only")
+
+
+def test_mode_set_is_in_sync_across_layers():
+    # config cannot import the enum (an actions import would cycle back
+    # through config via base.py), so the single-canonical-set invariant is
+    # enforced behaviorally here: every OperationMode value must round-trip
+    # through the config model, and a typo must not.
+    from pydantic import ValidationError
+
+    for mode in OperationMode:
+        assert InputConfig(mode=mode.value).mode == mode.value
+    with pytest.raises(ValidationError):
+        InputConfig(mode="not_a_mode")
 
 
 # --- Error taxonomy ----------------------------------------------------------

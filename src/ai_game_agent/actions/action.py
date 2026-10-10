@@ -427,9 +427,12 @@ def _validate_action(action: Action) -> None:
                 f"(got {value!r}); use a kind that uses it"
             )
 
-    # 2. Required fields must be non-default.
+    # 2. Required fields must be present (not ``None``). Zero is a *value*,
+    #    not an absence: (0, 0) is the screen origin, a legal mouse target.
+    #    (``key=""`` and ``scroll=0`` remain illegal — the value-level rules
+    #    below reject them with their specific messages.)
     for name in _KIND_REQUIRED[kind]:
-        if getattr(action, name) in (None, "", 0, ()):
+        if getattr(action, name) is None:
             raise ActionValidationError(
                 f"action kind {kind!r} requires field {name!r} to be set"
             )

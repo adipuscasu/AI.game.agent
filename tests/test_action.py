@@ -120,6 +120,13 @@ def test_mouse_move_requires_both_coords() -> None:
         Action(kind=ActionKind.MOUSE_MOVE, y=10)
 
 
+def test_mouse_move_accepts_origin_coordinate() -> None:
+    # Regression: (0, 0) is the screen origin — a legal absolute target.
+    # The required-field check must treat 0 as a *value*, not an absence.
+    action = Action(kind=ActionKind.MOUSE_MOVE, x=0, y=0)
+    assert (action.x, action.y) == (0, 0)
+
+
 def test_mouse_move_rejects_negative_absolute_coords() -> None:
     with pytest.raises(ActionValidationError):
         Action(kind=ActionKind.MOUSE_MOVE, x=-1, y=10)
