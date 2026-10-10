@@ -424,13 +424,55 @@ def _build_executor(
     return Executor(backend=backend, safety=guard), backend
 
 
+def _load_script(path: str | Path) -> list[Action]:
+    """Load a ``--script`` file into validated :class:`Action` objects.
+
+    The documented format is a JSON **list of Action dicts** (the shape
+    ``Action.to_dict()`` produces). An ActionLog-shaped dict (``{"results":
+    [...]}``, the artifact ``--record`` writes) is accepted too: each result's
+    ``action`` is extracted, so a recorded run can be replayed with
+    ``--script``.
+
+    Raises:
+        ActionError: the payload is not a list/ActionLog, or contains no
+            actions.
+        ActionValidationError: an element is not a valid Action (a clean CLI
+            error, not a traceback).
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        raw_actions = data
+    elif isinstance(data, dict):
+        results = data.get("results")
+        if not isinstance(results, list):
+            raise ActionError(
+                "act: a --script JSON object must carry a 'results' list "
+                "(ActionLog shape)"
+            )
+        raw_actions = [
+            r.get("action") if isinstance(r, dict) and "action" in r else r
+            for r in results
+        ]
+    else:
+        raise ActionError(
+            f"act: --script payload must be a list of actions or an ActionLog "
+            f"dict, got {type(data).__name__}"
+        )
+    actions = [Action.from_dict(raw) for raw in raw_actions]
+    if not actions:
+        raise ActionError("act: --script contains no actions")
+    return actions
+
+
 def _resolve_actions(args: argparse.Namespace) -> list[Action]:
-    """Resolve the actions to run: ``--do`` (repeatable) → built-in demo.
+    """Resolve the actions to run: ``--do`` (repeatable) → ``--script`` (file)
+    → built-in demo.
 
     ``--do`` flags *append* in command-line order (a batch is the union of all
-    flags). When no ``--do`` is present, the built-in 5-action demo is the
-    default — this is the path the plan's §7.2 config-file test exercises
-    (``act --config`` with no explicit actions).
+    flags). ``--script`` loads a JSON file of actions (or an ActionLog). When
+    neither is present, the built-in demo is the default — this is the path
+    the plan's §7.2 config-file test exercises (``act --config`` with no
+    explicit actions).
     """
     do_specs: list[str] = list(getattr(args, "do", None) or [])
     if do_specs:
@@ -440,17 +482,36 @@ def _resolve_actions(args: argparse.Namespace) -> list[Action]:
         if not actions:
             raise ActionError("act: --do specified no valid actions")
         return actions
+    script_path = getattr(args, "script", None)
+    if script_path is not None:
+        return _load_script(script_path)
     # Default: the built-in demo (also triggered explicitly by --demo).
     return _demo_actions()
 
 
 def _demo_actions() -> list[Action]:
-    """The built-in 5-action demo (plan §7.2): a recognizable, low-risk sequence."""
+    """The built-in full-contract demo (plan §9).
+
+    All eight action kinds, plus the contract's harder corners: a modifier
+    combo, both mouse buttons, an absolute *and* a relative move, a down/up
+    pairing, and scroll. The part a user will actually run is a real
+    demonstration, not a five-action toy. The sequence is self-releasing:
+    every key/button it holds is released within the batch, so it leaves
+    nothing stuck under any backend.
+    """
     return [
-        Action(kind=ActionKind.KEY_PRESS, key="space"),
-        Action(kind=ActionKind.MOUSE_MOVE, x=320, y=180),
-        Action(kind=ActionKind.MOUSE_CLICK, button="left", clicks=1),
+        # keyboard: modifier combo, then a timed hold (fully released)
+        Action(kind=ActionKind.KEY_PRESS, key="a", modifiers=("ctrl", "shift")),
         Action(kind=ActionKind.KEY_HOLD, key="w", duration_ms=150),
+        # mouse: absolute move, relative move, right button
+        Action(kind=ActionKind.MOUSE_MOVE, x=320, y=180),
+        Action(kind=ActionKind.MOUSE_MOVE, x=24, y=0, relative=True),
+        Action(kind=ActionKind.MOUSE_CLICK, button="right", clicks=2),
+        # press/release pairing (left button), then scroll
+        Action(kind=ActionKind.MOUSE_DOWN, button="left"),
+        Action(kind=ActionKind.MOUSE_UP, button="left"),
+        Action(kind=ActionKind.MOUSE_SCROLL, scroll=3),
+        # pacing
         Action(kind=ActionKind.DELAY, duration_ms=50),
     ]
 
@@ -470,7 +531,21 @@ def _act(args: argparse.Namespace, cfg: Config) -> int:
     from ai_game_agent.actions.modes import OperationMode
 
     mode = OperationMode(getattr(args, "mode", None) or cfg.input.mode)
-    backend_name = getattr(args, "backend", None)
+    backend_name = getattr(args, "backend", None) or cfg.input.backend
+    # --confirm policy gate: the real-OS-input backend in an input-enabled
+    # mode requires explicit acknowledgment. It fires *before* the backend is
+    # built, so a missing pynput can never mask the missing gate, and it is
+    # exempt for OBSERVE_ONLY — that mode emits no input by construction.
+    if (
+        backend_name.strip().lower() == "windows"
+        and mode is not OperationMode.OBSERVE_ONLY
+        and not getattr(args, "confirm", False)
+    ):
+        raise ActionError(
+            "act: the 'windows' backend in a non-observe_only mode emits real "
+            "OS input and requires --confirm to acknowledge; pass --confirm, "
+            "or use --mode observe_only / --backend mock"
+        )
     executor, backend = _build_executor(cfg, backend_name, mode)
 
     actions = _resolve_actions(args)
@@ -480,6 +555,7 @@ def _act(args: argparse.Namespace, cfg: Config) -> int:
     if mode is OperationMode.OBSERVE_ONLY:
         log.info("act: mode=observe_only — gate held, no input emitted")
         action_log = ActionLog(results=(), stopped=False)
+        _record_action_log(action_log, args)
         _print_action_log(action_log, args)
         return 0
 
@@ -519,6 +595,7 @@ def _act(args: argparse.Namespace, cfg: Config) -> int:
         stopped=stopped or executor.stopped,
         stop_reason=stop_reason or executor.stop_reason,
     )
+    _record_action_log(action_log, args)
     _print_action_log(action_log, args)
     return 0
 
@@ -533,6 +610,23 @@ def _failed_result(action: Action, exc: Exception, stop_event: bool) -> object:
         error=str(exc),
         stop_event=stop_event,
     )
+
+
+def _record_action_log(action_log: ActionLog, args: argparse.Namespace) -> None:
+    """If ``--record`` was passed, persist the ActionLog as a JSON file.
+
+    The file is the replayable artifact ``--script`` reads back. Written
+    before the log is printed so the record survives even if printing fails.
+    Directory is ``--record-dir`` (default ``recordings``); the file name is
+    timestamp-unique so repeated runs never clobber each other.
+    """
+    if not getattr(args, "record", False):
+        return
+    record_dir = Path(getattr(args, "record_dir", None) or "recordings")
+    record_dir.mkdir(parents=True, exist_ok=True)
+    out = record_dir / f"act-{time.time_ns()}.json"
+    out.write_text(json.dumps(action_log.to_dict(), indent=2) + "\n", encoding="utf-8")
+    log.info("act: recorded ActionLog to %s", out)
 
 
 def _print_action_log(action_log: ActionLog, args: argparse.Namespace) -> None:
@@ -665,9 +759,13 @@ def build_parser() -> argparse.ArgumentParser:
                        help="action spec (repeatable; ';'-separated for a batch): "
                             "key:a | hold:a:100 | move:100,200 | click:left:1 | "
                             "down:left | up:left | scroll:3 | delay:200")
+    p_act.add_argument("--script", default=None,
+                       help="JSON file of actions to replay (a list of action "
+                            "dicts, or an ActionLog as written by --record); "
+                            "used when --do is absent")
     p_act.add_argument("--demo", action="store_true",
-                       help="run the built-in 5-action demo (default when --do "
-                            "is absent)")
+                       help="run the built-in full-contract demo (all 8 action "
+                            "kinds; default when --do is absent)")
     p_act.add_argument("--mode", default=None,
                        choices=["observe_only", "assisted", "semi_autonomous",
                                 "autonomous"],
