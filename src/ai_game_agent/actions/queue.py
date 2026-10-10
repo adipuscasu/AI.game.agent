@@ -96,3 +96,12 @@ class ActionQueue:
         count = len(self._pending)
         self._pending.clear()
         return count
+
+    def cancel_all(self) -> int:
+        """Cancel every pending request (plan §5.3 naming).
+
+        Alias of :meth:`clear`: the emergency stop and other priority paths
+        call this so they read as "cancel queued work." Returns the number of
+        cancelled requests; idempotent.
+        """
+        return self.clear()

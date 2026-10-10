@@ -31,6 +31,7 @@ from ai_game_agent.actions.base import (
     SafetyViolation,
     create_backend,
 )
+from ai_game_agent.actions.executor import Executor
 from ai_game_agent.actions.modes import OperationMode
 from ai_game_agent.actions.queue import ActionQueue, ActionRequest
 from ai_game_agent.actions.safety import ExecutorState, SafetyGuard
@@ -43,6 +44,7 @@ __all__ = [
     "ActionQueueError",
     "ActionResult",
     "ActionValidationError",
+    "Executor",
     "ExecutorState",
     "InputBackend",
     "InputBackendError",
