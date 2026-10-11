@@ -451,27 +451,43 @@ def test_hold_key_release_failure_is_retried_by_release_all() -> None:
 
 def test_emergency_stop_releases_modifiers_of_held_key() -> None:
     """An emergency stop during a modified key hold must release the modifiers
-    too — ``release_all`` calls ``key_up`` without the action's modifiers, so
-    the executor must remember and emit them (the Windows backend only
-    releases the modifiers it is told to).
+    too — the executor remembers each held key's modifiers and passes them
+    through to the release, ``key_up("s", ("ctrl",))``, because the Windows
+    backend releases only the modifiers it is told to: a modifier-less
+    release would leave ``ctrl`` stuck.
+
+    The stop fires *during* the hold (the sleeper is the trigger), so
+    ``release_all`` drains a key that is still physically held — the
+    scenario a no-op sleeper makes unreachable.
     """
     from ai_game_agent.actions.executor import Executor
 
     b = MockBackend()
     b.open()
-    ex = Executor(backend=b, safety=_guard(), clock=lambda: 0.0, sleeper=lambda s: None)
-    # Hold 's' with ctrl: key_down carries the modifier, and the executor
-    # must keep it as part of the held state.
-    assert ex.execute(Action(kind=ActionKind.KEY_HOLD, key="s", modifiers=["ctrl"], duration_ms=100)).ok is True
-    ex.trigger_emergency_stop(reason="manual")
+    ex = Executor(
+        backend=b,
+        safety=_guard(),
+        clock=lambda: 0.0,
+        # The sleeper stands in for the elapsed hold time: an emergency stop
+        # arrives mid-hold, while 's'+ctrl is still physically held.
+        sleeper=lambda secs: ex.trigger_emergency_stop(reason="manual"),
+    )
+    result = ex.execute(
+        Action(kind=ActionKind.KEY_HOLD, key="s", modifiers=["ctrl"], duration_ms=100)
+    )
+    assert result.ok is True  # the hold itself completed; the stop is orthogonal
     assert ex.state is ExecutorState.STOPPED
-    # The main key is released ...
-    assert ("key_up", "s") in b.events
-    # ... and the modifier too — not left stuck.
-    assert ("key_up", "ctrl") in b.events
-    # Ordering: the modifier releases after the main key (key first, mods
-    # after — the backend's key_up contract).
-    assert b.events.index(("key_up", "ctrl")) > b.events.index(("key_up", "s"))
+    # The stop released the key with its modifier attached ...
+    assert ("key_up", "s", ("ctrl",)) in b.events
+    # ... and no modifier-less release landed (on the Windows backend that
+    # would leave ctrl stuck).
+    assert ("key_up", "s") not in b.events
+    # The hold's own finally-release may follow the stop's release; a
+    # duplicate release of an already-released key is a no-op in every
+    # backend, so the log must only end with a successful release.
+    assert b.events[0] == ("key_down", "s", ("ctrl",))
+    assert b.events[-1] == ("key_up", "s", ("ctrl",))
+    assert b.held_keys == set()
 
 
 class FlakyMouseReleaseBackend(MockBackend):

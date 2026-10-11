@@ -106,6 +106,11 @@ class Executor:
         # assertions). ``release_all`` drains both.
         self.held_keys: set[str] = set()
         self.held_buttons: set[str] = set()
+        # The modifiers each held key was pressed with. ``release_all`` passes
+        # them through to the release — a backend (e.g. the Windows backend,
+        # which releases only the modifiers it is told to) would otherwise
+        # leave the modifier stuck on an emergency stop.
+        self._key_mods: dict[str, tuple[str, ...]] = {}
         # Releases that were attempted but whose backend call raised: kept
         # so a later ``release_all`` / ``trigger_emergency_stop`` retries
         # **only** those, without re-emitting releases that already landed.
@@ -142,10 +147,17 @@ class Executor:
         Every held input gets its own release attempt: a backend exception
         on one release does **not** stop the remaining releases — the
         emergency stop must release all held input, not bail on the first
-        failure. A failed release is remembered and retried by a later call
-        (``release_all`` or a repeat ``trigger_emergency_stop``); releases
-        that already succeeded are never re-emitted, so a clean release
-        stays idempotent (the mock's event log stays stable).
+        failure. A failed release is remembered (key **and** its modifiers)
+        and retried by a later call (``release_all`` or a repeat
+        ``trigger_emergency_stop``); releases that already succeeded are
+        never re-emitted, so a clean release stays idempotent (the mock's
+        event log stays stable).
+
+        Each key is released **with the modifiers it was held with**
+        (``key_up("s", ("ctrl",))``): the executor remembers the per-key
+        modifiers from the action and passes them through. A backend may
+        release only the modifiers it is told to (the Windows backend
+        does), so a modifier-less release would leave the modifier stuck.
 
         Drains :attr:`held_keys` and :attr:`held_buttons` — cleared either
         way, since after a failed release the executor has done all it can
@@ -159,12 +171,15 @@ class Executor:
         ok = True
         for key in sorted(self.held_keys | self._unreleased_keys):
             try:
-                self._backend.key_up(key)
+                self._backend.key_up(key, self._key_mods.get(key, ()))
             except Exception:  # noqa: BLE001 - one failure must not block the rest
+                # Keep the key **and** its modifiers so the retry releases
+                # the same combined input.
                 self._unreleased_keys.add(key)
                 ok = False
             else:
                 self._unreleased_keys.discard(key)
+                self._key_mods.pop(key, None)
         self.held_keys.clear()
         for button in sorted(self.held_buttons | self._unreleased_buttons):
             try:
@@ -375,10 +390,17 @@ class Executor:
         still emits the release — the release-on-exception guarantee. A
         failed release attempt is handled exactly like the explicit
         release path (see :meth:`_release_key`): the key is tracked as a
-        failed release for a later retry, never left as "still held".
+        failed release (with its modifiers) for a later retry, never left
+        as "still held".
+
+        The action's modifiers are recorded as part of the held state so
+        an emergency stop's ``release_all`` (which may fire while the
+        hold's own release has not run yet) can release the key **with**
+        them.
         """
         self._backend.key_down(key, mods)
         self.held_keys.add(key)
+        self._key_mods[key] = mods
         try:
             if duration_ms > 0:
                 self._sleeper(duration_ms / 1000.0)
@@ -410,14 +432,17 @@ class Executor:
         so it moves from :attr:`held_keys` to the failed-release set —
         where ``release_all`` / ``trigger_emergency_stop`` retry exactly
         the releases that failed, without re-emitting ones that landed.
-        The exception still propagates (``execute`` records it as a
-        backend error for the bounded-retry contract).
+        The key's modifiers stay recorded for that retry (a successful
+        release drops them). The exception still propagates (``execute``
+        records it as a backend error for the bounded-retry contract).
         """
         try:
             self._backend.key_up(key, mods)
         except Exception:  # noqa: BLE001 - record, then let it propagate
             self._unreleased_keys.add(key)
             raise
+        else:
+            self._key_mods.pop(key, None)
         finally:
             self.held_keys.discard(key)
 
