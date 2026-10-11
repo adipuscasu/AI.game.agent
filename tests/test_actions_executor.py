@@ -23,6 +23,7 @@ from ai_game_agent.actions.action import (
     ActionKind,
 )
 from ai_game_agent.actions.base import (
+    InputBackendError,
     ModeViolation,
     SafetyViolation,
 )
@@ -243,3 +244,165 @@ def test_emergency_stop_blocks_even_in_autonomous(backend: MockBackend) -> None:
     assert result.ok is False
     assert result.stop_event is True
     assert backend.events == []  # no input emitted after the stop
+
+
+# --- P1: backend-error recording -> PAUSED (bounded retry, no loop) ---------
+
+
+class FailingBackend(MockBackend):
+    """A backend whose ``press`` always fails (simulated backend I/O error)."""
+
+    def press(self, key: str, modifiers: tuple[str, ...] = ()) -> None:
+        raise InputBackendError("simulated backend I/O failure")
+
+
+def test_backend_error_is_recorded_on_failure() -> None:
+    from ai_game_agent.actions.executor import Executor
+
+    b = FailingBackend()
+    b.open()
+    ex = Executor(backend=b, safety=_guard(), clock=lambda: 0.0, sleeper=lambda s: None)
+    result = ex.execute(Action(kind=ActionKind.KEY_PRESS, key="a"))
+    assert result.ok is False
+    assert ex.safety.backend_errors == 1  # recorded, so the threshold is live
+
+
+def test_backend_success_clears_the_error_count() -> None:
+    from ai_game_agent.actions.executor import Executor
+
+    b = FailingBackend()
+    b.open()
+    ex = Executor(backend=b, safety=_guard(), clock=lambda: 0.0, sleeper=lambda s: None)
+    ex.execute(Action(kind=ActionKind.KEY_PRESS, key="a"))
+    assert ex.safety.backend_errors == 1
+    result = ex.execute(Action(kind=ActionKind.MOUSE_MOVE, x=1, y=2))
+    assert result.ok is True
+    assert ex.safety.backend_errors == 0  # one success clears the consecutive count
+
+
+def test_repeated_backend_errors_pause_the_executor() -> None:
+    from ai_game_agent.actions.executor import Executor
+
+    b = FailingBackend()
+    b.open()
+    guard = _guard(max_backend_errors=2)
+    ex = Executor(backend=b, safety=guard, clock=lambda: 0.0, sleeper=lambda s: None)
+    ex.execute(Action(kind=ActionKind.KEY_PRESS, key="a"))
+    assert ex.state is ExecutorState.RUNNING  # below the bound: still running
+    ex.execute(Action(kind=ActionKind.KEY_PRESS, key="b"))
+    assert guard.should_pause
+    assert ex.state is ExecutorState.PAUSED  # bounded retry exhausted -> safe pause
+
+
+def test_paused_executor_blocks_further_input() -> None:
+    from ai_game_agent.actions.executor import Executor
+
+    b = FailingBackend()
+    b.open()
+    ex = Executor(
+        backend=b, safety=_guard(max_backend_errors=1), clock=lambda: 0.0, sleeper=lambda s: None
+    )
+    ex.execute(Action(kind=ActionKind.KEY_PRESS, key="a"))
+    assert ex.state is ExecutorState.PAUSED
+    events_before = len(b.events)
+    result = ex.execute(Action(kind=ActionKind.KEY_PRESS, key="b"))
+    assert result.ok is False
+    assert result.stop_event is False  # pause is not an emergency stop
+    assert len(b.events) == events_before  # PAUSED gates input: no backend contact
+
+
+def test_resume_recovers_a_paused_executor() -> None:
+    from ai_game_agent.actions.executor import Executor
+
+    b = FailingBackend()
+    b.open()
+    ex = Executor(
+        backend=b, safety=_guard(max_backend_errors=1), clock=lambda: 0.0, sleeper=lambda s: None
+    )
+    ex.execute(Action(kind=ActionKind.KEY_PRESS, key="a"))
+    assert ex.state is ExecutorState.PAUSED
+    ex.resume()
+    assert ex.state is ExecutorState.IDLE
+    assert ex.safety.backend_errors == 0  # the consecutive-error count is cleared
+    result = ex.execute(Action(kind=ActionKind.MOUSE_MOVE, x=1, y=2))
+    assert result.ok is True  # input flows again after resume
+
+
+def test_resume_from_stopped_raises(backend: MockBackend) -> None:
+    ex = _executor(backend)
+    ex.trigger_emergency_stop(reason="manual")  # type: ignore[union-attr]
+    with pytest.raises(ValueError):
+        ex.resume()  # STOPPED is terminal: never recoverable at runtime
+
+
+# --- P2: release_all fault tolerance + failed-release retry ------------------
+
+
+class FlakyReleaseBackend(MockBackend):
+    """A backend that fails to release key ``'a'`` until ``fail_a`` is cleared."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_a = True
+
+    def key_up(self, key: str, modifiers: tuple[str, ...] = ()) -> None:
+        if key == "a" and self.fail_a:
+            raise InputBackendError("simulated release failure for key 'a'")
+        super().key_up(key, modifiers)
+
+
+def test_release_all_continues_after_a_failed_release() -> None:
+    from ai_game_agent.actions.executor import Executor
+
+    b = FlakyReleaseBackend()
+    b.open()
+    b.key_down("a")
+    b.key_down("b")
+    b.mouse_down("left")
+    ex = Executor(backend=b, safety=_guard(), clock=lambda: 0.0, sleeper=lambda s: None)
+    ex.held_keys = set(b.held_keys)
+    ex.held_buttons = set(b.held_buttons)
+    ex.release_all()
+    # Tracking state is cleared: the executor has done all it can for 'a'.
+    assert ex.held_keys == set()
+    assert ex.held_buttons == set()
+    # The other held inputs still received their release (no early bail-out).
+    assert ("key_up", "b") in b.events
+    assert ("mouse_up", "left") in b.events
+
+
+def test_release_all_retries_only_failed_releases() -> None:
+    from ai_game_agent.actions.executor import Executor
+
+    b = FlakyReleaseBackend()
+    b.open()
+    b.key_down("a")
+    b.key_down("b")
+    ex = Executor(backend=b, safety=_guard(), clock=lambda: 0.0, sleeper=lambda s: None)
+    ex.held_keys = set(b.held_keys)
+    ex.release_all()
+    b.fail_a = False  # the backend recovers
+    ex.release_all()
+    assert ("key_up", "a") in b.events  # the failed release was retried
+    # No duplicate release for the key that had already succeeded.
+    assert b.events.count(("key_up", "b")) == 1
+
+
+def test_emergency_stop_retries_failed_release_on_next_stop() -> None:
+    from ai_game_agent.actions.executor import Executor
+
+    b = FlakyReleaseBackend()
+    b.open()
+    b.key_down("a")
+    b.key_down("b")
+    ex = Executor(backend=b, safety=_guard(), clock=lambda: 0.0, sleeper=lambda s: None)
+    ex.held_keys = set(b.held_keys)
+    ex.trigger_emergency_stop(reason="first")
+    assert ex.state is ExecutorState.STOPPED
+    assert ("key_up", "b") in b.events
+    assert "a" in b.held_keys  # 'a' is still physically held (release failed)
+    b.fail_a = False  # the backend recovers
+    ex.trigger_emergency_stop(reason="second")
+    assert ("key_up", "a") in b.events  # the retry landed
+    assert b.held_keys == set()
+    assert ex.stop_reason == "first"  # the original reason is retained

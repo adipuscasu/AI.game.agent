@@ -18,10 +18,24 @@ State machine
 Explicit, testable states (``ExecutorState``): ``IDLE → RUNNING → (IDLE |
 PAUSED | STOPPED)``. ``PAUSED`` is recoverable (bounded backend errors);
 ``STOPPED`` is terminal for the process lifetime and is set **only** by an
-emergency stop. Once ``STOPPED``, every :meth:`execute` short-circuits to a
-failed result with ``stop_event=True`` and **never touches the backend** —
-the safety-critical invariant the OBSERVE_ONLY and emergency-stop regression
-tests both depend on.
+emergency stop.
+
+* A backend I/O failure during ``execute`` is recorded on the guard
+  (``record_backend_error``); a success clears the consecutive count
+  (``record_success``). Once ``safety.should_pause`` is true the executor
+  transitions to ``PAUSED`` — bounded retry, never an infinite loop
+  (AGENTS.md).
+* ``PAUSED`` **gates further input**: while paused, every :meth:`execute`
+  short-circuits to a failed result and **never touches the backend**.
+  :meth:`resume` is the only way back: it clears the consecutive-error
+  count and returns the executor to ``IDLE``. If the backend is still
+  failing it will simply pause again after ``max_backend_errors`` more
+  failures. ``resume`` refuses to run from ``STOPPED`` (raises
+  :class:`ValueError`).
+* Once ``STOPPED``, every :meth:`execute` short-circuits to a failed result
+  with ``stop_event=True`` and **never touches the backend** — the
+  safety-critical invariant the OBSERVE_ONLY and emergency-stop regression
+  tests both depend on.
 
 Dependency injection
 --------------------
@@ -85,6 +99,11 @@ class Executor:
         # assertions). ``release_all`` drains both.
         self.held_keys: set[str] = set()
         self.held_buttons: set[str] = set()
+        # Releases that were attempted but whose backend call raised: kept
+        # so a later ``release_all`` / ``trigger_emergency_stop`` retries
+        # **only** those, without re-emitting releases that already landed.
+        self._unreleased_keys: set[str] = set()
+        self._unreleased_buttons: set[str] = set()
 
     # -- state -----------------------------------------------------------
 
@@ -110,19 +129,46 @@ class Executor:
 
     # -- release-all -----------------------------------------------------
 
-    def release_all(self) -> None:
+    def release_all(self) -> bool:
         """Release every held key and button through the backend.
 
-        Drains :attr:`held_keys` and :attr:`held_buttons`. Idempotent: once
-        nothing is held, a further call emits no events (so the emergency
-        stop can call it repeatedly and the mock's event log stays stable).
+        Every held input gets its own release attempt: a backend exception
+        on one release does **not** stop the remaining releases — the
+        emergency stop must release all held input, not bail on the first
+        failure. A failed release is remembered and retried by a later call
+        (``release_all`` or a repeat ``trigger_emergency_stop``); releases
+        that already succeeded are never re-emitted, so a clean release
+        stays idempotent (the mock's event log stays stable).
+
+        Drains :attr:`held_keys` and :attr:`held_buttons` — cleared either
+        way, since after a failed release the executor has done all it can
+        for that input until the backend recovers.
+
+        Returns:
+            ``True`` if every release succeeded, ``False`` if any backend
+            call raised (the failed inputs remain in the executor's
+            failed-release sets for a later retry).
         """
-        for key in sorted(self.held_keys):
-            self._backend.key_up(key)
+        ok = True
+        for key in sorted(self.held_keys | self._unreleased_keys):
+            try:
+                self._backend.key_up(key)
+            except Exception:  # noqa: BLE001 - one failure must not block the rest
+                self._unreleased_keys.add(key)
+                ok = False
+            else:
+                self._unreleased_keys.discard(key)
         self.held_keys.clear()
-        for button in sorted(self.held_buttons):
-            self._backend.mouse_up(button)
+        for button in sorted(self.held_buttons | self._unreleased_buttons):
+            try:
+                self._backend.mouse_up(button)
+            except Exception:  # noqa: BLE001 - one failure must not block the rest
+                self._unreleased_buttons.add(button)
+                ok = False
+            else:
+                self._unreleased_buttons.discard(button)
         self.held_buttons.clear()
+        return ok
 
     # -- emergency stop --------------------------------------------------
 
@@ -135,10 +181,16 @@ class Executor:
         4. block further input (every later ``execute`` short-circuits);
         5. record the stop (reason retained for the first trigger only).
 
-        Idempotent: a second call keeps the original reason and does not
-        re-emit releases.
+        Idempotent: a second call keeps the original reason and re-emits
+        nothing — **except** that releases which failed during the first
+        call are retried (the executor is already ``STOPPED``, so the retry
+        cannot emit any new input).
         """
         if self._stopped:
+            # Already stopped: retry only the releases that failed on the
+            # first call (a clean first release makes this a no-op).
+            if self._unreleased_keys or self._unreleased_buttons:
+                self.release_all()
             return
         # 1. stop the decision loop first — nothing after this point may
         #    schedule further input.
@@ -146,12 +198,37 @@ class Executor:
         self._state = ExecutorState.STOPPED
         # 2. cancel queued actions (priority lane included).
         self.queue.cancel_all()
-        # 3. + 4. release all held input; the blocked state (step 4/5) means
-        #    further execute() calls are no-ops, so the release is final.
+        # 3. + 4. release all held input (fault-tolerant: a failed release
+        #    is remembered and retried on the next call); the blocked state
+        #    means further execute() calls are no-ops, so the release is
+        #    final.
         self.release_all()
         # 5. record the stop event.
         if self._stop_reason is None:
             self._stop_reason = reason
+
+    def resume(self) -> None:
+        """Recover a ``PAUSED`` executor: clear the error count, go ``IDLE``.
+
+        ``PAUSED`` is the recoverable safe state (bounded backend errors
+        exhausted — AGENTS.md's "transition to a safe paused state"); the
+        caller invokes this once the backend is worth retrying. If the
+        backend is still failing it will simply pause again after
+        ``max_backend_errors`` more failures, so this cannot create an
+        unbounded retry loop.
+
+        Raises:
+            ValueError: if the executor is ``STOPPED`` — an emergency stop
+                is terminal for the process lifetime and is never undone
+                at runtime.
+        """
+        if self._stopped:
+            raise ValueError(
+                "cannot resume from STOPPED: an emergency stop is terminal "
+                "for the process lifetime"
+            )
+        self._safety.record_success()
+        self._state = ExecutorState.IDLE
 
     # -- execution -------------------------------------------------------
 
@@ -175,6 +252,18 @@ class Executor:
                 stop_event=True,
             )
 
+        # Paused: bounded backend errors exhausted. Gates further input
+        # (no backend contact) until the caller recovers via resume().
+        if self._state is ExecutorState.PAUSED:
+            return ActionResult(
+                action=action,
+                ok=False,
+                error=(
+                    f"executor paused after {self._safety.backend_errors} "
+                    "consecutive backend errors; call resume() to continue"
+                ),
+            )
+
         self._state = ExecutorState.RUNNING
 
         # Mode gate + bounds fire **before** any backend call. These raise
@@ -185,7 +274,14 @@ class Executor:
         start = self._clock()
         try:
             self._perform(action)
-        except (ActionError, Exception) as exc:  # noqa: BLE001 - convert, don't crash
+        except Exception as exc:  # noqa: BLE001 - convert, don't crash
+            # Bounded-retry contract (AGENTS.md): a backend failure is
+            # recorded on the guard, and once the bound is exhausted the
+            # executor pauses (``PAUSED`` is recoverable, unlike the
+            # terminal ``STOPPED``) — never an infinite retry loop.
+            self._safety.record_backend_error()
+            if self._safety.should_pause:
+                self._state = ExecutorState.PAUSED
             # release_all is guaranteed by the per-kind try/finally inside
             # _perform; record the failure for the result.
             return ActionResult(
@@ -194,6 +290,9 @@ class Executor:
                 error=f"action {action.kind.value} failed: {exc}",
             )
         duration_ms = (self._clock() - start) * 1000.0
+        # A success clears the consecutive-error count (the count tracks
+        # *consecutive* failures only).
+        self._safety.record_success()
         return ActionResult(
             action=action,
             ok=True,
