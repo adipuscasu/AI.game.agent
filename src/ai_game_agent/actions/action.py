@@ -437,6 +437,18 @@ def _validate_action(action: Action) -> None:
                 f"action kind {kind!r} requires field {name!r} to be set"
             )
 
+    # 2b. Coordinate pairs must be complete where they are optional.
+    #     ``mouse_click`` may carry an optional (x, y) target, but exactly
+    #     one of the two is a half-pair: the click either targets a
+    #     complete (x, y) or clicks in place. (``mouse_move`` cannot reach
+    #     this rule — both of its coordinates are required above.)
+    if kind == "mouse_click" and (action.x is None) != (action.y is None):
+        raise ActionValidationError(
+            f"action kind {kind!r} requires x and y to be set together "
+            f"(got x={action.x!r}, y={action.y!r}); a click targets a "
+            f"complete (x, y) pair or no coordinates"
+        )
+
     # 3. Field-level value rules (shared across kinds).
     _validate_field_values(action, kind)
 

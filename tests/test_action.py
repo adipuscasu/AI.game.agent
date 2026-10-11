@@ -159,6 +159,32 @@ def test_mouse_click_forbids_relative_position() -> None:
         Action(kind=ActionKind.MOUSE_CLICK, x=1, y=2, relative=True)
 
 
+def test_mouse_click_rejects_incomplete_coords_x_only() -> None:
+    # A single dangling coordinate is meaningless: the click either targets a
+    # complete (x, y) pair or clicks in place. Reject the half-pair instead of
+    # letting the executor silently ignore the coordinate.
+    with pytest.raises(ActionValidationError):
+        Action(kind=ActionKind.MOUSE_CLICK, x=5)
+
+
+def test_mouse_click_rejects_incomplete_coords_y_only() -> None:
+    with pytest.raises(ActionValidationError):
+        Action(kind=ActionKind.MOUSE_CLICK, y=6)
+
+
+def test_mouse_click_accepts_neither_coordinate() -> None:
+    # Click-in-place remains legal: no coordinates at all.
+    action = Action(kind=ActionKind.MOUSE_CLICK)
+    assert action.x is None
+    assert action.y is None
+
+
+def test_mouse_click_accepts_both_coordinates() -> None:
+    # A complete pair is a legal click target.
+    action = Action(kind=ActionKind.MOUSE_CLICK, x=5, y=6)
+    assert (action.x, action.y) == (5, 6)
+
+
 def test_mouse_down_requires_known_button() -> None:
     with pytest.raises(ActionValidationError):
         Action(kind=ActionKind.MOUSE_DOWN, button="middle2")
