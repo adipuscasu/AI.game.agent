@@ -449,6 +449,31 @@ def test_hold_key_release_failure_is_retried_by_release_all() -> None:
     assert b.held_keys == set()
 
 
+def test_emergency_stop_releases_modifiers_of_held_key() -> None:
+    """An emergency stop during a modified key hold must release the modifiers
+    too — ``release_all`` calls ``key_up`` without the action's modifiers, so
+    the executor must remember and emit them (the Windows backend only
+    releases the modifiers it is told to).
+    """
+    from ai_game_agent.actions.executor import Executor
+
+    b = MockBackend()
+    b.open()
+    ex = Executor(backend=b, safety=_guard(), clock=lambda: 0.0, sleeper=lambda s: None)
+    # Hold 's' with ctrl: key_down carries the modifier, and the executor
+    # must keep it as part of the held state.
+    assert ex.execute(Action(kind=ActionKind.KEY_HOLD, key="s", modifiers=["ctrl"], duration_ms=100)).ok is True
+    ex.trigger_emergency_stop(reason="manual")
+    assert ex.state is ExecutorState.STOPPED
+    # The main key is released ...
+    assert ("key_up", "s") in b.events
+    # ... and the modifier too — not left stuck.
+    assert ("key_up", "ctrl") in b.events
+    # Ordering: the modifier releases after the main key (key first, mods
+    # after — the backend's key_up contract).
+    assert b.events.index(("key_up", "ctrl")) > b.events.index(("key_up", "s"))
+
+
 class FlakyMouseReleaseBackend(MockBackend):
     """A backend that fails to release the ``'left'`` button until ``fail_left`` is cleared."""
 
