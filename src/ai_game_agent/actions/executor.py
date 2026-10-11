@@ -36,6 +36,13 @@ emergency stop.
   with ``stop_event=True`` and **never touches the backend** — the
   safety-critical invariant the OBSERVE_ONLY and emergency-stop regression
   tests both depend on.
+* **Pending-release gate**: while any failed release is still unresolved
+  (``_unreleased_keys`` / ``_unreleased_buttons`` non-empty), every
+  :meth:`execute` short-circuits to a failed result **without touching the
+  backend** — a failed release means the physical input state is uncertain
+  (the key may still be held), so no unrelated input may flow and no
+  unrelated success may clear the condition. ``resume()`` flushes the
+  pending release first and only unblocks if the flush lands.
 
 Dependency injection
 --------------------
@@ -217,6 +224,13 @@ class Executor:
         ``max_backend_errors`` more failures, so this cannot create an
         unbounded retry loop.
 
+        Any pending (failed) releases are flushed **first**: while a key or
+        button release is unresolved the physical input state is uncertain,
+        so the executor must not unblock. If the flush fails the executor
+        goes to ``PAUSED`` (still blocked — the pending-release gate in
+        :meth:`execute` applies too); if it succeeds the error count clears
+        and input flows again.
+
         Raises:
             ValueError: if the executor is ``STOPPED`` — an emergency stop
                 is terminal for the process lifetime and is never undone
@@ -227,8 +241,16 @@ class Executor:
                 "cannot resume from STOPPED: an emergency stop is terminal "
                 "for the process lifetime"
             )
-        self._safety.record_success()
-        self._state = ExecutorState.IDLE
+        if self.release_all():
+            # All releases landed (or there was nothing pending): the
+            # physical input state is settled, so a success is a real
+            # success — clear the consecutive-error count and unblock.
+            self._safety.record_success()
+            self._state = ExecutorState.IDLE
+        else:
+            # At least one release still failed: stay in a safe blocked
+            # state until a later resume() (or emergency stop) flushes it.
+            self._state = ExecutorState.PAUSED
 
     # -- execution -------------------------------------------------------
 
@@ -261,6 +283,22 @@ class Executor:
                 error=(
                     f"executor paused after {self._safety.backend_errors} "
                     "consecutive backend errors; call resume() to continue"
+                ),
+            )
+
+        # Pending release: a failed release leaves the physical input state
+        # uncertain (the key/button may still be held). Ordinary actions are
+        # blocked — with or without backend contact — until the pending
+        # release is flushed via resume() or trigger_emergency_stop(). No
+        # unrelated action may clear the condition while input is unresolved.
+        if self._unreleased_keys or self._unreleased_buttons:
+            return ActionResult(
+                action=action,
+                ok=False,
+                error=(
+                    "executor has an unresolved key/mouse release "
+                    "(physical input state uncertain); call resume() to flush "
+                    "it before further input"
                 ),
             )
 

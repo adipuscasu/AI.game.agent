@@ -449,6 +449,49 @@ def test_hold_key_release_failure_is_retried_by_release_all() -> None:
     assert b.held_keys == set()
 
 
+def test_failed_release_blocks_further_input_until_flushed() -> None:
+    """A failed release gates ordinary input: the key may still be physically
+    held, so no new input may flow until the pending release is flushed.
+
+    ``resume()`` retries the release first — while the backend still fails
+    the block stays; once the backend recovers the flush lands and input
+    flows again. An unrelated success must never clear the condition.
+    """
+    from ai_game_agent.actions.executor import Executor
+
+    b = FlakyReleaseBackend()
+    b.open()
+    ex = Executor(backend=b, safety=_guard(), clock=lambda: 0.0, sleeper=lambda s: None)
+    result = ex.execute(Action(kind=ActionKind.KEY_HOLD, key="a", duration_ms=100))
+    assert result.ok is False
+    assert "a" in b.held_keys  # still physically held on the backend
+
+    # A subsequent action must not emit new input while the release is pending.
+    events_before = len(b.events)
+    result2 = ex.execute(Action(kind=ActionKind.KEY_PRESS, key="b"))
+    assert result2.ok is False
+    assert result2.stop_event is False  # not an emergency stop
+    assert len(b.events) == events_before  # no backend contact at all
+    assert "a" in b.held_keys
+
+    # resume() while the backend still fails must not unblock the executor.
+    ex.resume()
+    result3 = ex.execute(Action(kind=ActionKind.KEY_PRESS, key="b"))
+    assert result3.ok is False
+    assert "a" in b.held_keys
+
+    # The backend recovers: resume() flushes the pending release and input
+    # flows again.
+    b.fail_a = False
+    ex.resume()
+    assert ex.state is ExecutorState.IDLE
+    assert ("key_up", "a") in b.events  # the pending release was flushed
+    assert b.held_keys == set()
+    result4 = ex.execute(Action(kind=ActionKind.KEY_PRESS, key="b"))
+    assert result4.ok is True
+    assert ("press", "b") in b.events
+
+
 def test_hold_key_release_failure_is_retried_by_emergency_stop() -> None:
     from ai_game_agent.actions.executor import Executor
 
