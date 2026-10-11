@@ -360,8 +360,7 @@ class Executor:
             self._backend.mouse_down(action.button)
             self.held_buttons.add(action.button)
         elif kind is ActionKind.MOUSE_UP:
-            self._backend.mouse_up(action.button)
-            self.held_buttons.discard(action.button)
+            self._release_button(action.button)
         elif kind is ActionKind.MOUSE_SCROLL:
             self._perform_scroll(action.scroll)
         elif kind is ActionKind.DELAY:
@@ -385,6 +384,23 @@ class Executor:
                 self._sleeper(duration_ms / 1000.0)
         finally:
             self._release_key(key, mods)
+
+    def _release_button(self, button: str) -> None:
+        """Emit one mouse-button release, updating bookkeeping either way.
+
+        The button/mouse counterpart of :meth:`_release_key`: after a
+        failed release the button moves from :attr:`held_buttons` to the
+        failed-release set (retried by ``release_all`` /
+        ``trigger_emergency_stop``), never left as "still held", and the
+        exception propagates for the normal error accounting.
+        """
+        try:
+            self._backend.mouse_up(button)
+        except Exception:  # noqa: BLE001 - record, then let it propagate
+            self._unreleased_buttons.add(button)
+            raise
+        finally:
+            self.held_buttons.discard(button)
 
     def _release_key(self, key: str, mods: tuple[str, ...]) -> None:
         """Emit one key release, updating bookkeeping whether it lands or fails.

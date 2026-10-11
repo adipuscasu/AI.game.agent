@@ -449,6 +449,80 @@ def test_hold_key_release_failure_is_retried_by_release_all() -> None:
     assert b.held_keys == set()
 
 
+class FlakyMouseReleaseBackend(MockBackend):
+    """A backend that fails to release the ``'left'`` button until ``fail_left`` is cleared."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_left = True
+
+    def mouse_up(self, button: str = "left") -> None:
+        if button == "left" and self.fail_left:
+            raise InputBackendError("simulated release failure for button 'left'")
+        super().mouse_up(button)
+
+
+def test_failed_mouse_release_updates_bookkeeping() -> None:
+    """A failed MOUSE_UP release must not leave the button tracked as held —
+    the same contract as the key path: tracked as a failed release, not held.
+    """
+    from ai_game_agent.actions.executor import Executor
+
+    b = FlakyMouseReleaseBackend()
+    b.open()
+    ex = Executor(backend=b, safety=_guard(), clock=lambda: 0.0, sleeper=lambda s: None)
+    assert ex.execute(Action(kind=ActionKind.MOUSE_DOWN, button="left")).ok is True
+    result = ex.execute(Action(kind=ActionKind.MOUSE_UP, button="left"))
+    assert result.ok is False
+    assert "simulated release failure" in (result.error or "")
+    # The executor has done all it can for 'left': no longer tracked as held.
+    assert ex.held_buttons == set()
+    # But the backend still physically holds the button (the release failed).
+    assert "left" in b.held_buttons
+    # mouse_down was issued; the failed mouse_up recorded no event.
+    assert b.events == [("mouse_down", "left")]
+
+
+def test_failed_mouse_release_blocks_further_input_until_flushed() -> None:
+    """A failed MOUSE_UP release gates ordinary input until flushed —
+    the button may still be physically held (same contract as the key path).
+    """
+    from ai_game_agent.actions.executor import Executor
+
+    b = FlakyMouseReleaseBackend()
+    b.open()
+    ex = Executor(backend=b, safety=_guard(), clock=lambda: 0.0, sleeper=lambda s: None)
+    assert ex.execute(Action(kind=ActionKind.MOUSE_DOWN, button="left")).ok is True
+    result = ex.execute(Action(kind=ActionKind.MOUSE_UP, button="left"))
+    assert result.ok is False
+    assert "left" in b.held_buttons  # still physically held on the backend
+
+    # A subsequent action must not emit new input while the release is pending.
+    events_before = len(b.events)
+    result2 = ex.execute(Action(kind=ActionKind.KEY_PRESS, key="b"))
+    assert result2.ok is False
+    assert result2.stop_event is False  # not an emergency stop
+    assert len(b.events) == events_before  # no backend contact at all
+    assert "left" in b.held_buttons
+
+    # resume() while the backend still fails must not unblock the executor.
+    ex.resume()
+    result3 = ex.execute(Action(kind=ActionKind.KEY_PRESS, key="b"))
+    assert result3.ok is False
+    assert "left" in b.held_buttons
+
+    # The backend recovers: resume() flushes the pending release and input
+    # flows again.
+    b.fail_left = False
+    ex.resume()
+    assert ex.state is ExecutorState.IDLE
+    assert ("mouse_up", "left") in b.events  # the pending release was flushed
+    assert b.held_buttons == set()
+    result4 = ex.execute(Action(kind=ActionKind.KEY_PRESS, key="b"))
+    assert result4.ok is True
+    assert ("press", "b") in b.events
+
+
 def test_failed_release_blocks_further_input_until_flushed() -> None:
     """A failed release gates ordinary input: the key may still be physically
     held, so no new input may flow until the pending release is flushed.
