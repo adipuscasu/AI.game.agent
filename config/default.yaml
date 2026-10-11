@@ -35,12 +35,24 @@ capture:
     directory: recordings
     max_files: 1000
 
+# Input control (Phase 3). The backend is selected here or via --backend.
+# "mock" is the deterministic, CI/backend-free default (records events, no
+# OS input). "windows" needs the "input" extra (pynput) and a real desktop.
+input:
+  backend: mock            # mock | windows
+  # Default operating mode. OBSERVE_ONLY is the safe default: the shipped
+  # CLI emits no OS input unless explicitly promoted.
+  mode: observe_only       # observe_only | assisted | semi_autonomous | autonomous
+
 # Safety (Phase 3+).
 safety:
   emergency_stop_keys:
     - F12
   max_action_duration_ms: 5000
   max_consecutive_actions: 50
+  # Bounded retry: after this many backend errors the executor PAUSES
+  # (never an infinite loop).
+  max_backend_errors: 3
 
 # Perception (Phase 2). Runs the cheap, deterministic detectors: template
 # matching, UI-zone checks, OCR, and color-blob object detection. With nothing

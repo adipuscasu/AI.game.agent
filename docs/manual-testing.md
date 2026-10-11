@@ -8,9 +8,12 @@ PowerShell is assumed — the `$LASTEXITCODE` checks are PowerShell. In `cmd`
 picks up the right interpreter and installed extras.
 
 Phase 1 exercises the capture backend (`capture` / `observe`). Phase 2
-exercises the perception pipeline (`analyze`). Both are safe to run headless
-with `--backend mock` (the mock backend emits a deterministic 128×72 frame and
-needs no display).
+exercises the perception pipeline (`analyze`). Phase 3 exercises input
+control (`act`). Phases 1–2 are safe to run headless with `--backend mock`
+(the mock backend emits a deterministic 128×72 frame and needs no display);
+Phase 3's mock backend likewise records events without touching your
+keyboard, but the **windows** backend drives real mouse/keyboard input —
+read §4.3 before running it.
 
 ---
 
@@ -84,23 +87,24 @@ Shared flags with `capture`/`observe`: `--backend` (default `mss`), `--monitor`,
 
 ### 3.1 Install the optional extras
 
-The core CLI imports and runs with no extras. Four extras cover the full
+The core CLI imports and runs with no extras. Five extras cover the full
 manual-testing flow:
 
-- `dev` — test tooling (pytest, ruff, …) for the §3.5 cross-checks.
+- `dev` — test tooling (pytest, ruff, …) for the §3.5 / §4.5 cross-checks.
 - `capture` — mss + Pillow. Backs the **real** `--backend mss` capture steps.
 - `vision` — OpenCV + numpy. Backs **template matching** and **object blobs**.
 - `ocr` — pytesseract + Pillow. Backs **OCR** (and, separately, a Tesseract
   binary).
+- `input` — pynput. Backs the **windows** input backend of `act` (§4).
 
 > **`uv sync` prunes the venv to *exactly* the extras you list.** Omitting
 > `capture` here uninstalls `mss` (you will see a ` - mss==…` line in the
 > sync output), and then every `--backend mss` step fails with
-> `error: the 'mss' backend is not installed`. List all four:
+> `error: the 'mss' backend is not installed`. List all five:
 
 ```powershell
-# One-shot: dev + capture + perception extras into the same .venv
-uv sync --extra dev --extra capture --extra vision --extra ocr
+# One-shot: dev + capture + perception + input extras into the same .venv
+uv sync --extra dev --extra capture --extra vision --extra ocr --extra input
 ```
 
 OCR needs the Tesseract **binary** on `PATH` as well — the Python package alone
@@ -148,8 +152,9 @@ so it produces **no** real template / OCR / blob hits — those require real
 screen content. Test these against `--backend mss` on a region where you know
 the target is present.
 
-Create `config/manual-test.yaml` (enable one subsystem at a time so the output
-is unambiguous), then point `analyze` at it:
+`config/manual-test.yaml` ships in the repo (contents below); tweak it to
+enable one subsystem at a time so the output is unambiguous. Then point
+`analyze` at it:
 
 ```yaml
 perception:
@@ -244,4 +249,198 @@ uv run pytest tests/test_observation.py tests/test_perception_config.py tests/te
 
 # The `analyze` e2e contract (stream routing, exit codes, --config)
 uv run pytest tests/e2e/test_e2e_cli.py -k analyze -v
+
+---
+
+## 4. Phase 3 — input control (`act`)
+
+`act` runs input actions (keys, mouse, holds, scroll, delays) through the
+`Executor` and prints the resulting `ActionLog` as JSON on **stdout**.
+It is **observe-only by default**: with the shipped config
+(`input.mode: observe_only`) the CLI emits zero OS input — the log prints
+with `results == []`.
+
+Contract you can rely on while testing by hand:
+
+- **stdout** carries only the JSON ActionLog (nothing else).
+- **stderr** carries `error:` lines and log lines.
+- Exit code is **0** on success — including a batch *stopped* by a safety
+  bound (a bounded stop is a recorded, successful stop: `stopped: true`
+  with a `stop_reason`, not a CLI error); **1** on a setup/config/policy
+  failure (unknown backend, missing `--confirm`, unparseable `--do` spec,
+  empty `--script`).
+- A mode/safety violation is recorded as a failed result for that action
+  (`ok: false`) and **halts the batch**; a per-action backend failure is
+  recorded and the batch continues.
+
+Flags: `--do` (repeatable; `;`-separated within one flag), `--script`
+(file), `--demo` (built-in 8-action sequence — the **default** when neither
+`--do` nor `--script` is given), `--mode`, `--backend` (default `mock`
+from config), `--record`, `--record-dir` (default `recordings`),
+`--confirm`, `--pretty`, `--config`.
+
+### 4.1 Install the `input` extra (real-input backend only)
+
+The **mock** backend (the default) needs no extras. The **windows** backend
+drives real mouse/keyboard input and needs pynput, installed **on the
+Windows target machine**:
+
+```powershell
+uv sync --extra input
+```
+
+> **Shared-venv caveat:** if this `.venv` is shared across OSes (drvfs/9p),
+> don't re-run `uv sync` on the other OS without `--extra input` — the sync
+> prunes the venv to the extras you list and would uninstall pynput on the
+> Windows side (see the §3.1 note).
+
+### 4.2 Smoke test (mock backend, headless, no extras needed)
+
+The mock backend records the events instead of touching your keyboard, so
+every step below is safe on any machine.
+
+```powershell
+# Default: config mode observe_only → the gate holds, zero input. results == []
+uv run python -m ai_game_agent act
+$LASTEXITCODE   # → 0   (JSON: {"results": [], "stopped": false, ...})
+
+# Full-contract demo (all 8 action kinds) executed against the mock
+uv run python -m ai_game_agent act --backend mock --mode autonomous --demo --pretty
+# expect: 8 results, all "ok": true, "stopped": false
+
+# A few explicit actions (repeatable; ';' splits a batch inside one flag)
+uv run python -m ai_game_agent act --backend mock --mode autonomous --do key:a --do "hold:w:100;scroll:3"
+$LASTEXITCODE   # → 0   (3 results, all "ok": true)
+
+# Record the ActionLog to ./recordings (timestamped file name)
+uv run python -m ai_game_agent act --backend mock --mode autonomous --demo --record
+ls recordings
+# then replay the recorded log (ActionLog shape is accepted by --script)
+uv run python -m ai_game_agent act --backend mock --mode autonomous --script recordings\<the-file>.json --pretty
+```
+
+Hand-written action script (a JSON list of action dicts — `--do` aside,
+the same shape `Action.to_dict()` emits):
+
+```powershell
+@'
+[
+  {"kind": "key_press", "key": "a"},
+  {"kind": "mouse_move", "x": 100, "y": 200},
+  {"kind": "mouse_click", "button": "left", "clicks": 1}
+]
+'@ | Set-Content scripts\smoke.json
+uv run python -m ai_game_agent act --backend mock --mode autonomous --script scripts\smoke.json --pretty
+$LASTEXITCODE   # → 0   (3 results, all "ok": true)
+```
+
+### 4.3 Windows backend (real mouse/keyboard — read before running)
+
+**Before the first run:**
+
+1. Install the extra (§4.1).
+2. **Focus a scratch window first** (e.g. Notepad). The demo presses
+   `Ctrl+Shift+A`, holds `w` for 150 ms, double right-clicks at absolute
+   (320, 180), does a relative move, a left press/release, and scrolls —
+   you want those effects to land somewhere harmless.
+3. Know the panic key: **F12** (`safety.emergency_stop_keys`, default).
+   Press it any time a run misbehaves: the executor stops, pending actions
+   are cancelled, any held key/button is released (mid-hold included), and
+   no further input is dispatched for that run.
+4. `--confirm` is required on every non-`observe_only` `windows` run — it
+   is the explicit acknowledgment that real OS input will occur (a no-op
+   for `mock`; not needed at all under `observe_only`).
+5. Know the bounds (the `safety:` block): a hold longer than
+   `max_action_duration_ms` (5000 ms) is *rejected* and stops the batch;
+   `max_consecutive_actions` (50) and `max_backend_errors` (3) make the
+   executor **pause**, never loop.
+
+```powershell
+# 1. Smallest real action: one 'a' keystroke in the focused scratch window
+uv run python -m ai_game_agent act --backend windows --mode autonomous --confirm --do key:a
+$LASTEXITCODE   # → 0   (expect "a" typed; log: 1 result, "ok": true, "stopped": false)
+
+# 2. F12 drill: hold 'w' for 4 s (under the 5 s bound) and press F12 mid-hold
+uv run python -m ai_game_agent act --backend windows --mode autonomous --confirm --do hold:w:4000 --pretty
+# mid-hold: press F12 → the held key must release immediately, and the log
+# shows "stop_event": true on the hold's result and "stopped": true with a stop_reason
+
+# 3. Full 8-action demo, assisted mode, recorded for replay/audit
+uv run python -m ai_game_agent act --backend windows --mode assisted --confirm --demo --record --pretty
+# expect: mouse travel + double right-click + wheel scroll in the scratch window,
+# "a" + typed "w", and 8 "ok": true results; the ActionLog is in ./recordings
+```
+
+> **Mode note:** in this CLI the hard mode gate currently rejects only
+> `observe_only`; `assisted` and `semi_autonomous` dispatch through the same
+> executor path as `autonomous`. Phase-3 scope: the propose/approve split is
+> the guard's mechanism (see `SafetyGuard`), not yet an interactive prompt —
+> `--confirm` is the acknowledgment for all real-input runs.
+
+### 4.4 Error routing (the contract the e2e suite asserts)
+
+None of these should print a traceback — expect a clean `error:` line on
+**stderr**, an **empty stdout**, and exit **1**:
+
+```powershell
+# Unknown backend → exit 1
+uv run python -m ai_game_agent act --backend doesnotexist
+$LASTEXITCODE   # → 1   (stderr: "error: …")
+
+# Real-input backend in an input-allowed mode without --confirm → exit 1
+uv run python -m ai_game_agent act --backend windows --mode autonomous --demo
+$LASTEXITCODE   # → 1   (stderr: "error: the 'windows' backend … requires --confirm …")
+
+# Unparseable --do spec → exit 1
+uv run python -m ai_game_agent act --do bogus:xyz
+$LASTEXITCODE   # → 1   (stderr: "error: act: unknown --do kind 'bogus' …")
+
+# --script with no actions → exit 1
+"[]" | Set-Content scripts\empty.json
+uv run python -m ai_game_agent act --script scripts\empty.json
+$LASTEXITCODE   # → 1   (stderr: "error: act: --script contains no actions")
+
+# --backend windows under observe_only → no --confirm needed, no input, exit 0
+# (works even without the input extra — the backend is never opened)
+uv run python -m ai_game_agent act --backend windows --mode observe_only
+$LASTEXITCODE   # → 0   (JSON: {"results": [], "stopped": false, ...})
+```
+
+A *bounded stop* is **not** an error: with a tight safety bound the run still
+exits **0** and the log records the stop (mirror of the e2e `--config` test):
+
+```powershell
+@'
+input:
+  backend: mock
+  mode: autonomous
+safety:
+  max_action_duration_ms: 100
+'@ | Set-Content config\act-bound.yaml
+# The demo's 150 ms hold exceeds the 100 ms bound → rejected, batch halts
+uv run python -m ai_game_agent act --config config\act-bound.yaml --pretty
+$LASTEXITCODE   # → 0
+# log: "stopped": true, "stop_reason": "safety bound: …",
+# the rejected hold is a result with "ok": false
+```
+
+### 4.5 Phase 3 test suite (optional cross-check)
+
+The manual steps above mirror the automated suites; run them to confirm your
+environment agrees with CI.
+
+```powershell
+# Action-layer unit tests (contract, executor, queue, guard, hotkey, mock, windows)
+uv run pytest tests/test_action.py tests/test_actions_base.py tests/test_actions_config.py tests/test_actions_executor.py tests/test_actions_hotkey.py tests/test_actions_mock.py tests/test_actions_modes.py tests/test_actions_queue.py tests/test_windows_backend.py -q
+
+# The `act` CLI contract (stream routing, exit codes, observe-only zero-input)
+uv run pytest tests/e2e/test_e2e_act.py -v
+```
+
+And the whole suite must stay green in a **bare venv** (no `vision` / `ocr` /
+`input` extras) — the cv2/pynput-dependent modules skip instead of failing:
+
+```powershell
+uv run pytest -q
+```
 ```

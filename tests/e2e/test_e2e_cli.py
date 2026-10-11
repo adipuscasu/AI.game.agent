@@ -276,6 +276,15 @@ def test_analyze_fulltest_config_fires_all_subsystems() -> None:
     (no detector errors — the template PNG loads, OCR runs) with real hits
     from the detectors that can fire on a uniform frame.
     """
+    # The fulltest config enables templates + OCR + objects: it needs the
+    # ``vision`` and ``ocr`` extras *and* the tesseract binary (CI installs
+    # it; a bare dev venv may not have any of the three). Skip rather than
+    # fail — the same bare-venv contract the unit suite already holds.
+    pytest.importorskip("cv2", reason="fulltest config needs the vision extra")
+    pytest.importorskip("pytesseract", reason="fulltest config needs the ocr extra")
+    if shutil.which("tesseract") is None:
+        pytest.skip("fulltest config needs the tesseract binary (see .github/workflows/ci.yml)")
+
     result = run_cli("analyze", "--backend", "mock", "--config", "config/fulltest.yaml")
     assert result.returncode == 0, result.stderr
     obs = json.loads(result.stdout)
@@ -309,3 +318,27 @@ def test_analyze_unknown_backend_reports_error() -> None:
     assert result.returncode == 1
     assert "error:" in result.stderr
     assert result.stdout == ""
+
+
+@pytest.mark.e2e
+def test_root_help_prints_clean_on_a_cp1250_console() -> None:
+    """``--help`` must not crash on a legacy-codepage Windows console.
+
+    The root help renders the module docstring, which historically used the
+    ``→`` arrow — not encodable in cp1250. On such a console ``print_help``
+    raised ``UnicodeEncodeError`` and the CLI died with a raw traceback
+    instead of printing its help. ``PYTHONIOENCODING`` reproduces the
+    legacy-codepage stdout deterministically on any platform.
+    """
+    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "PYTHONIOENCODING": "cp1250"}
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_game_agent", "--help"],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "usage: ai-game-agent" in result.stdout
+    assert "UnicodeEncodeError" not in result.stderr

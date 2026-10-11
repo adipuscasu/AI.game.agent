@@ -45,7 +45,13 @@ jobs:
           uv python find 3.11
 
       - name: Install dependencies
-        run: uv sync --all-extras --locked
+        # Every extra EXCEPT `input`: the bare-venv contract test
+        # (tests/test_actions_bare.py) asserts pynput is ABSENT from this
+        # venv — the `input` extra installs only on the target Windows
+        # machine (cross-OS venv rule), and a Linux/macOS venv must stay
+        # bare so the fail-fast `create_backend("windows")` error path is
+        # the one CI exercises, not a real pynput import.
+        run: uv sync --extra capture --extra vision --extra ocr --extra dev --locked
 
       - name: Check lockfile
         run: uv lock --check

@@ -817,3 +817,202 @@ def test_cli_analyze_keeps_at_or_above_ocr_floor(tmp_path, monkeypatch, capsys) 
     obs = json.loads(capsys.readouterr().out)
     assert len(obs["text_regions"]) == 1
     assert obs["text_regions"][0]["text"] == "12 / 12"
+
+
+# --- Phase 3: `act` subcommand -------------------------------------------------
+
+
+def test_cli_act_demo_autonomous_executes(capsys) -> None:
+    """AUTONOMOUS demo: exit 0, valid ActionLog JSON, results executed."""
+    rc = main(["act", "--backend", "mock", "--demo", "--mode", "autonomous"])
+    assert rc == 0
+    log = json.loads(capsys.readouterr().out)
+    assert isinstance(log["results"], list) and len(log["results"]) > 0
+    assert log["stopped"] is False
+
+
+def test_cli_act_observe_only_emits_nothing(capsys) -> None:
+    """OBSERVE_ONLY: the gate holds end to end — zero results, not stopped."""
+    rc = main(["act", "--backend", "mock", "--demo", "--mode", "observe_only"])
+    assert rc == 0
+    log = json.loads(capsys.readouterr().out)
+    assert log["results"] == []
+    assert log["stopped"] is False
+
+
+def test_cli_act_do_batch_runs(capsys) -> None:
+    """Two ``--do`` flags form a batch (append-list), both execute ok."""
+    rc = main(
+        [
+            "act", "--backend", "mock", "--mode", "autonomous",
+            "--do", "key:a", "--do", "click:left:1",
+        ]
+    )
+    assert rc == 0
+    log = json.loads(capsys.readouterr().out)
+    assert log["stopped"] is False
+    assert len(log["results"]) == 2
+    assert all(r["ok"] is True for r in log["results"])
+
+
+# ---------------------------------------------------------------------------
+# act: --record / --script / --confirm / full-contract demo (plan §9)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_act_record_writes_json(tmp_path, capsys) -> None:
+    """``--record --record-dir`` saves the ActionLog as a JSON file (plan §9).
+
+    The file must be valid JSON with a ``results`` list and a ``stopped``
+    boolean — the replayable artifact ``--script`` later reads back.
+    """
+    rc = main(
+        [
+            "act", "--backend", "mock", "--demo", "--mode", "autonomous",
+            "--record", "--record-dir", str(tmp_path),
+        ]
+    )
+    assert rc == 0, capsys.readouterr().err
+    files = sorted(tmp_path.glob("*.json"))
+    assert files, "--record must write an ActionLog JSON file to --record-dir"
+    data = json.loads(files[0].read_text(encoding="utf-8"))
+    assert isinstance(data.get("results"), list) and data["results"]
+    assert isinstance(data.get("stopped"), bool)
+
+
+def test_cli_act_script_runs(tmp_path, capsys) -> None:
+    """``--script`` loads an ActionLog-shaped JSON file and replays it (plan §9).
+
+    A list of Action dicts is the documented format; the replay must execute
+    every action (autonomous) and report each ok.
+    """
+    script = tmp_path / "actions.json"
+    script.write_text(
+        json.dumps(
+            [
+                {"kind": "key_press", "key": "a"},
+                {"kind": "mouse_click", "button": "left", "clicks": 1},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rc = main(
+        [
+            "act", "--backend", "mock", "--script", str(script),
+            "--mode", "autonomous",
+        ]
+    )
+    assert rc == 0, capsys.readouterr().err
+    log = json.loads(capsys.readouterr().out)
+    assert log["stopped"] is False
+    assert len(log["results"]) == 2
+    assert all(r["ok"] is True for r in log["results"])
+
+
+def test_cli_act_script_invalid_payload_is_clean_error(tmp_path, capsys) -> None:
+    """A bad --script payload is a clean ``error:`` + exit 1, not a traceback."""
+    script = tmp_path / "bad.json"
+    script.write_text(json.dumps(["not", "an", "action"]), encoding="utf-8")
+    rc = main(
+        [
+            "act", "--backend", "mock", "--script", str(script),
+            "--mode", "autonomous",
+        ]
+    )
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert err.startswith("error:")
+
+
+def test_cli_act_windows_requires_confirm(capsys) -> None:
+    """``--backend windows`` in a non-OBSERVE_ONLY mode refuses without --confirm.
+
+    The refusal is a *policy* gate that fires before any backend is built, so
+    it is testable headless (pynput not installed): the error must name the
+    missing --confirm, not the missing pynput dependency.
+    """
+    rc = main(
+        ["act", "--backend", "windows", "--demo", "--mode", "assisted"]
+    )
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert err.startswith("error:")
+    assert "confirm" in err.lower()
+
+
+def test_cli_act_windows_confirm_absent_still_clean_on_missing_pynput(capsys) -> None:
+    """With --confirm but pynput absent: still a clean error naming the extra."""
+    rc = main(
+        [
+            "act", "--backend", "windows", "--demo", "--mode", "assisted",
+            "--confirm",
+        ]
+    )
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert err.startswith("error:")
+    assert "pynput" in err
+
+
+def test_cli_act_demo_exercises_full_contract(capsys) -> None:
+    """The built-in demo covers the full Action contract (plan §9).
+
+    All eight kinds, modifiers, both mouse buttons, absolute + relative move,
+    down/up pairing, and scroll — the part a user will actually run must be a
+    real demonstration, not a five-action toy.
+    """
+    rc = main(
+        ["act", "--backend", "mock", "--demo", "--mode", "autonomous"]
+    )
+    assert rc == 0
+    log = json.loads(capsys.readouterr().out)
+    assert log["stopped"] is False
+    results = log["results"]
+    kinds = {r["action"]["kind"] for r in results}
+    assert kinds == {
+        "key_press", "key_hold", "mouse_move", "mouse_click",
+        "mouse_down", "mouse_up", "mouse_scroll", "delay",
+    }
+    actions = [r["action"] for r in results]
+    assert any(a.get("modifiers") == ["ctrl", "shift"] for a in actions)
+    assert any(a.get("button") == "right" for a in actions)
+    assert any(a.get("relative") is True for a in actions)
+    assert any(a.get("scroll") == 3 for a in actions)
+
+
+# ---------------------------------------------------------------------------
+# act: cleanup guarantees (spy backend; the mock never touches OS input)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_act_observe_only_zero_events(monkeypatch) -> None:
+    """OBSERVE_ONLY: the backend is never opened and receives zero events."""
+    from ai_game_agent.actions.mock import MockBackend
+
+    spy = MockBackend()
+    monkeypatch.setattr(cli, "create_backend", lambda cfg: spy)
+    rc = cli.main(
+        ["act", "--backend", "mock", "--demo", "--mode", "observe_only"]
+    )
+    assert rc == 0
+    assert spy.opened is False
+    assert spy.events == []
+
+
+def test_cli_act_autonomous_closes_and_releases(monkeypatch) -> None:
+    """AUTONOMOUS run: backend closed, nothing held, hold fully released."""
+    from ai_game_agent.actions.mock import MockBackend
+
+    spy = MockBackend()
+    monkeypatch.setattr(cli, "create_backend", lambda cfg: spy)
+    rc = cli.main(
+        ["act", "--backend", "mock", "--demo", "--mode", "autonomous"]
+    )
+    assert rc == 0
+    assert spy.opened is False  # closed after the run (finally path)
+    assert spy.held_keys == set()
+    assert spy.held_buttons == set()
+    # the timed hold must be fully released: key_down and key_up for 'w'
+    kinds = [e[0] for e in spy.events]
+    assert "key_down" in kinds and "key_up" in kinds
+    assert kinds.count("key_up") >= kinds.count("key_down")
