@@ -370,6 +370,12 @@ class Executor:
         elif kind is ActionKind.MOUSE_MOVE:
             self._backend.mouse_move(action.x, action.y, action.relative)
         elif kind is ActionKind.MOUSE_CLICK:
+            # The Action contract permits an optional (x, y) on mouse_click.
+            # The backend's mouse_click has no coordinate parameter, so honor
+            # the coords by moving the pointer there first; a click without
+            # coords keeps the existing click-in-place behavior.
+            if action.x is not None and action.y is not None:
+                self._backend.mouse_move(action.x, action.y, action.relative)
             self._backend.mouse_click(action.button, action.clicks)
         elif kind is ActionKind.MOUSE_DOWN:
             self._backend.mouse_down(action.button)

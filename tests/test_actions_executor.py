@@ -74,6 +74,31 @@ def test_execute_mouse_move_emits_move_event(backend: MockBackend) -> None:
     assert backend.events == [("mouse_move", 100, 200)]
 
 
+def test_execute_mouse_click_at_coords_moves_then_clicks(backend: MockBackend) -> None:
+    """A MOUSE_CLICK carrying (x, y) must move the pointer there first.
+
+    Regression: the executor used to drop the action's coordinates and click
+    at wherever the pointer already was. The Action contract permits
+    ``mouse_click`` with optional (x, y); the executor must honor them by
+    emitting ``mouse_move`` before ``mouse_click``, in that order.
+    """
+    ex = _executor(backend)
+    action = Action(kind=ActionKind.MOUSE_CLICK, x=5, y=6, button="right", clicks=2)
+    result = ex.execute(action)
+    assert result.ok is True
+    assert backend.events == [("mouse_move", 5, 6), ("mouse_click", "right", 2)]
+
+
+def test_execute_mouse_click_without_coords_does_not_move(backend: MockBackend) -> None:
+    """A MOUSE_CLICK without coordinates keeps the existing behavior: click
+    in place, no spurious mouse_move."""
+    ex = _executor(backend)
+    action = Action(kind=ActionKind.MOUSE_CLICK)
+    result = ex.execute(action)
+    assert result.ok is True
+    assert backend.events == [("mouse_click", "left", 1)]
+
+
 def test_execute_key_hold_releases_even_if_sleeper_raises(backend: MockBackend) -> None:
     """The try/finally release guarantee: a failure during the hold still releases the key."""
     from ai_game_agent.actions.executor import Executor
