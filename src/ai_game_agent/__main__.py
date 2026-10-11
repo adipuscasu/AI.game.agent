@@ -14,7 +14,7 @@ Subcommands
 
 ``analyze``
     Run one capture and pass the frame through the perception pipeline
-    (template matching → UI zones → OCR → object blobs), printing the
+    (template matching -> UI zones -> OCR -> object blobs), printing the
     resulting ``Observation`` as JSON. Detector failures are recorded in
     the observation's ``detector_errors`` list rather than aborting. The
     subsystems run based on ``config/default.yaml`` (or ``--config``) and

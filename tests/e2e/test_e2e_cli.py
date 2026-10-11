@@ -309,3 +309,27 @@ def test_analyze_unknown_backend_reports_error() -> None:
     assert result.returncode == 1
     assert "error:" in result.stderr
     assert result.stdout == ""
+
+
+@pytest.mark.e2e
+def test_root_help_prints_clean_on_a_cp1250_console() -> None:
+    """``--help`` must not crash on a legacy-codepage Windows console.
+
+    The root help renders the module docstring, which historically used the
+    ``→`` arrow — not encodable in cp1250. On such a console ``print_help``
+    raised ``UnicodeEncodeError`` and the CLI died with a raw traceback
+    instead of printing its help. ``PYTHONIOENCODING`` reproduces the
+    legacy-codepage stdout deterministically on any platform.
+    """
+    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "PYTHONIOENCODING": "cp1250"}
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_game_agent", "--help"],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "usage: ai-game-agent" in result.stdout
+    assert "UnicodeEncodeError" not in result.stderr
