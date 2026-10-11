@@ -1,0 +1,24 @@
+perception:
+  enabled: true
+  template_threshold: 0.8
+  # Template matching (needs "vision"). Paths are repo-relative.
+  templates:
+    target_frame: assets/templates/target_frame.png   # committed 64x36 sample
+  # UI-zone checks (needs "vision"). check: presence | brightness | color_present
+  ui_zones:
+    - name: action_bar
+      x: 40
+      y: 56
+      width: 48
+      height: 12
+      check: brightness
+  # OCR (needs "ocr" extra + Tesseract binary).
+  ocr:
+    enabled: true
+    regions:
+      - {name: health_bar, x: 10, y: 20, width: 100, height: 20}
+  # Color-blob objects (needs "vision").
+  objects:
+    enabled: true
+    colors:
+      - {name: loot_glow, rgb: [255, 200, 0], tolerance: 40}

@@ -150,6 +150,56 @@ Shared options with `capture`/`observe`: `--backend` (default `mss`), `--monitor
 CI, and fast debug runs. All CLI options default to the values in
 `config/default.yaml` where applicable.
 
+### Phase 3: input control (`act`)
+
+`act` executes input actions (keys, mouse, holds, scroll, delays) through the
+`Executor`, printing the resulting `ActionLog` as JSON on stdout. It is
+**observe-only by default**: with the shipped config the CLI emits zero OS
+input until you explicitly promote the mode.
+
+```powershell
+# Built-in full-contract demo (all 8 action kinds) against the mock backend.
+# Mock records the events instead of touching your keyboard — safe anywhere.
+uv run ai-game-agent act --backend mock --demo
+
+# A few explicit actions (repeatable; ';'-separated for a batch)
+uv run ai-game-agent act --backend mock --do "key:a" --do "move:100,200" --do "click:left:1"
+
+# Record the ActionLog to ./recordings so it can be replayed or audited
+uv run ai-game-agent act --backend mock --demo --record
+
+# Replay a recorded / hand-written action script (list of action dicts,
+# or an ActionLog as written by --record)
+uv run ai-game-agent act --backend mock --script recordings/some_log.json
+
+# Promote the mode and target the real OS (Windows desktop required):
+# assisted = propose/approve split, autonomous = executes every action.
+# --confirm acknowledges that real mouse/keyboard input will occur.
+uv run ai-game-agent act --backend windows --mode assisted --confirm --demo
+```
+
+The real-input backend needs the `input` extra (pynput), installed **on the
+Windows machine only** — the shared dev venv stays bare and the full test
+suite runs without it:
+
+```powershell
+uv sync --extra input
+```
+
+Safety (see `safety:` in `config/default.yaml`):
+
+* `emergency_stop_keys` (default **F12**): a global hotkey that stops the
+  executor, cancels the queue, releases any held key/button, and blocks
+  further dispatch — press it any time a real-input run misbehaves.
+* `max_action_duration_ms`: a held input is auto-released past this bound, so
+  nothing stays stuck even if a backend call misbehaves.
+* `max_consecutive_actions` / `max_backend_errors`: bounded limits — the
+  executor pauses instead of looping.
+
+Errors go to `stderr` with an `error:` prefix and exit 1; a clean run prints
+only the `ActionLog` JSON on stdout. See `docs/manual-testing.md` §4 for the
+Windows run + F12 emergency-stop checklist.
+
 ## Running the Unit Tests
 
 All commands are run from the repository root.
