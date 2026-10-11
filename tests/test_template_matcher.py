@@ -21,10 +21,17 @@ from pathlib import Path
 import pytest
 from PIL import Image, ImageDraw
 
-from ai_game_agent.capture import Frame
-from ai_game_agent.perception.base import PerceptionError, TemplateMatcher
-from ai_game_agent.perception.observation import BBox
-from ai_game_agent.perception.template import CvTemplateMatcher
+cv2 = pytest.importorskip("cv2", reason="CvTemplateMatcher requires OpenCV (vision extra)")
+
+# E402 is intentional: in a bare venv (no ``vision`` extra) ``importorskip``
+# skips this whole module, so ``CvTemplateMatcher`` is never constructed and
+# the ``PerceptionError`` it raises at load time without cv2 is never
+# triggered (§7.3) — the same contract ``test_objects.py`` and
+# ``test_ui_zones.py`` already hold.
+from ai_game_agent.capture import Frame  # noqa: E402
+from ai_game_agent.perception.base import PerceptionError, TemplateMatcher  # noqa: E402
+from ai_game_agent.perception.observation import BBox  # noqa: E402
+from ai_game_agent.perception.template import CvTemplateMatcher  # noqa: E402
 
 TS = datetime.datetime(2026, 9, 27, 12, 0, 0, tzinfo=datetime.UTC)
 

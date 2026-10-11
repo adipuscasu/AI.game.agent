@@ -42,8 +42,8 @@ The one assertion this file makes about :mod:`pynput` is the absence: the
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
-from typing import Callable
 
 import pytest
 
@@ -62,7 +62,6 @@ from ai_game_agent.actions.base import (
 from ai_game_agent.actions.executor import Executor
 from ai_game_agent.actions.hotkey import FakeHotkeyListener
 from ai_game_agent.actions.modes import OperationMode
-
 
 # ---------------------------------------------------------------------------
 # Fakes for the pynput surface (never imports the real library)
@@ -137,7 +136,9 @@ class FakeMouseController:
     def relative_move(self, dx: int, dy: int, *args: object, **kwargs: object) -> None:
         self.events.append(("relative_move", dx, dy))
 
-    def click(self, button: object = FakeButton.left, clicks: int = 1, *a: object, **kw: object) -> None:
+    def click(
+        self, button: object = FakeButton.left, clicks: int = 1, *a: object, **kw: object
+    ) -> None:
         self.events.append(("click", button, clicks))
 
     def down(self, button: object = FakeButton.left, *a: object, **kw: object) -> None:

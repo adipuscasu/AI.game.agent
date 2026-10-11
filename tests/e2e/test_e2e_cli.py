@@ -276,6 +276,15 @@ def test_analyze_fulltest_config_fires_all_subsystems() -> None:
     (no detector errors — the template PNG loads, OCR runs) with real hits
     from the detectors that can fire on a uniform frame.
     """
+    # The fulltest config enables templates + OCR + objects: it needs the
+    # ``vision`` and ``ocr`` extras *and* the tesseract binary (CI installs
+    # it; a bare dev venv may not have any of the three). Skip rather than
+    # fail — the same bare-venv contract the unit suite already holds.
+    pytest.importorskip("cv2", reason="fulltest config needs the vision extra")
+    pytest.importorskip("pytesseract", reason="fulltest config needs the ocr extra")
+    if shutil.which("tesseract") is None:
+        pytest.skip("fulltest config needs the tesseract binary (see .github/workflows/ci.yml)")
+
     result = run_cli("analyze", "--backend", "mock", "--config", "config/fulltest.yaml")
     assert result.returncode == 0, result.stderr
     obs = json.loads(result.stdout)
