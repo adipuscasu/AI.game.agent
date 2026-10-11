@@ -335,7 +335,10 @@ class Executor:
         """key_down → hold → key_up, with the release in a ``finally``.
 
         A failure anywhere in the hold (including the injected sleeper)
-        still emits the release — the release-on-exception guarantee.
+        still emits the release — the release-on-exception guarantee. A
+        failed release attempt is handled exactly like the explicit
+        release path (see :meth:`_release_key`): the key is tracked as a
+        failed release for a later retry, never left as "still held".
         """
         self._backend.key_down(key, mods)
         self.held_keys.add(key)
@@ -343,7 +346,25 @@ class Executor:
             if duration_ms > 0:
                 self._sleeper(duration_ms / 1000.0)
         finally:
+            self._release_key(key, mods)
+
+    def _release_key(self, key: str, mods: tuple[str, ...]) -> None:
+        """Emit one key release, updating bookkeeping whether it lands or fails.
+
+        The held-state bookkeeping is updated **either way**: after a
+        failed release the executor has done all it can for that input,
+        so it moves from :attr:`held_keys` to the failed-release set —
+        where ``release_all`` / ``trigger_emergency_stop`` retry exactly
+        the releases that failed, without re-emitting ones that landed.
+        The exception still propagates (``execute`` records it as a
+        backend error for the bounded-retry contract).
+        """
+        try:
             self._backend.key_up(key, mods)
+        except Exception:  # noqa: BLE001 - record, then let it propagate
+            self._unreleased_keys.add(key)
+            raise
+        finally:
             self.held_keys.discard(key)
 
     def _perform_scroll(self, ticks: int | None) -> None:

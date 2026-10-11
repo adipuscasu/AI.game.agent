@@ -406,3 +406,59 @@ def test_emergency_stop_retries_failed_release_on_next_stop() -> None:
     assert ("key_up", "a") in b.events  # the retry landed
     assert b.held_keys == set()
     assert ex.stop_reason == "first"  # the original reason is retained
+
+
+# --- release failure during key_hold -----------------------------------------
+
+
+def test_hold_key_release_failure_updates_bookkeeping() -> None:
+    """A failed release during the hold must not leave the key tracked as held.
+
+    The same contract ``release_all`` honors: after a failed release the
+    executor has done all it can for that input — it is tracked as a failed
+    release (retried by ``release_all`` / emergency stop), not as a still-held
+    key. The backend still physically holds it until the retry lands.
+    """
+    from ai_game_agent.actions.executor import Executor
+
+    b = FlakyReleaseBackend()
+    b.open()
+    ex = Executor(backend=b, safety=_guard(), clock=lambda: 0.0, sleeper=lambda s: None)
+    result = ex.execute(Action(kind=ActionKind.KEY_HOLD, key="a", duration_ms=100))
+    assert result.ok is False
+    assert "simulated release failure" in (result.error or "")
+    # The executor has done all it can for 'a': no longer tracked as held.
+    assert ex.held_keys == set()
+    # But the backend still physically holds the key (the release failed).
+    assert "a" in b.held_keys
+    # key_down was issued; the failed key_up recorded no event.
+    assert b.events == [("key_down", "a")]
+
+
+def test_hold_key_release_failure_is_retried_by_release_all() -> None:
+    from ai_game_agent.actions.executor import Executor
+
+    b = FlakyReleaseBackend()
+    b.open()
+    ex = Executor(backend=b, safety=_guard(), clock=lambda: 0.0, sleeper=lambda s: None)
+    ex.execute(Action(kind=ActionKind.KEY_HOLD, key="a", duration_ms=100))
+    assert "a" in b.held_keys  # still physically held on the backend
+    b.fail_a = False  # the backend recovers
+    assert ex.release_all() is True
+    assert ("key_up", "a") in b.events  # the failed release was retried
+    assert b.held_keys == set()
+
+
+def test_hold_key_release_failure_is_retried_by_emergency_stop() -> None:
+    from ai_game_agent.actions.executor import Executor
+
+    b = FlakyReleaseBackend()
+    b.open()
+    ex = Executor(backend=b, safety=_guard(), clock=lambda: 0.0, sleeper=lambda s: None)
+    ex.execute(Action(kind=ActionKind.KEY_HOLD, key="a", duration_ms=100))
+    assert "a" in b.held_keys  # still physically held on the backend
+    b.fail_a = False  # the backend recovers
+    ex.trigger_emergency_stop(reason="manual")
+    assert ex.state is ExecutorState.STOPPED
+    assert ("key_up", "a") in b.events  # the retry landed
+    assert b.held_keys == set()
