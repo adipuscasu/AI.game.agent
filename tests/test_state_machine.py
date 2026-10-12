@@ -16,6 +16,7 @@ from ai_game_agent.state.machine import (
     SIGNAL_HEALTH_RECOVERED,
     SIGNAL_LOOT_PRESENT,
     SIGNAL_TARGET_HOSTILE,
+    SIGNAL_TARGET_PRESENT,
     GameStateMachine,
 )
 from ai_game_agent.state.states import AgentState
@@ -61,7 +62,7 @@ def test_idle_loot_marker_to_looting():
 
 
 def test_idle_hostile_target_to_combat():
-    m, _ = make({SIGNAL_TARGET_HOSTILE: True})
+    m, _ = make({SIGNAL_TARGET_PRESENT: True, SIGNAL_TARGET_HOSTILE: True})
     assert m.decide(OBS, 1000) is AgentState.COMBAT
 
 
@@ -69,18 +70,19 @@ def test_idle_priority_health_beats_loot_beats_hostile():
     m, _ = make({
         SIGNAL_HEALTH_LOW: True,
         SIGNAL_LOOT_PRESENT: True,
+        SIGNAL_TARGET_PRESENT: True,
         SIGNAL_TARGET_HOSTILE: True,
     })
     assert m.decide(OBS, 1000) is AgentState.RECOVERY  # health floor is safety
 
 
 def test_idle_priority_loot_beats_hostile():
-    m, _ = make({SIGNAL_LOOT_PRESENT: True, SIGNAL_TARGET_HOSTILE: True})
+    m, _ = make({SIGNAL_LOOT_PRESENT: True, SIGNAL_TARGET_PRESENT: True, SIGNAL_TARGET_HOSTILE: True})
     assert m.decide(OBS, 1000) is AgentState.LOOTING  # table order is the contract
 
 
 def test_combat_target_lost_to_idle():
-    m, _ = make({SIGNAL_TARGET_HOSTILE: False}, initial=AgentState.COMBAT)
+    m, _ = make({SIGNAL_TARGET_PRESENT: False}, initial=AgentState.COMBAT)
     assert m.decide(OBS, 1000) is AgentState.IDLE
 
 
@@ -90,7 +92,7 @@ def test_combat_low_health_to_recovery():
 
 
 def test_combat_order_target_lost_before_health():
-    m, _ = make({SIGNAL_TARGET_HOSTILE: False, SIGNAL_HEALTH_LOW: True},
+    m, _ = make({SIGNAL_TARGET_PRESENT: False, SIGNAL_HEALTH_LOW: True},
                 initial=AgentState.COMBAT)
     assert m.decide(OBS, 1000) is AgentState.IDLE  # table order is the contract
 
@@ -116,12 +118,14 @@ def test_paused_is_terminal():
     assert m.decide(OBS, 1000) is AgentState.PAUSED
 
 
-def test_ai_analysis_slot_is_watchdogged():
-    # Phase 4 never *enters* AI_ANALYSIS; the slot is a watchdog state. The
-    # machine has no clock at construction (state_entered_at = 0.0), so a
-    # large ``now`` trips the watchdog — the Phase-5 "VLM never returns" seam.
+def test_initial_ai_analysis_anchors_watchdog_clock_before_timing_out():
+    # Construction has no clock; the first decision anchors the initial
+    # watchdog state's entry time instead of comparing process uptime to zero.
     m, _ = make({}, initial=AgentState.AI_ANALYSIS)
-    assert m.decide(OBS, 1000) is AgentState.PAUSED  # entered_at=0, now > timeout
+    assert m.decide(OBS, 1000) is AgentState.AI_ANALYSIS
+    assert m.state_entered_at == 1000
+    assert m.decide(OBS, 1004.9) is AgentState.AI_ANALYSIS
+    assert m.decide(OBS, 1005) is AgentState.PAUSED
 
 
 # --- Self-loop idempotence ---------------------------------------------------
@@ -246,8 +250,12 @@ def test_watchdog_does_not_fire_in_non_watchdog_states():
 def test_none_signals_are_never_treated_as_false():
     pol = StubPolicy()
     m = GameStateMachine(policy=pol, initial=AgentState.COMBAT)
-    pol.signals = {SIGNAL_TARGET_HOSTILE: None, SIGNAL_HEALTH_LOW: None}
-    assert m.decide(OBS, 1000) is AgentState.COMBAT  # unknown hostility != target lost
+    pol.signals = {
+        SIGNAL_TARGET_PRESENT: None,
+        SIGNAL_TARGET_HOSTILE: None,
+        SIGNAL_HEALTH_LOW: None,
+    }
+    assert m.decide(OBS, 1000) is AgentState.COMBAT  # unknown target != target lost
 
     pol2 = StubPolicy()
     m2 = GameStateMachine(policy=pol2, initial=AgentState.LOOTING)
