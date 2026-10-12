@@ -10,7 +10,8 @@
 ## 1. Purpose
 
 
-> **Contract validation note (2026-10-12).** Implement against the live Phase 1–3 APIs: `Capture` in `capture.py` with `start()`/`stop()` lifecycle; `wait_next_frame()` and `config.fps` for pacing; `CaptureError` for capture failures; `Observation.ui_zones`, `templates`, `objects`, and `detector_errors`; actual `ActionKind` values and `duration_ms`; `threading.Event` for cancellation; and the existing multi-layer config wiring. Use a scripted capture fake where the real API has no queued-frame fixture. Nest cleanup so capture and executor resources are closed even if cleanup itself raises. Event sequence numbers are session-wide and assigned by the loop. Detector errors are data, not exceptions, and hit coordinates are frame-space after capture region/scale.
+
+> **Contract validation note (2026-10-12).** Implement against the live Phase 1–3 APIs: `Capture` in `capture.py` with `start()`/`stop()` lifecycle; `wait_next_frame()` and `config.fps` for pacing; `CaptureError` for capture failures; `Observation.ui_zones`, `templates`, `objects`, and `detector_errors`; actual `ActionKind` values and `duration_ms`; `threading.Event` for cancellation; and the existing multi-layer config wiring. Use a scripted test fake where the real API has no queued-frame fixture. Nest cleanup so capture and executor resources are closed even if cleanup itself raises. Event sequence numbers are session-wide and assigned by the loop. Detector errors are data, not exceptions, and hit coordinates are frame-space after capture region/scale.
 
 
 Phase 3 can *see* (Phase 2: `perception.analyze`) and can *act* (Phase 3:
@@ -220,6 +221,8 @@ lives in `policy.py` per game; the machine only enforces the *shape*):
 | RECOVERY | recovery attempts exhausted | PAUSED | "recovery attempts exhausted; safe pause" |
 | any | capture or perception raised this tick | RECOVERY | "observation failure this tick" |
 
+The table's `health_bar.percent`, `.present`, and `.hostile` expressions are names for **policy-produced signals**, not attributes on `Observation`. The machine must consume only the typed signal contract from the injected policy. If a signal is unknown (`None`), transition logic must preserve the current state or take an explicitly documented safe path; unknown is never equivalent to `False` or zero health.
+
 **Rules the machine enforces (independent of the policy):**
 1. **Watchdog timeout.** If the machine has stayed in any
    `watchdog_states` state for ≥ `state_timeout_s` (measured at `decide()`
@@ -295,8 +298,7 @@ class _AgentConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     # The loop
-    tick_hz: float = Field(default=2.0, gt=0, le=60.0)     # 2 Hz ≈ 500ms/tick
-    max_ticks: int | None = Field(default=None, gt=0)      # None = run until stopped
+      max_ticks: int | None = Field(default=None, gt=0)      # None = run until stopped
     state_timeout_s: float = Field(default=5.0, gt=0)      # watchdog (machine)
     recovery_attempts: int = Field(default=3, gt=0)        # bounded recovery
     # WoW-flavored defaults, overridable per game later
@@ -329,7 +331,6 @@ class AgentLoop:
                  machine: GameStateMachine,
                  policy: StatePolicy,
                  mode: OperationMode,
-                 tick_hz: float,
                  max_ticks: int | None,
                  now_fn: Callable[[], float] = time.time,   # injectable clock
                  stop_event: threading.Event | None = None,
@@ -337,7 +338,7 @@ class AgentLoop:
         ...
 
     def run(self) -> AgentLoopReport:
-        """Blocking loop: grab → observe → decide → act → sleep, until
+        """Blocking loop: grab → observe → decide → act → pace, until
         stop_event, max_ticks, or PAUSED. Returns the report.
 
         Invariants:
@@ -345,8 +346,8 @@ class AgentLoop:
         - One Perception call per tick; `detector_errors` are observation data, not raised exceptions.
         - Executor.execute called only for non-empty action lists.
         - Every tick writes ≥1 LoopEvent (TICK + possibly STATE_*/ACTION_*).
-        - Any exception from capture/perception is classified (PERCEPTION_ERROR
-          / ACTION_ERROR / STATE_ERROR) and routed to RECOVERY, not propagated.
+        - `CaptureError` and documented pipeline failures are classified and routed
+          according to policy; detector errors remain observation data.
         """
         ...
 
@@ -697,7 +698,7 @@ A step is complete when:
 | **Loop leaks a capture frame on exception.** | `run()` guarantees `Capture.stop()` in nested `finally` cleanup, including if executor cleanup raises. Tests assert lifecycle closure on normal exit and failure. |
 | **Hotkey stops the executor but not the loop.** | Step 6 wires the loop's stop callback through the actual Phase 3 callback seam; the emergency-stop path itself remains owned by `Executor`. The test asserts the loop exits, not just the action. |
 | **OBSERVE_ONLY still executes input via a policy bug.** | The policy returns `()` under `OBSERVE_ONLY` (step 3), *and* the executor's `SafetyGuard` re-checks the mode at dispatch (Phase 3). Defense in depth; step 5 asserts zero `MockBackend.events` under `OBSERVE_ONLY`. |
-| **`tick_hz` too high → CPU/VRAM spike.** | Default is 2 Hz (500 ms/tick), well within the `le=60.0` config bound. The config validator caps it. At 2 Hz with Phase 2's detector pipeline, the loop is perception-bound, not CPU-bound. |
+| **`tick_hz` too high → CPU/VRAM spike.** | Pacing follows the existing `capture.config.fps` contract; `fps=0` disables pacing for CI/debug. Do not add an independent loop sleep that duplicates capture pacing. |
 | **Phase 5 (AI) needs a different loop shape.** | The `AI_ANALYSIS` state slot + watchdog + `paused` fallback are the exact seams Phase 5 will use: the AI strategy object replaces the empty `policy.actions(AI_ANALYSIS, ...)` tuple, and the same watchdog bounds its runtime. No loop refactor needed. |
 
 ---
