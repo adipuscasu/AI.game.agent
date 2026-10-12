@@ -85,6 +85,14 @@ def test_combat_target_lost_to_idle():
     m, _ = make({SIGNAL_TARGET_PRESENT: False}, initial=AgentState.COMBAT)
     assert m.decide(OBS, 1000) is AgentState.IDLE
 
+def test_combat_non_hostile_but_present_target_does_not_end_combat():
+    m, _ = make({
+        SIGNAL_TARGET_PRESENT: True,
+        SIGNAL_TARGET_HOSTILE: False,
+    }, initial=AgentState.COMBAT)
+    assert m.decide(OBS, 1000) is AgentState.COMBAT
+
+
 
 def test_combat_low_health_to_recovery():
     m, _ = make({SIGNAL_HEALTH_LOW: True}, initial=AgentState.COMBAT)
