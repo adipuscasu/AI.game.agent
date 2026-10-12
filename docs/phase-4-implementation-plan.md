@@ -9,7 +9,8 @@
 
 ## 1. Purpose
 
-> **Contract validation note (2026-10-12).** Implement against the live Phase 1–3 APIs: `Capture` in `capture.py` with `start()`/`stop()` lifecycle; `wait_next_frame()` and `config.fps` for pacing; `CaptureError` for capture failures; `Observation.ui_zones`, `templates`, `objects`, and `detector_errors`; the actual `ActionKind` values and `duration_ms`; `threading.Event` for cancellation; and the existing multi-layer config wiring. Use a scripted test fake where the real API has no queued-frame fixture. Nest cleanup so capture and executor resources are closed even if release/close itself raises. Assign session-wide event sequence numbers in the loop/event-log owner. Detector errors are data, not exceptions: distinguish no detection, partial perception, repeated required-detector failures, and capture/pipeline failure. Detected coordinates are frame-space after capture region/scale, not inherently desktop coordinates.
+
+> **Contract validation note (2026-10-12).** Implement against the live Phase 1–3 APIs: `Capture` in `capture.py` with `start()`/`stop()` lifecycle; `wait_next_frame()` and `config.fps` for pacing; `CaptureError` for capture failures; `Observation.ui_zones`, `templates`, `objects`, and `detector_errors`; actual `ActionKind` values and `duration_ms`; `threading.Event` for cancellation; and the existing multi-layer config wiring. Use a scripted capture fake where the real API has no queued-frame fixture. Nest cleanup so capture and executor resources are closed even if cleanup itself raises. Event sequence numbers are session-wide and assigned by the loop. Detector errors are data, not exceptions, and hit coordinates are frame-space after capture region/scale.
 
 
 Phase 3 can *see* (Phase 2: `perception.analyze`) and can *act* (Phase 3:
@@ -178,12 +179,14 @@ class GameStateMachine:
                  state_timeout_s: float = 5.0,
                  watchdog_states: frozenset[AgentState] = frozenset(
                      {AgentState.RECOVERY, AgentState.AI_ANALYSIS}),
-                 on_transition: Callable[[LoopEvent], None] | None = None):
+                 policy: StatePolicy,
+                 on_transition: Callable[[AgentState, AgentState, str, float], None] | None = None):
         ...
 
     state: AgentState                       # current
     def decide(self, observation: Observation, now: float) -> AgentState:
-        """Pure: (observation, internal attempt/timeout state, now) -> next state.
+        """Use injected policy.transition_signals(observation) plus internal
+        attempt/timeout state and now to choose the next state.
 
         No I/O. No Action creation. This keeps the test matrix small and the
         replay contract exact.
@@ -232,8 +235,15 @@ lives in `policy.py` per game; the machine only enforces the *shape*):
 3. **Self-loop idempotence.** `decide()` returning the *same* state as current
    is not a transition: no event, no counter reset. Only genuine changes go
    through `enter()`.
-4. **No I/O, no side effects.** The machine never touches the executor,
-   capture, or perception. It *returns* a state and *emits* callbacks.
+4. **No I/O, no side effects.** The machine never touches the executor or capture. It asks its injected
+   policy to interpret the observation, then returns a state and emits a
+   transition descriptor; the loop owns session-wide event sequencing.
+
+
+**Signal and health heuristics (required, not implied by detector output).** `Observation` has no health percentage, `present` property, `get_zone()`, or `ZoneResult`. Define a small typed signal object returned by `StatePolicy.transition_signals()` with `health_fraction: float | None`, `loot_present: bool | None`, `target_present: bool | None`, `target_hostile: bool | None`, and a detector-health/degradation flag. `None` means unknown/not configured/not detected; it must not be silently treated as `False` or as 0% health. A `UiZoneHit.value` is the normalized value of a configured brightness/color/presence check, not a WoW health fraction by definition. Phase 4 must either (a) configure a documented deterministic health-bar measurement whose output is calibrated to `[0, 1]`, or (b) leave health as unknown and avoid health-threshold transitions; it must not pretend a generic UI-zone value is health percent. Likewise, target hostility must not be inferred from simple target-zone presence unless the configuration explicitly defines that check. The policy owns these game-specific heuristics and their tests.
+
+**Detector degradation policy.** A detector listed in `Observation.detector_errors` failed for that frame, but the `Observation` itself remains valid. Define required vs optional detectors in the WoW adapter. One optional-detector error or an empty hit collection is not automatically a recovery event. On a required detector error, preserve any independent usable signals and mark affected signals unknown. Configure and test a bounded consecutive-failure threshold (default 3 consecutive ticks for a required detector); reset the counter after a successful observation of that detector. At threshold, emit a structured error/recovery event and enter `RECOVERY`; if recovery attempts are exhausted or the state watchdog expires, enter `PAUSED`. Capture-level `CaptureError` is a separate failure path and must not be conflated with detector errors.
+
 
 ### 4.4 `StatePolicy` (policy.py) — the "Action Plan" table
 
@@ -248,9 +258,9 @@ class StatePolicy(Protocol):
     def name(self) -> str: ...
     def actions(self, state: AgentState, observation: Observation,
                 mode: OperationMode) -> tuple[Action, ...]: ...
-    def transition_signals(self, observation: Observation) -> dict: ...
-        # zone values the machine's decide() consumes; isolates zone names
-        # (game-specific) from the machine (generic).
+    def transition_signals(self, observation: Observation) -> dict[str, object]: ...
+        # Typed, documented generic signal contract consumed by the machine;
+        # game-specific zone names stay inside games/wow/policy.py.
 ```
 
 `DeterministicPolicy` (in `games/wow/policy.py`) implements the table:
@@ -350,14 +360,15 @@ class AgentLoop:
 `to_dict()` (mirroring `Observation.to_dict()`).
 
 **Cooperative stop.** `run()` checks `stop_event.is_set()` at the
-top of each tick *and* between action dispatches inside a tick (so a hotkey
-mid-batch interrupts promptly). The hotkey is already wired into the executor
-(Phase 3): Phase 4 registers the loop's `stop_event.set` callback
-so F12 stops the *loop*, not just the current action.
+top of each tick and before each action dispatch. The Phase 3 emergency-stop
+path is owned by `Executor.trigger_emergency_stop()` and its configured
+hotkey callback; do not invent a separate `HotkeyListener` injection point
+unless the existing backend exposes one. Wire a loop-stop callback through
+the actual callback seam. A stop requested during `Executor.execute()` may
+interrupt that action via the executor's emergency-stop path; otherwise stop
+before the next action and never dispatch further actions.
 
-**Clock injection.** `now_fn` defaults to `time.time()` but is injectable so
-tests drive the watchdog deterministically (no real sleeps in the test path —
-Pacing uses `Capture.wait_next_frame()` and `capture.config.fps`; avoid a second sleep between ticks., not in tests).
+**Clock and pacing.** Inject a clock for deterministic watchdog tests. In production, use `Capture.wait_next_frame()` and `capture.config.fps` for pacing; `fps <= 0` disables pacing. Do not add a second `time.sleep(1 / tick_hz)` on top of the capture facade, which would double-pace the loop. If Phase 4 requires an independent tick rate, define how it maps to `capture.config.fps` and ensure only one pacing mechanism is active.
 
 ---
 
@@ -484,10 +495,7 @@ assert the `LoopEvent` fields).
 ### Step 5 — `AgentLoop.tick()` + `run()` (loop.py, report.py)
 
 **Contract (tests first):**
-- `tick()` performs exactly one capture grab (asserted via
-  the scripted capture fake's `grab_calls`), one `perception.observe()` call, one
-  `machine.decide()`, and (for COMBAT) exactly one `executor.execute()` call
-  per action in the policy tuple.
+- `tick()` performs one capture grab, one `perception.observe()` call, one `machine.decide()`, and at most one `executor.execute()` call per planned action. Record each result before deciding whether to continue.
 - `tick()` under `OBSERVE_ONLY` performs the grab + perception + decide but
   **zero** `executor.execute()` calls (the policy returns `()` under that
   mode, so the loop's dispatch loop has nothing to dispatch — asserted via
@@ -549,17 +557,11 @@ the exact key/delay sequence from the policy.
   test asserts the *loop* calls `release_all` as a belt-and-braces measure).
 - On `PAUSED` exit, `capture.release()` is called (asserted via
   the scripted fake's lifecycle assertions).
-- If `executor.execute()` raises `ActionError` (simulated by a
-  `SafetyGuard` mode-violation under `OBSERVE_ONLY` — but the policy already
-  returns `()` under that mode, so instead simulate via a
-  `max_backend_errors` exhaustion), the loop routes to RECOVERY, not a crash.
+- Each action dispatch is isolated: record a returned `ActionResult(ok=False)` and continue only when policy permits; if `execute()` raises `ActionError` or the executor reports stopped/paused, record the failure, stop dispatching the batch, and apply the bounded recovery/safe-pause policy. Do not retry a failed action blindly.
 
 **Red test:** `tests/test_agent_loop_safety.py`.
 
-**Green:** wire the hotkey callback in `AgentLoop.__init__` (accept an
-wire the loop stop callback through the existing Phase 3 backend hotkey callback and register `stop_event.set` as its
-trigger handler, in addition to the executor's existing callback). Add the
-`release_all` + `capture.release` calls to `run()`'s `finally` block.
+**Green:** wire loop cancellation only through the actual Phase 3 callback seam. In nested `finally` blocks call `executor.release_all()` / the executor's documented shutdown path and `Capture.stop()` so one cleanup failure cannot skip the other.
 
 **Verify:** full suite green.
 
@@ -624,6 +626,12 @@ log from step 7's test.
 
 ---
 
+### Tick result and action-failure contract
+
+`TickResult` is a concrete frozen dataclass (not an undefined placeholder) with at least: `observation: Observation | None`, `state_before: AgentState`, `state_after: AgentState`, `actions: tuple[Action, ...]`, `results: tuple[ActionResult, ...]`, `errors: tuple[str, ...]`, and `stop_requested: bool`. A capture failure may produce `observation=None`; preserve partial results when a later action fails. The loop catches only documented capture/perception/action exceptions at the boundary, emits an error event, and routes through recovery. Do not swallow arbitrary `BaseException` or turn every exception into a retry.
+
+**Action dispatch is per-action, not all-or-nothing.** Before each action, check the stop event and executor stopped/paused state. Execute one action, immediately log its `ActionResult`, then decide whether to continue. A returned `ok=False`, raised `ActionError`, safety rejection, emergency stop, or cancellation must have explicit handling; no unlogged failure and no further batch actions after stop/safety failure. Do not infer a new executor API: use the actual `ActionResult`, `Executor.stopped`, `stop_reason`, `release_all()`, and `trigger_emergency_stop()` contracts.
+
 ## 6. Dependency policy (no new third-party deps)
 
 Phase 4 adds **zero** new runtime dependencies. Everything it needs is
@@ -683,7 +691,7 @@ A step is complete when:
 | --- | --- |
 | **Watchdog timeout vs. legitimate long RECOVERY.** A real low-health recovery (drinking a potion, waiting for a healer) may take > 5 s. | `state_timeout_s` is config (`agent.state_timeout_s`, default 5.0). The watchdog fires on *stuck-in-RECOVERY* (no state change), not on *being in RECOVERY*: if `decide()` keeps returning RECOVERY because health is still < 30%, the watchdog fires at 5 s and pauses — which is the *correct* safe behavior (the agent shouldn't sit in a death-spiral loop). The operator can raise the timeout or the `recovery_attempts` to give it more room. |
 | **Policy/machine coupling drift.** If the policy's `transition_signals` key set changes, the machine silently breaks. | Step 3's test asserts the exact key set; step 2's machine tests use a stub policy with the same key set. A change to either side fails the other's test — the seam is contract-tested from both sides. |
-| **Loop leaks a capture frame on exception.** | `tick()` wraps `grab()` in a `try/finally` that calls `release()` (Phase 2's contract). Step 6 asserts `releases == grabs` after a `PAUSED` exit. |
+| **Loop leaks a capture frame on exception.** | `run()` guarantees `Capture.stop()` in nested `finally` cleanup, including if executor cleanup raises. Tests assert lifecycle closure on normal exit and failure. |
 | **Hotkey stops the executor but not the loop.** | Step 6 explicitly wires the loop's `stop_event` into the hotkey callback *in addition to* the executor's existing callback. The test asserts the loop exits, not just the action. |
 | **OBSERVE_ONLY still executes input via a policy bug.** | The policy returns `()` under `OBSERVE_ONLY` (step 3), *and* the executor's `SafetyGuard` re-checks the mode at dispatch (Phase 3). Defense in depth; step 5 asserts zero `MockBackend.events` under `OBSERVE_ONLY`. |
 | **`tick_hz` too high → CPU/VRAM spike.** | Default is 2 Hz (500 ms/tick), well within the `le=60.0` config bound. The config validator caps it. At 2 Hz with Phase 2's detector pipeline, the loop is perception-bound, not CPU-bound. |
