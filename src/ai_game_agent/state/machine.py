@@ -25,8 +25,8 @@ until then the callback is the raw ``(before, after, reason, now)`` tuple
 (§4.3).
 
 The machine is game-agnostic: it consumes only the stable signal keys the
-policy promises — ``health_low``, ``loot_present``, ``target_hostile``,
-``health_recovered`` — never zone names. A value of ``None`` means
+policy promises — ``health_low``, ``loot_present``, ``target_present``,
+``target_hostile``, ``health_recovered`` — never zone names. A value of ``None`` means
 unknown/not-detected and is *never* treated as ``False`` (or 0% health).
 """
 
