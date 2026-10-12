@@ -173,7 +173,7 @@ replay tests assert against.
 
 ```python
 class GameStateMachine:
-    def __init__(self,
+    def __init__(self, *,
                  initial: AgentState = AgentState.IDLE,
                  recovery_attempts: int = 3,
                  state_timeout_s: float = 5.0,
@@ -301,8 +301,11 @@ class _AgentConfig(BaseModel):
     recovery_attempts: int = Field(default=3, gt=0)        # bounded recovery
     # WoW-flavored defaults, overridable per game later
     combat_keys: tuple[str, ...] = ("q", "w")
+    # Used only when a calibrated health-fraction signal is available.
     health_low: float = Field(default=0.30, gt=0.0, le=1.0)
     health_recovered: float = Field(default=0.50, gt=0.0, le=1.0)
+    required_detector_failures: int = Field(default=3, gt=0)
+    required_detector_failures: int = Field(default=3, gt=0)
     loot_pickup_key: str = "f"
     # Event log
     record_dir: str = "recordings"
@@ -335,7 +338,7 @@ class AgentLoop:
 
     def run(self) -> AgentLoopReport:
         """Blocking loop: grab → observe → decide → act → sleep, until
-        stop_token, max_ticks, or PAUSED. Returns the report.
+        stop_event, max_ticks, or PAUSED. Returns the report.
 
         Invariants:
         - One capture grab per tick; released in `finally` (Phase 2 contract).
