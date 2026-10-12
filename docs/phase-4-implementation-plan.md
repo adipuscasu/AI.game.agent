@@ -9,6 +9,9 @@
 
 ## 1. Purpose
 
+> **Contract validation note (2026-10-12).** Implement against the live Phase 1–3 APIs: `Capture` in `capture.py` with `start()`/`stop()` lifecycle; `wait_next_frame()` and `config.fps` for pacing; `CaptureError` for capture failures; `Observation.ui_zones`, `templates`, `objects`, and `detector_errors`; the actual `ActionKind` values and `duration_ms`; `threading.Event` for cancellation; and the existing multi-layer config wiring. Use a scripted test fake where the real API has no queued-frame fixture. Nest cleanup so capture and executor resources are closed even if release/close itself raises. Assign session-wide event sequence numbers in the loop/event-log owner. Detector errors are data, not exceptions: distinguish no detection, partial perception, repeated required-detector failures, and capture/pipeline failure. Detected coordinates are frame-space after capture region/scale, not inherently desktop coordinates.
+
+
 Phase 3 can *see* (Phase 2: `perception.analyze`) and can *act* (Phase 3:
 `actions.act`) — but in two one-shot CLI invocations that a human drives.
 Phase 4 closes the loop: a **deterministic controller** that repeatedly
@@ -43,7 +46,7 @@ phase on purpose.
 ### 1.1 What "deterministic" buys us here
 
 - **CI-safe.** No Ollama, no desktop, no model download: the loop runs against
-  `MockCaptureBackend` frames + `MockBackend` input in the test suite, which is
+  the real `Capture` facade with a scripted test fake implementing the actual capture contract, plus `actions.MockBackend` input in the test suite, which is
   the project's stated "primary mechanism for regression testing."
 - **Replayable.** Every decision is a pure function of `(Observation, state,
   clock, attempt-counts)` — replay tests can feed recorded observations and
@@ -67,17 +70,17 @@ phase on purpose.
 
 | Contract | Source | What Phase 4 uses |
 | --- | --- | --- |
-| `Observation` (`perception/observation.py`) | frozen dataclass | `zones` (typed `ZoneResult` by zone name), `detector_errors`, `screen_size`, `ts`. **Phase 4 must consume the typed zone API** (`observation.get_zone(name)`), not raw dict keys. |
+| `Observation` (`perception/observation.py`) | frozen dataclass | `templates`, `ui_zones`, `objects`, `detector_errors`, and the other fields defined by the frozen `Observation` dataclass. Consume real hit collections (`TemplateHit`, `UiZoneHit`, `ObjectHit`), not a nonexistent `get_zone()`/`UiZoneHit` / `TemplateHit` / `ObjectHit` API. |
 | `Perception.observe(frame) -> Observation` (`perception/pipeline.py`) | pure pipeline | The per-tick perception call. Constructed once, reused across the loop (detector state is per-frame, so reuse is safe). |
-| `ScreenCaptureBackend` (`capture/base.py`) | grab/release/`__enter__`/`__exit__` | One grab per tick, released in the `finally` — Phase 2's frame lifecycle. |
-| `MockCaptureBackend` (`capture/mock.py`) | frame queue, `grabs` count, `grabs_failed` | Test doubles for the loop; `frames=()` drives the perception-error path; `raise_after=1` drives the capture-crash path. |
+| `Capture` / `CaptureBackend` (`capture.py`) | `start()`/`stop()` (or context manager), `grab()`, `wait_next_frame()`, and `config.fps` | Start before the loop and always stop in nested `finally` cleanup; there is no per-frame `release()` contract. |
+| `Capture` (`capture.py`) | The existing `MockBackend` returns a synthetic frame; it is not a queued-frame test fixture. Use a scripted test fake implementing `start()`/`stop()`/`grab()`/`wait_next_frame()` and counters; do not rely on undocumented queue/failure constructor arguments. |
 | `Executor` + `Action` / `ActionResult` / `ActionLog` (`actions/*`) | Phase 3 | One executor instance for the whole loop (hotkey armed, backend open). `execute()` returns `ActionResult(ok=...)`. |
 | `MockBackend` (`actions/mock.py`) | `events` list, `held_keys`, `held_buttons` | Test double asserting the exact emitted input sequence. |
 | `SafetyGuard` (`actions/safety.py`) | mode gate, bounded errors, release-all on stop | Unchanged; Phase 4 respects the same `paused`/stop semantics the guard enforces. |
 | `HotkeyListener` / `FakeHotkeyListener` (`actions/hotkey.py`) | `arm`/`disarm`/`trigger` | The loop's `run(stop_event)` must **cooperate with the F12 hotkey**: the hotkey callback (registered via the executor's backend) must be able to stop the loop, not just cancel one action. |
 | Config (`config.py`) | `_PerceptionConfig`, `_InputConfig`, `_SafetyConfig` | Phase 4 adds one new frozen model, `_AgentConfig` (see §4.4), alongside them. |
 | CLI (`__main__.py`) | `parse_args`, `_build_perception`, `_build_capture`, `_build_executor`, `_resolve_actions`, `_record_action_log` | Phase 4 adds one subcommand, `run`, reusing all four builders verbatim. |
-| Concurrency (`concurrency.py`) | `StopToken` | Reuse as the loop's cooperative stop primitive (already in the package; no new dependency). |
+| Stop primitive | `threading.Event` | Use as the loop's cooperative stop primitive; no project-specific stop-token abstraction exists. |
 
 ---
 
@@ -125,7 +128,7 @@ like the `actions` package (keeping the CLI cold-start contract).
 ### 4.1 `AgentState` (states.py)
 
 ```python
-class AgentState(str, Enum):
+class AgentState(StrEnum):
     IDLE = "idle"
     COMBAT = "combat"
     LOOTING = "looting"
@@ -138,7 +141,7 @@ class AgentStateError(ValueError):
     ...
 ```
 
-String-valued enum, same discipline as `OperationMode` (Phase 3): config
+Use `StrEnum`, matching the project's `OperationMode` style: config
 validation is closed-set, `extra="forbid"` applies to the config model, and
 `str(state)` round-trips through JSON.
 
@@ -150,7 +153,7 @@ One frozen dataclass per tick/decision, append-only per session:
 @dataclass(frozen=True)
 class LoopEvent:
     ts: float                      # monotonic-safe epoch seconds
-    seq: int                       # 0-based within the session
+    seq: int                       # 0-based session-wide; assigned by AgentLoop
     event: "EventType"             # TICK, STATE_ENTER, STATE_EXIT, ACTION_BATCH,
                                    # ACTION_RESULT, RECOVERY, STOP, ERROR
     state_before: AgentState | None
@@ -254,16 +257,15 @@ class StatePolicy(Protocol):
 
 - `IDLE`: `()` — wait for the next tick. (Phase 4 does not move the camera;
   that's a Phase 5/6 concern.)
-- `COMBAT`: `(Action(kind="key", key="q"), Action(kind="delay", delay_ms=120),
-  Action(kind="key", key="w"))` — a deterministic GCD-ish rotation. (Keys are
+- `COMBAT`: `(Action(kind=ActionKind.KEY_PRESS, key="q"), Action(kind=ActionKind.DELAY, duration_ms=120),
+  Action(kind=ActionKind.KEY_PRESS, key="w"))` — a deterministic GCD-ish rotation. (Keys are
   configurable via `agent.combat_keys` in config; defaults are WoW-friendly
   but the loop does not hard-code them.)
-- `LOOTING`: `(Action(kind="mouse_click", button="left", clicks=1,
-  x=<zone.cx>, y=<zone.cy>), Action(kind="delay", delay_ms=200),
-  Action(kind="key", key="f"))` — click the loot marker, wait, pick up.
-  The click coordinates come **from the zone's detected marker**, not a
-  hard-coded screen point.
-- `RECOVERY`: `(Action(kind="key", key="r"), Action(kind="delay", delay_ms=300))`
+- `LOOTING`: `(Action(kind=ActionKind.MOUSE_CLICK, button="left", clicks=1,
+  x=<hit center x>, y=<hit center y>), Action(kind=ActionKind.DELAY, duration_ms=200),
+  Action(kind=ActionKind.KEY_PRESS, key="f"))` — click the loot marker, wait, pick up.
+  The click coordinates must come from the selected hit's actual coordinate fields. These are frame-space coordinates after capture region/scale, not inherently absolute desktop coordinates.
+- `RECOVERY`: `(Action(kind=ActionKind.KEY_PRESS, key="r"), Action(kind=ActionKind.DELAY, duration_ms=300))`
   — re-use the "res" hotkey the Phase 2/3 demo already defined.
 - `AI_ANALYSIS`: `()` in Phase 4 (the slot is defined; the action list stays
   empty until Phase 5 fills it).
@@ -296,8 +298,7 @@ class _AgentConfig(BaseModel):
     record_dir: str = "recordings"
 ```
 
-Added to `Config` as `agent: _AgentConfig = _AgentConfig()` — default
-construction unchanged (no new required keys). `default.yaml` and
+Wire the new frozen agent settings through the existing configuration chain (`_AgentConfig` → `_Config` → public `Config` → `AgentConfig`); adding a field to the public facade alone is insufficient. Keep default construction backward-compatible. `default.yaml` and
 `development.yaml` each gain an `agent:` block (documented, not required —
 Pydantic fills defaults).
 
@@ -309,7 +310,7 @@ the Phase 2/3 config contract.
 ```python
 class AgentLoop:
     def __init__(self, *,
-                 capture: ScreenCaptureBackend,
+                 capture: Capture,
                  perception: Perception,
                  executor: Executor,
                  machine: GameStateMachine,
@@ -318,7 +319,7 @@ class AgentLoop:
                  tick_hz: float,
                  max_ticks: int | None,
                  now_fn: Callable[[], float] = time.time,   # injectable clock
-                 stop_token: StopToken | None = None,
+                 stop_event: threading.Event | None = None,
                  on_event: Callable[[LoopEvent], None] | None = None):
         ...
 
@@ -328,7 +329,7 @@ class AgentLoop:
 
         Invariants:
         - One capture grab per tick; released in `finally` (Phase 2 contract).
-        - One Perception call per tick; detector_errors recorded, never raised.
+        - One Perception call per tick; `detector_errors` are observation data, not raised exceptions.
         - Executor.execute called only for non-empty action lists.
         - Every tick writes ≥1 LoopEvent (TICK + possibly STATE_*/ACTION_*).
         - Any exception from capture/perception is classified (PERCEPTION_ERROR
@@ -348,16 +349,15 @@ class AgentLoop:
 `stopped_reason: str | None`, `wall_time_s: float`. JSON-serializable via a
 `to_dict()` (mirroring `Observation.to_dict()`).
 
-**Cooperative stop.** `run()` checks `stop_token.is_stop_requested()` at the
+**Cooperative stop.** `run()` checks `stop_event.is_set()` at the
 top of each tick *and* between action dispatches inside a tick (so a hotkey
 mid-batch interrupts promptly). The hotkey is already wired into the executor
-(Phase 3): Phase 4 registers the loop's `stop_token` as an additional callback
+(Phase 3): Phase 4 registers the loop's `stop_event.set` callback
 so F12 stops the *loop*, not just the current action.
 
 **Clock injection.** `now_fn` defaults to `time.time()` but is injectable so
 tests drive the watchdog deterministically (no real sleeps in the test path —
-`tick_hz` is honored in production via `time.sleep(1/tick_hz)` *between*
-ticks, not in tests).
+Pacing uses `Capture.wait_next_frame()` and `capture.config.fps`; avoid a second sleep between ticks., not in tests).
 
 ---
 
@@ -446,7 +446,7 @@ the code reads as data, not nested `if`.
 
 **Red test:** `tests/test_state_policy.py` + a small `observation_factory`
 helper in `conftest.py` that builds an `Observation` with specific zone
-results (reusing Phase 2's `ZoneResult` constructors).
+results (reusing Phase 2's `UiZoneHit` / `TemplateHit` / `ObjectHit` constructors).
 
 **Green:** `games/wow/zones.py` (constants), `games/wow/policy.py`
 (`DeterministicPolicy`), `state/policy.py` (the `Protocol`).
@@ -485,7 +485,7 @@ assert the `LoopEvent` fields).
 
 **Contract (tests first):**
 - `tick()` performs exactly one capture grab (asserted via
-  `MockCaptureBackend.grabs`), one `perception.observe()` call, one
+  the scripted capture fake's `grab_calls`), one `perception.observe()` call, one
   `machine.decide()`, and (for COMBAT) exactly one `executor.execute()` call
   per action in the policy tuple.
 - `tick()` under `OBSERVE_ONLY` performs the grab + perception + decide but
@@ -495,12 +495,12 @@ assert the `LoopEvent` fields).
 - `tick()` records a `TICK` event with `detail={"zones": {...}}` (the zone
   names + their `present` flags) so a log reader can reconstruct the decision
   without re-running perception.
-- `run()` with `max_ticks=3` and a 3-frame `MockCaptureBackend` returns an
+- `run()` with `max_ticks=3` and a 3-frame scripted capture fake returns an
   `AgentLoopReport` with `ticks == 3`, `final_state` matching the last
   `decide()` output, and `stopped_reason == "max_ticks"`.
-- `run()` with `stop_token` set before the first tick returns immediately with
+- `run()` with `stop_event` set before the first tick returns immediately with
   `ticks == 0` and `stopped_reason == "stop_requested"`.
-- `run()` with a `MockCaptureBackend(frames=())` (perception-error path)
+- `run()` with a a scripted fake that raises `CaptureError` from `grab()` (capture-error path)
   routes to RECOVERY, and after `recovery_attempts` ticks, `PAUSED`.
 - `run()` exits on `PAUSED` (the machine's terminal state) with
   `stopped_reason == "paused"` and the executor released (hotkey disarmed,
@@ -541,14 +541,14 @@ the exact key/delay sequence from the policy.
 
 **Contract (tests first):**
 - Triggering the `FakeHotkeyListener` (F12) during a `run()` loop causes
-  `stop_token` to be set, the loop to exit within the current tick, and the
+  `stop_event` to be set, the loop to exit within the current tick, and the
   report's `stopped_reason == "emergency_stop"`.
 - On `PAUSED` exit, `executor.release_all()` is called (asserted via
   `MockBackend.held_keys == []` and `held_buttons == []` after a COMBAT tick
   that leaves a key held — though the Phase 3 executor auto-releases, the
   test asserts the *loop* calls `release_all` as a belt-and-braces measure).
 - On `PAUSED` exit, `capture.release()` is called (asserted via
-  `MockCaptureBackend.releases == grabs`).
+  the scripted fake's lifecycle assertions).
 - If `executor.execute()` raises `ActionError` (simulated by a
   `SafetyGuard` mode-violation under `OBSERVE_ONLY` — but the policy already
   returns `()` under that mode, so instead simulate via a
@@ -557,7 +557,7 @@ the exact key/delay sequence from the policy.
 **Red test:** `tests/test_agent_loop_safety.py`.
 
 **Green:** wire the hotkey callback in `AgentLoop.__init__` (accept an
-optional `hotkey_listener` and register `stop_token.request_stop` as its
+wire the loop stop callback through the existing Phase 3 backend hotkey callback and register `stop_event.set` as its
 trigger handler, in addition to the executor's existing callback). Add the
 `release_all` + `capture.release` calls to `run()`'s `finally` block.
 
@@ -634,8 +634,8 @@ already in the package:
 | Typed game state | new `state/` package (pure Python) |
 | State machine + watchdog | new `state/machine.py` (pure Python, `enum`, `dataclasses`) |
 | Policy/action-plan | new `state/policy.py` + `games/wow/policy.py` (consumes Phase 2 `Action` types) |
-| Loop orchestration | new `agent/loop.py` (consumes Phase 2 `ScreenCaptureBackend`, `Perception`; Phase 3 `Executor`) |
-| Stop token | `concurrency.StopToken` (Phase 2) |
+| Loop orchestration | new `agent/loop.py` (consumes `Capture`, Phase 2 `Perception`, and Phase 3 `Executor`) |
+| Stop token | `threading.Event` |
 | Event log | new `state/events.py` (`dataclasses`, `json`) |
 | Config | `config.py` `_AgentConfig` (Pydantic, already a dep) |
 | CLI | `__main__.py` `argparse` (stdlib) |
@@ -643,12 +643,12 @@ already in the package:
 **Explicitly NOT added:** no `pynput` (Phase 3's `input` extra is unchanged;
 the `windows` backend still requires it on the Windows box), no Ollama client
 (Phase 5), no new CV libs (Phase 2's `cv` extra is unchanged), no scheduler
-(`time.sleep` + `StopToken` are sufficient at 2 Hz).
+(`time.sleep` + `threading.Event` are sufficient at 2 Hz).
 
 The `pyproject.toml` `[project] dependencies` block is **untouched** by
 Phase 4. The `[project.optional-dependencies]` block is **untouched**. CI's
 bare-venv contract (no `input` extra) continues to hold because Phase 4's
-loop tests use `MockCaptureBackend` + `MockBackend` exclusively.
+loop tests use scripted capture fake + `MockBackend` exclusively.
 
 ---
 
@@ -684,7 +684,7 @@ A step is complete when:
 | **Watchdog timeout vs. legitimate long RECOVERY.** A real low-health recovery (drinking a potion, waiting for a healer) may take > 5 s. | `state_timeout_s` is config (`agent.state_timeout_s`, default 5.0). The watchdog fires on *stuck-in-RECOVERY* (no state change), not on *being in RECOVERY*: if `decide()` keeps returning RECOVERY because health is still < 30%, the watchdog fires at 5 s and pauses — which is the *correct* safe behavior (the agent shouldn't sit in a death-spiral loop). The operator can raise the timeout or the `recovery_attempts` to give it more room. |
 | **Policy/machine coupling drift.** If the policy's `transition_signals` key set changes, the machine silently breaks. | Step 3's test asserts the exact key set; step 2's machine tests use a stub policy with the same key set. A change to either side fails the other's test — the seam is contract-tested from both sides. |
 | **Loop leaks a capture frame on exception.** | `tick()` wraps `grab()` in a `try/finally` that calls `release()` (Phase 2's contract). Step 6 asserts `releases == grabs` after a `PAUSED` exit. |
-| **Hotkey stops the executor but not the loop.** | Step 6 explicitly wires the loop's `stop_token` into the hotkey callback *in addition to* the executor's existing callback. The test asserts the loop exits, not just the action. |
+| **Hotkey stops the executor but not the loop.** | Step 6 explicitly wires the loop's `stop_event` into the hotkey callback *in addition to* the executor's existing callback. The test asserts the loop exits, not just the action. |
 | **OBSERVE_ONLY still executes input via a policy bug.** | The policy returns `()` under `OBSERVE_ONLY` (step 3), *and* the executor's `SafetyGuard` re-checks the mode at dispatch (Phase 3). Defense in depth; step 5 asserts zero `MockBackend.events` under `OBSERVE_ONLY`. |
 | **`tick_hz` too high → CPU/VRAM spike.** | Default is 2 Hz (500 ms/tick), well within the `le=60.0` config bound. The config validator caps it. At 2 Hz with Phase 2's detector pipeline, the loop is perception-bound, not CPU-bound. |
 | **Phase 5 (AI) needs a different loop shape.** | The `AI_ANALYSIS` state slot + watchdog + `paused` fallback are the exact seams Phase 5 will use: the AI strategy object replaces the empty `policy.actions(AI_ANALYSIS, ...)` tuple, and the same watchdog bounds its runtime. No loop refactor needed. |
