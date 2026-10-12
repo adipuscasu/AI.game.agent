@@ -298,7 +298,7 @@ class _AgentConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     # The loop
-      max_ticks: int | None = Field(default=None, gt=0)      # None = run until stopped
+    max_ticks: int | None = Field(default=None, gt=0)      # None = run until stopped
     state_timeout_s: float = Field(default=5.0, gt=0)      # watchdog (machine)
     recovery_attempts: int = Field(default=3, gt=0)        # bounded recovery
     # WoW-flavored defaults, overridable per game later
@@ -306,7 +306,6 @@ class _AgentConfig(BaseModel):
     # Used only when a calibrated health-fraction signal is available.
     health_low: float = Field(default=0.30, gt=0.0, le=1.0)
     health_recovered: float = Field(default=0.50, gt=0.0, le=1.0)
-    required_detector_failures: int = Field(default=3, gt=0)
     required_detector_failures: int = Field(default=3, gt=0)
     loot_pickup_key: str = "f"
     # Event log
@@ -559,8 +558,7 @@ the exact key/delay sequence from the policy.
   `MockBackend.held_keys == []` and `held_buttons == []` after a COMBAT tick
   that leaves a key held — though the Phase 3 executor auto-releases, the
   test asserts the *loop* calls `release_all` as a belt-and-braces measure).
-- On `PAUSED` exit, `capture.release()` is called (asserted via
-  the scripted fake's lifecycle assertions).
+- On every exit path, `Capture.stop()` is called in `finally`; test cleanup even when executor cleanup raises.
 - Each action dispatch is isolated: record a returned `ActionResult(ok=False)` and continue only when policy permits; if `execute()` raises `ActionError` or the executor reports stopped/paused, record the failure, stop dispatching the batch, and apply the bounded recovery/safe-pause policy. Do not retry a failed action blindly.
 
 **Red test:** `tests/test_agent_loop_safety.py`.
