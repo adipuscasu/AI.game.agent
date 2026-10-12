@@ -77,7 +77,11 @@ def test_idle_priority_health_beats_loot_beats_hostile():
 
 
 def test_idle_priority_loot_beats_hostile():
-    m, _ = make({SIGNAL_LOOT_PRESENT: True, SIGNAL_TARGET_PRESENT: True, SIGNAL_TARGET_HOSTILE: True})
+    m, _ = make({
+        SIGNAL_LOOT_PRESENT: True,
+        SIGNAL_TARGET_PRESENT: True,
+        SIGNAL_TARGET_HOSTILE: True,
+    })
     assert m.decide(OBS, 1000) is AgentState.LOOTING  # table order is the contract
 
 
