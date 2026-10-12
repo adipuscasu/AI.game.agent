@@ -44,6 +44,7 @@ __all__ = [
     "SIGNAL_HEALTH_RECOVERED",
     "SIGNAL_LOOT_PRESENT",
     "SIGNAL_TARGET_HOSTILE",
+    "SIGNAL_TARGET_PRESENT",
 ]
 
 # Stable signal keys: the machine's consumption seam (step 3 produces these).
@@ -51,6 +52,7 @@ SIGNAL_HEALTH_LOW = "health_low"
 SIGNAL_HEALTH_RECOVERED = "health_recovered"
 SIGNAL_LOOT_PRESENT = "loot_present"
 SIGNAL_TARGET_HOSTILE = "target_hostile"
+SIGNAL_TARGET_PRESENT = "target_present"
 
 Signals = dict[str, object]
 OnTransition = Callable[[AgentState, AgentState, str, float], None]
@@ -105,10 +107,10 @@ class GameStateMachine:
         self.state_timeout_s = state_timeout_s
         self.watchdog_states = frozenset(watchdog_states)
         self.on_transition = on_transition
-        # Clock value at which the current state was entered. 0.0 for the
-        # initial state (construction has no clock); the watchdog only
-        # meaningfully applies after a real transition into a watchdog state.
-        self.state_entered_at: float = 0.0
+        # The constructor has no clock input. None means the initial state's
+        # entry time has not yet been anchored; the first decide(now) anchors
+        # it instead of incorrectly treating process uptime as state duration.
+        self.state_entered_at: float | None = None
         self._recovery_count: int = 0
 
     # ---- Public decision / bookkeeping API ----------------------------------
@@ -123,7 +125,14 @@ class GameStateMachine:
         # 1) Watchdog hard-override — only in watchdog states, checked before
         #    any per-state logic (it is the "only escape" from a stuck state).
         in_watchdog = self.state in self.watchdog_states
-        timed_out = now >= self.state_entered_at + self.state_timeout_s
+        if in_watchdog and self.state_entered_at is None:
+            # The initial state was supplied before a clock existed. Start its
+            # timeout at the first decision, never at an arbitrary zero epoch.
+            self.state_entered_at = now
+        timed_out = (
+            self.state_entered_at is not None
+            and now >= self.state_entered_at + self.state_timeout_s
+        )
         if in_watchdog and timed_out:
             self._enter(AgentState.PAUSED, REASON_STATE_TIMEOUT, now)
             return AgentState.PAUSED
@@ -192,11 +201,17 @@ class GameStateMachine:
                 return AgentState.RECOVERY, REASON_LOW_HEALTH_IDLE
             if self._is_true(signals, SIGNAL_LOOT_PRESENT):
                 return AgentState.LOOTING, REASON_LOOT_MARKER
-            if self._is_true(signals, SIGNAL_TARGET_HOSTILE):
+            if (
+                self._is_true(signals, SIGNAL_TARGET_PRESENT)
+                and self._is_true(signals, SIGNAL_TARGET_HOSTILE)
+            ):
                 return AgentState.COMBAT, REASON_HOSTILE_TARGET
             return AgentState.IDLE, REASON_NO_ACTIONABLE_SIGNAL
         if state is AgentState.COMBAT:
-            if self._is_false(signals, SIGNAL_TARGET_HOSTILE):
+            # A present but non-hostile target is not the same as no target.
+            # Only an explicit target_present=False ends combat; None means
+            # detection is unknown and must preserve the current state.
+            if self._is_false(signals, SIGNAL_TARGET_PRESENT):
                 return AgentState.IDLE, REASON_TARGET_LOST
             if self._is_true(signals, SIGNAL_HEALTH_LOW):
                 return AgentState.RECOVERY, REASON_HEALTH_FLOOR_COMBAT
