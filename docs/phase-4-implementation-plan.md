@@ -451,9 +451,10 @@ the code reads as data, not nested `if`.
 - `policy.actions(AgentState.LOOTING, obs, mode=...)` uses the zone's marker
   `cx`/`cy` for the click, not a hard-coded point.
 - `policy.transition_signals(obs)` returns a dict with keys
-  `health_low`, `loot_present`, `target_hostile`, `health_recovered` — the
-  *exact* keys the machine's `decide()` consumes (this is the seam; the test
-  asserts the key set is stable so the machine can rely on it).
+  `health_low`, `loot_present`, `target_present`, `target_hostile`,
+  `health_recovered` — the *exact* keys the machine's `decide()` consumes.
+  `target_present` is distinct from `target_hostile`: a present non-hostile
+  target does not mean the current combat target was lost.
 - `wow_policy` reads zone names from `games/wow/zones.py` constants — the
   policy is the *only* place in the codebase that knows the literal strings
   `"health_bar"`, `"loot_glow"`, etc.
