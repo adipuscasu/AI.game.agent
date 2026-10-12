@@ -372,7 +372,7 @@ the actual callback seam. A stop requested during `Executor.execute()` may
 interrupt that action via the executor's emergency-stop path; otherwise stop
 before the next action and never dispatch further actions.
 
-**Clock and pacing.** Inject a clock for deterministic watchdog tests. In production, use `Capture.wait_next_frame()` and `capture.config.fps` for pacing; `fps <= 0` disables pacing. Do not add a second `time.sleep(1 / tick_hz)` on top of the capture facade, which would double-pace the loop. If Phase 4 requires an independent tick rate, define how it maps to `capture.config.fps` and ensure only one pacing mechanism is active.
+**Clock and pacing.** Inject a clock for deterministic watchdog tests. In production, use `Capture.wait_next_frame()` and `capture.config.fps` for pacing; `fps <= 0` disables pacing. Do not add a second independent sleep on top of the capture facade, which would double-pace the loop.
 
 ---
 
@@ -698,7 +698,7 @@ A step is complete when:
 | **Loop leaks a capture frame on exception.** | `run()` guarantees `Capture.stop()` in nested `finally` cleanup, including if executor cleanup raises. Tests assert lifecycle closure on normal exit and failure. |
 | **Hotkey stops the executor but not the loop.** | Step 6 wires the loop's stop callback through the actual Phase 3 callback seam; the emergency-stop path itself remains owned by `Executor`. The test asserts the loop exits, not just the action. |
 | **OBSERVE_ONLY still executes input via a policy bug.** | The policy returns `()` under `OBSERVE_ONLY` (step 3), *and* the executor's `SafetyGuard` re-checks the mode at dispatch (Phase 3). Defense in depth; step 5 asserts zero `MockBackend.events` under `OBSERVE_ONLY`. |
-| **`tick_hz` too high → CPU/VRAM spike.** | Pacing follows the existing `capture.config.fps` contract; `fps=0` disables pacing for CI/debug. Do not add an independent loop sleep that duplicates capture pacing. |
+| **Capture pacing too high → CPU/VRAM spike.** | Pacing follows `capture.config.fps`; `fps=0` disables pacing for CI/debug. Avoid a second loop sleep that duplicates capture pacing. |
 | **Phase 5 (AI) needs a different loop shape.** | The `AI_ANALYSIS` state slot + watchdog + `paused` fallback are the exact seams Phase 5 will use: the AI strategy object replaces the empty `policy.actions(AI_ANALYSIS, ...)` tuple, and the same watchdog bounds its runtime. No loop refactor needed. |
 
 ---
