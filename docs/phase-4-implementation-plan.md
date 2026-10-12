@@ -509,7 +509,7 @@ assert the `LoopEvent` fields).
 - `run()` with `max_ticks=3` and a 3-frame scripted capture fake returns an
   `AgentLoopReport` with `ticks == 3`, `final_state` matching the last
   `decide()` output, and `stopped_reason == "max_ticks"`.
-- `run()` with `stop_event` set before the first tick returns immediately with
+- `run()` with `stop_event.is_set()` before the first tick returns immediately with
   `ticks == 0` and `stopped_reason == "stop_requested"`.
 - `run()` with a a scripted fake that raises `CaptureError` from `grab()` (capture-error path)
   routes to RECOVERY, and after `recovery_attempts` ticks, `PAUSED`.
@@ -695,7 +695,7 @@ A step is complete when:
 | **Watchdog timeout vs. legitimate long RECOVERY.** A real low-health recovery (drinking a potion, waiting for a healer) may take > 5 s. | `state_timeout_s` is config (`agent.state_timeout_s`, default 5.0). The watchdog fires on *stuck-in-RECOVERY* (no state change), not on *being in RECOVERY*: if `decide()` keeps returning RECOVERY because health is still < 30%, the watchdog fires at 5 s and pauses — which is the *correct* safe behavior (the agent shouldn't sit in a death-spiral loop). The operator can raise the timeout or the `recovery_attempts` to give it more room. |
 | **Policy/machine coupling drift.** If the policy's `transition_signals` key set changes, the machine silently breaks. | Step 3's test asserts the exact key set; step 2's machine tests use a stub policy with the same key set. A change to either side fails the other's test — the seam is contract-tested from both sides. |
 | **Loop leaks a capture frame on exception.** | `run()` guarantees `Capture.stop()` in nested `finally` cleanup, including if executor cleanup raises. Tests assert lifecycle closure on normal exit and failure. |
-| **Hotkey stops the executor but not the loop.** | Step 6 explicitly wires the loop's `stop_event` into the hotkey callback *in addition to* the executor's existing callback. The test asserts the loop exits, not just the action. |
+| **Hotkey stops the executor but not the loop.** | Step 6 wires the loop's stop callback through the actual Phase 3 callback seam; the emergency-stop path itself remains owned by `Executor`. The test asserts the loop exits, not just the action. |
 | **OBSERVE_ONLY still executes input via a policy bug.** | The policy returns `()` under `OBSERVE_ONLY` (step 3), *and* the executor's `SafetyGuard` re-checks the mode at dispatch (Phase 3). Defense in depth; step 5 asserts zero `MockBackend.events` under `OBSERVE_ONLY`. |
 | **`tick_hz` too high → CPU/VRAM spike.** | Default is 2 Hz (500 ms/tick), well within the `le=60.0` config bound. The config validator caps it. At 2 Hz with Phase 2's detector pipeline, the loop is perception-bound, not CPU-bound. |
 | **Phase 5 (AI) needs a different loop shape.** | The `AI_ANALYSIS` state slot + watchdog + `paused` fallback are the exact seams Phase 5 will use: the AI strategy object replaces the empty `policy.actions(AI_ANALYSIS, ...)` tuple, and the same watchdog bounds its runtime. No loop refactor needed. |
