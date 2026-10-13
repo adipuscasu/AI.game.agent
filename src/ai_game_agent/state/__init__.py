@@ -6,12 +6,12 @@ Public re-exports so callers can do::
 
 Step-1 scope: the ``AgentState`` enum and ``AgentStateError`` from
 :mod:`ai_game_agent.state.states`. Step-2 scope: the ``GameStateMachine``
-decision core from :mod:`ai_game_agent.state.machine`. The events and
-policy modules land in subsequent phase-4 steps and are re-exported here
-as they are added.
+decision core from :mod:`ai_game_agent.state.machine`. Step-3 scope: the
+``StatePolicy`` contract from :mod:`ai_game_agent.state.policy`.
 """
 
 from ai_game_agent.state.machine import GameStateMachine
+from ai_game_agent.state.policy import StatePolicy
 from ai_game_agent.state.states import AgentState, AgentStateError
 
-__all__ = ["AgentState", "AgentStateError", "GameStateMachine"]
+__all__ = ["AgentState", "AgentStateError", "GameStateMachine", "StatePolicy"]
