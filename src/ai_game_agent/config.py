@@ -287,6 +287,168 @@ class _PerceptionConfig(BaseModel):
     objects: _ObjectConfig = Field(default_factory=_ObjectConfig)
 
 
+class _AgentConfig(BaseModel):
+    """Policy parameters for the deterministic state machine (Phase 4, §4.5).
+
+    Mirrors the exact constructor surface of
+    :class:`~ai_game_agent.games.wow.policy.DeterministicPolicy` so that
+    ``DeterministicPolicy.from_config`` is a pure pass-through. Defaults match
+    the policy's built-in defaults, keeping an existing config file (no
+    ``agent:`` block) backward compatible.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str = Field(default="wow", min_length=1)
+    combat_keys: tuple[str, ...] = Field(default_factory=lambda: ("q", "w"))
+    combat_delay_ms: int = Field(default=120, gt=0)
+    loot_pickup_key: str = Field(default="f", min_length=1)
+    loot_delay_ms: int = Field(default=200, gt=0)
+    recovery_key: str = Field(default="r", min_length=1)
+    recovery_delay_ms: int = Field(default=300, gt=0)
+    health_low: float = Field(default=0.30, gt=0, le=1)
+    health_recovered: float = Field(default=0.50, gt=0, le=1)
+
+    @model_validator(mode="after")
+    def _thresholds_ordered(self) -> _AgentConfig:
+        if not (self.health_low < self.health_recovered):
+            raise ValueError(
+                f"health_low must be < health_recovered, "
+                f"got {self.health_low!r} !< {self.health_recovered!r}"
+            )
+        return self
+
+
+class AgentConfig:
+    """Immutable, frozen view over :class:`_AgentConfig`.
+
+    Mirrors the public/private split used by every other config section
+    (``CaptureConfig``/``_CaptureConfig``, etc.): callers read attributes,
+    the model enforces validation, and ``from_model`` gives a single
+    construction path so the frozen view can never drift from the validated
+    model. Hashable and value-equal.
+    """
+
+    __slots__ = (
+        "name",
+        "combat_keys",
+        "combat_delay_ms",
+        "loot_pickup_key",
+        "loot_delay_ms",
+        "recovery_key",
+        "recovery_delay_ms",
+        "health_low",
+        "health_recovered",
+    )
+
+    def __init__(
+        self,
+        name: str = "wow",
+        combat_keys: tuple[str, ...] = ("q", "w"),
+        combat_delay_ms: int = 120,
+        loot_pickup_key: str = "f",
+        loot_delay_ms: int = 200,
+        recovery_key: str = "r",
+        recovery_delay_ms: int = 300,
+        health_low: float = 0.30,
+        health_recovered: float = 0.50,
+    ) -> None:
+        # Validate against the same rules the model enforces (so a direct
+        # AgentConfig(...) call is just as strict as a YAML round-trip).
+        if not name or not isinstance(name, str):
+            raise ValueError(f"policy name must be a non-empty string, got {name!r}")
+        if not (isinstance(combat_keys, (list, tuple)) and combat_keys):
+            raise ValueError("combat_keys must be a non-empty tuple/list")
+        for key in combat_keys:
+            if not (isinstance(key, str) and key):
+                raise ValueError(f"combat key must be a non-empty string, got {key!r}")
+        for key_name, key in (
+            ("loot_pickup_key", loot_pickup_key),
+            ("recovery_key", recovery_key),
+        ):
+            if not (isinstance(key, str) and key):
+                raise ValueError(f"{key_name} must be a non-empty string, got {key!r}")
+        for delay_name, delay in (
+            ("combat_delay_ms", combat_delay_ms),
+            ("loot_delay_ms", loot_delay_ms),
+            ("recovery_delay_ms", recovery_delay_ms),
+        ):
+            if not (isinstance(delay, int) and not isinstance(delay, bool) and delay > 0):
+                raise ValueError(f"{delay_name} must be a positive int, got {delay!r}")
+        for t_name, t in (("health_low", health_low), ("health_recovered", health_recovered)):
+            if not (0.0 < t <= 1.0):
+                raise ValueError(f"{t_name} must be in (0, 1], got {t!r}")
+        if not (health_low < health_recovered):
+            raise ValueError(
+                f"health_low must be < health_recovered, got {health_low!r} !< {health_recovered!r}"
+            )
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "combat_keys", tuple(combat_keys))
+        object.__setattr__(self, "combat_delay_ms", combat_delay_ms)
+        object.__setattr__(self, "loot_pickup_key", loot_pickup_key)
+        object.__setattr__(self, "loot_delay_ms", loot_delay_ms)
+        object.__setattr__(self, "recovery_key", recovery_key)
+        object.__setattr__(self, "recovery_delay_ms", recovery_delay_ms)
+        object.__setattr__(self, "health_low", health_low)
+        object.__setattr__(self, "health_recovered", health_recovered)
+
+    @classmethod
+    def from_model(cls, model: _AgentConfig) -> AgentConfig:
+        return cls(
+            name=model.name,
+            combat_keys=model.combat_keys,
+            combat_delay_ms=model.combat_delay_ms,
+            loot_pickup_key=model.loot_pickup_key,
+            loot_delay_ms=model.loot_delay_ms,
+            recovery_key=model.recovery_key,
+            recovery_delay_ms=model.recovery_delay_ms,
+            health_low=model.health_low,
+            health_recovered=model.health_recovered,
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:  # pragma: no cover
+        raise AttributeError("AgentConfig is immutable")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"AgentConfig(name={self.name!r}, combat_keys={self.combat_keys!r}, "
+            f"combat_delay_ms={self.combat_delay_ms!r}, "
+            f"loot_pickup_key={self.loot_pickup_key!r}, loot_delay_ms={self.loot_delay_ms!r}, "
+            f"recovery_key={self.recovery_key!r}, recovery_delay_ms={self.recovery_delay_ms!r}, "
+            f"health_low={self.health_low!r}, health_recovered={self.health_recovered!r})"
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, AgentConfig):
+            return NotImplemented
+        return (
+            self.name == other.name
+            and self.combat_keys == other.combat_keys
+            and self.combat_delay_ms == other.combat_delay_ms
+            and self.loot_pickup_key == other.loot_pickup_key
+            and self.loot_delay_ms == other.loot_delay_ms
+            and self.recovery_key == other.recovery_key
+            and self.recovery_delay_ms == other.recovery_delay_ms
+            and self.health_low == other.health_low
+            and self.health_recovered == other.health_recovered
+        )
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.name,
+                self.combat_keys,
+                self.combat_delay_ms,
+                self.loot_pickup_key,
+                self.loot_delay_ms,
+                self.recovery_key,
+                self.recovery_delay_ms,
+                self.health_low,
+                self.health_recovered,
+            )
+        )
+
+
 class _Config(BaseModel):
     """Top-level configuration object for the agent."""
 
@@ -298,6 +460,7 @@ class _Config(BaseModel):
     safety: _SafetyConfig = Field(default_factory=_SafetyConfig)
     logging: _LoggingConfig = Field(default_factory=_LoggingConfig)
     perception: _PerceptionConfig = Field(default_factory=_PerceptionConfig)
+    agent: _AgentConfig = Field(default_factory=_AgentConfig)
 
 
 class Region:
@@ -705,7 +868,7 @@ class InputConfig(_FrozenConfig):
 class Config:
     """Top-level configuration object for the agent."""
 
-    __slots__ = ("ai", "capture", "safety", "logging", "perception", "input")
+    __slots__ = ("ai", "capture", "safety", "logging", "perception", "input", "agent")
 
     def __init__(
         self,
@@ -715,6 +878,7 @@ class Config:
         logging: LoggingConfig | None = None,
         perception: PerceptionConfig | None = None,
         input: InputConfig | None = None,
+        agent: AgentConfig | None = None,
     ) -> None:
         self.ai = ai if ai is not None else AIConfig()
         self.capture = capture if capture is not None else CaptureConfig()
@@ -722,12 +886,14 @@ class Config:
         self.logging = logging if logging is not None else LoggingConfig()
         self.perception = perception if perception is not None else PerceptionConfig()
         self.input = input if input is not None else InputConfig()
+        self.agent = agent if agent is not None else AgentConfig()
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
             f"Config(ai={self.ai!r}, capture={self.capture!r}, "
             f"safety={self.safety!r}, logging={self.logging!r}, "
-            f"perception={self.perception!r}, input={self.input!r})"
+            f"perception={self.perception!r}, input={self.input!r}, "
+            f"agent={self.agent!r})"
         )
 
 
@@ -775,6 +941,7 @@ def _config_from_model(model: _Config) -> Config:
             objects_enabled=model.perception.objects.enabled,
             object_colors=tuple(c.model_dump() for c in model.perception.objects.colors),
         ),
+        agent=AgentConfig.from_model(model.agent),
     )
 
 

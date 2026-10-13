@@ -174,6 +174,68 @@ class DeterministicPolicy:
         self._health_recovered = health_recovered
         self._health_fraction = health_fraction
 
+    @classmethod
+    def from_config(
+        cls,
+        config: object,
+        *,
+        health_fraction: Callable[[Observation], float | None] | None = None,
+    ) -> DeterministicPolicy:
+        """Build a :class:`DeterministicPolicy` from a loaded :class:`Config`.
+
+        Reads the ``agent:`` block (``config.agent``) and passes each value
+        straight through to the constructor — no re-defaulting, no field
+        translation. This is the config-wiring seam from §4.5: the YAML
+        ``agent:`` block (``config/default.yaml``) *is* the policy parameters.
+
+        The ``health_fraction`` callable is a *runtime* concern (it needs a
+        live :class:`Observation`) and is therefore **not** a config field.
+        When omitted it stays ``None`` and the ``health_low`` /
+        ``health_recovered`` signals remain inert (``None``) until one is
+        injected via :meth:`set_health_fraction` — the "no signal without
+        data" guardrail the tests lock in.
+
+        Args:
+            config: Any object exposing an ``agent`` attribute with the
+                :class:`~ai_game_agent.config.AgentConfig` shape.
+            health_fraction: Optional calibrated health reading callable,
+                ``Observation -> float | None``. ``None`` (the default) keeps
+                the health signals inert.
+
+        Raises:
+            ValueError: If ``config.agent`` is missing.
+        """
+        agent = getattr(config, "agent", None)
+        if agent is None:
+            raise ValueError("config.agent is required; load a config with an agent: block")
+
+        return cls(
+            name=agent.name,
+            combat_keys=tuple(agent.combat_keys),
+            combat_delay_ms=agent.combat_delay_ms,
+            loot_pickup_key=agent.loot_pickup_key,
+            loot_delay_ms=agent.loot_delay_ms,
+            recovery_key=agent.recovery_key,
+            recovery_delay_ms=agent.recovery_delay_ms,
+            health_low=agent.health_low,
+            health_recovered=agent.health_recovered,
+            health_fraction=health_fraction,
+        )
+
+    def set_health_fraction(
+        self,
+        health_fraction: Callable[[Observation], float | None] | None,
+    ) -> None:
+        """Inject or clear the calibrated health reading callable at runtime.
+
+        This is the sanctioned seam for enabling the ``health_low`` /
+        ``health_recovered`` signals after construction: the caller supplies a
+        function that knows how to read the *actual* health bar from the
+        observation (which depends on the running game's UI layout), and the
+        policy simply calls it. Passing ``None`` disables the signals again.
+        """
+        self._health_fraction = health_fraction
+
     # -- StatePolicy protocol ------------------------------------------------
 
     def name(self) -> str:
