@@ -37,7 +37,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ai_game_agent.state.events import EventType, LoopEvent
-from ai_game_agent.state.states import AgentState
+from ai_game_agent.state.states import AgentState, AgentStateError
 
 __all__ = [
     "GameStateMachine",
@@ -98,10 +98,25 @@ class GameStateMachine:
             raise ValueError("recovery_attempts must be >= 1")
         if state_timeout_s <= 0:
             raise ValueError("state_timeout_s must be > 0")
-        if initial not in set(AgentState):
-            raise ValueError(f"unknown initial state: {initial!r}")
-        if not watchdog_states <= set(AgentState):
-            raise ValueError("watchdog_states must be a subset of AgentState")
+        if not isinstance(initial, AgentState):
+            # A membership check (``in set(AgentState)``) cannot catch a plain
+            # string that equals a member value (StrEnum value equality) — and
+            # that string would then be stored as a ``str`` and silently break
+            # every transition, because the table dispatches on ``is``. Type-
+            # check instead: the project's "explicit error type, no implicit
+            # coercion" rule (states.py).
+            raise AgentStateError(
+                f"initial must be an AgentState member, got {type(initial).__name__}"
+            )
+        for _member in watchdog_states:
+            # Same discipline per member: a type check, not StrEnum equality or
+            # set membership (which would rely on hashing the string and would
+            # accept a plain string equal to a member value).
+            if not isinstance(_member, AgentState):
+                raise AgentStateError(
+                    "watchdog_states must contain only AgentState members, "
+                    f"got {_member!r}"
+                )
 
         self.policy = policy
         self.state: AgentState = initial

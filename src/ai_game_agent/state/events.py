@@ -16,8 +16,14 @@ Design notes:
   discipline as :class:`AgentState` and ``OperationMode``: string
   interoperability with config and JSON, a closed value set, and an implicit
   coercion to an unknown value is impossible (``EventType("bogus")`` raises).
-* :class:`LoopEvent` is a frozen dataclass (immutable, hashable) so an event
-  is a value that can be logged, replayed, and compared without mutation.
+* :class:`LoopEvent` is a frozen dataclass (immutable field *bindings*) so an
+  event can be logged, replayed, and compared without rebinding a field. Note
+  ``frozen=True`` does not make the value deep-immutable: the ``detail`` dict
+  is still a mutable container a caller may edit in place, and the presence of
+  that unhashable dict field means :class:`LoopEvent` itself is **not**
+  hashable. The audit-trail guarantee that matters — *serializing must not
+  corrupt the source* — is provided by :meth:`LoopEvent.to_dict` deep-copying
+  ``detail``.
 * ``seq`` ownership (plan-internal, resolved): this step follows the
   step-4 contract bullet — 0-based, monotonically increasing *per machine
   instance*, assigned by the machine, not the callback. The plan's global
@@ -26,9 +32,10 @@ Design notes:
   all event kinds; the machine's per-instance counter is provisional and
   test-scoped until then.
 * ``detail`` is always a ``dict[str, JSON-compatible]``; ``to_dict()``
-  yields a plain, ``json.dumps``-able mapping (enums as their string
-  values). Validating that ``detail`` values are in fact JSON-compatible
-  is the step-8 record/replay obligation, not step 4's.
+  yields a plain, ``json.dumps``-able mapping (enums as their string values),
+  deep-copying ``detail`` so mutating the serialized result never leaks back
+  into the event. Validating that ``detail`` values are in fact
+  JSON-compatible is the step-8 record/replay obligation, not step 4's.
 """
 
 from __future__ import annotations

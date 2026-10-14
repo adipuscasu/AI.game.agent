@@ -30,7 +30,7 @@ from ai_game_agent.state.machine import (
     SIGNAL_TARGET_PRESENT,
     GameStateMachine,
 )
-from ai_game_agent.state.states import AgentState
+from ai_game_agent.state.states import AgentState, AgentStateError
 
 OBS = object()  # sentinel observation; the stub policy ignores it
 
@@ -472,3 +472,33 @@ def test_constructor_validates_bounds():
         GameStateMachine(policy=StubPolicy(), recovery_attempts=0)
     with pytest.raises(ValueError):
         GameStateMachine(policy=StubPolicy(), state_timeout_s=0.0)
+
+
+def test_constructor_rejects_plain_string_initial_state():
+    # 'idle' *equals* AgentState.IDLE (StrEnum value equality), so a
+    # membership check (`in set(AgentState)`) cannot catch it — but the
+    # transition table dispatches on `is`, so a plain string would be
+    # accepted and then silently break every transition. The guard is a
+    # type check, not a membership check.
+    with pytest.raises(AgentStateError):
+        GameStateMachine(policy=StubPolicy(), initial="idle")
+    with pytest.raises(AgentStateError):
+        GameStateMachine(policy=StubPolicy(), initial="bogus")
+    with pytest.raises(AgentStateError):
+        GameStateMachine(policy=StubPolicy(), initial=None)
+
+
+def test_constructor_rejects_mixed_type_watchdog_states():
+    # A plain string equal to a member value must not slip in alongside
+    # real members — validation is per-member type, not StrEnum equality
+    # or set membership (which relies on hashing the string).
+    with pytest.raises(AgentStateError):
+        GameStateMachine(
+            policy=StubPolicy(),
+            watchdog_states={AgentState.RECOVERY, "combat"},
+        )
+    with pytest.raises(AgentStateError):
+        GameStateMachine(
+            policy=StubPolicy(),
+            watchdog_states={AgentState.RECOVERY, AgentState.PAUSED, 7},
+        )
