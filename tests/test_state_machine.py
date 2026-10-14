@@ -5,12 +5,23 @@ Red tests for the deterministic decision core. The machine is driven by a
 stable signal keys — the machine never sees zone names, so the test matrix
 stays small and game-agnostic. A fake clock (``now``) is used so no real time
 elapses in the watchdog tests.
+
+Step 4 (plan §4.2) extends this file with the ``LoopEvent`` contract: the
+``on_transition`` seam fires frozen ``LoopEvent`` objects (``STATE_ENTER``),
+and the tests assert the exact field set, the closed ``EventType``, sequence
+numbering, and the emitted reasons — all through the public callback, never
+private counters.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import json
+import typing
+
 import pytest
 
+from ai_game_agent.state.events import EventType, LoopEvent
 from ai_game_agent.state.machine import (
     SIGNAL_HEALTH_LOW,
     SIGNAL_HEALTH_RECOVERED,
@@ -144,11 +155,11 @@ def test_initial_ai_analysis_anchors_watchdog_clock_before_timing_out():
 
 
 def test_self_loop_does_not_fire_on_transition():
-    events: list = []
+    events: list[LoopEvent] = []
     m, _ = make({SIGNAL_TARGET_HOSTILE: True}, initial=AgentState.COMBAT,
-                on_transition=lambda b, a, r, t: events.append((b, a, r, t)))
+                on_transition=events.append)
     assert m.decide(OBS, 1000) is AgentState.COMBAT
-    assert events == []
+    assert events == []  # self-loop: no spurious STATE_ENTER event
 
 
 def test_self_loop_does_not_reset_recovery_counter():
@@ -209,30 +220,183 @@ def test_healthy_exit_resets_recovery_counter():
     assert m.recovery_count == 0  # healthy exit resets the episode
 
 
-# --- on_transition seam (step 4 refines this into a LoopEvent) ---------------
+# --- on_transition seam: LoopEvent (plan §4.2) -------------------------------
 
 
-def test_enter_fires_on_transition_with_before_after_reason_now():
-    events: list = []
-    m, _ = make({SIGNAL_HEALTH_LOW: True},
-                on_transition=lambda b, a, r, t: events.append((b, a, r, t)))
+def make_event(**overrides: object) -> LoopEvent:
+    """A valid ``LoopEvent`` for shape tests; override any field."""
+    base: dict[str, object] = {
+        "ts": 1000.0,
+        "seq": 0,
+        "event": EventType.STATE_ENTER,
+        "state_before": AgentState.IDLE,
+        "state_after": AgentState.RECOVERY,
+        "reason": "low health on idle scan",
+        "detail": {},
+    }
+    base.update(overrides)
+    return LoopEvent(**base)
+
+
+def test_enter_fires_state_enter_event_with_before_after_reason_now():
+    events: list[LoopEvent] = []
+    m, _ = make({SIGNAL_HEALTH_LOW: True}, on_transition=events.append)
     m.decide(OBS, 1234.5)
-    assert events == [
-        (AgentState.IDLE, AgentState.RECOVERY, "low health on idle scan", 1234.5)
-    ]
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.event is EventType.STATE_ENTER
+    assert ev.state_before is AgentState.IDLE
+    assert ev.state_after is AgentState.RECOVERY
+    assert ev.reason == "low health on idle scan"  # §4.3 table reason, verbatim
+    assert ev.ts == 1234.5  # the injected now, verbatim (no wall clock)
+    assert ev.seq == 0
+    assert ev.detail == {}
 
 
 def test_loop_forces_recovery_on_observation_failure_via_enter():
-    events: list = []
-    m, _ = make({}, on_transition=lambda b, a, r, t: events.append((b, a, r, t)))
+    events: list[LoopEvent] = []
+    m, _ = make({}, on_transition=events.append)
     # §4.3 "any -> RECOVERY: observation failure this tick" is a loop-driven
     # forced move (no observation to read), exposed through the controlled writer.
     m.enter(AgentState.RECOVERY, "observation failure this tick", 2000.0)
     assert m.state is AgentState.RECOVERY
     assert m.recovery_count == 0  # fresh recovery episode
-    assert events == [
-        (AgentState.IDLE, AgentState.RECOVERY, "observation failure this tick", 2000.0)
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.event is EventType.STATE_ENTER
+    assert ev.state_before is AgentState.IDLE
+    assert ev.state_after is AgentState.RECOVERY
+    assert ev.reason == "observation failure this tick"
+    assert ev.ts == 2000.0
+    assert ev.seq == 0
+
+
+def test_enter_self_loop_emits_no_event():
+    events: list[LoopEvent] = []
+    m, _ = make({SIGNAL_TARGET_HOSTILE: True}, initial=AgentState.COMBAT,
+                on_transition=events.append)
+    m.enter(AgentState.COMBAT, "still engaging hostile target", 1000.0)
+    assert events == []  # idempotent writer: no spurious STATE_ENTER
+
+
+# --- LoopEvent contract (plan §4.2) ------------------------------------------
+
+
+def test_state_package_reexports_the_event_contract():
+    from ai_game_agent.state import EventType as PkgET
+    from ai_game_agent.state import LoopEvent as PkgLE
+
+    assert PkgET is EventType
+    assert PkgLE is LoopEvent
+
+
+def test_event_type_is_closed_with_exactly_the_plan_values():
+    assert len(EventType) == 8
+    assert {e.name for e in EventType} == {
+        "TICK", "STATE_ENTER", "STATE_EXIT", "ACTION_BATCH",
+        "ACTION_RESULT", "RECOVERY", "STOP", "ERROR",
+    }
+    for e in EventType:  # closed str-enum: string interop + round-trip
+        assert isinstance(e, str)
+        assert EventType(str(e)) is e
+    with pytest.raises(ValueError):
+        EventType("bogus")  # closed: no implicit coercion
+
+
+def test_loop_event_is_frozen_dataclass_with_exact_fields():
+    assert LoopEvent.__dataclass_params__.frozen  # frozen=True dataclass
+    fields = dataclasses.fields(LoopEvent)
+    assert [f.name for f in fields] == [
+        "ts", "seq", "event", "state_before", "state_after", "reason", "detail",
     ]
+    hints = typing.get_type_hints(LoopEvent)
+    assert hints["ts"] is float
+    assert hints["seq"] is int
+    assert hints["event"] is EventType
+    assert hints["state_before"] == AgentState | None
+    assert hints["state_after"] == AgentState | None
+    assert hints["reason"] is str
+    assert hints["detail"] == dict[str, object]
+
+
+def test_loop_event_rejects_mutation():
+    ev = make_event()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ev.ts = 2.0  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ev.reason = "other"  # type: ignore[misc]
+
+
+def test_loop_event_to_dict_is_json_round_trippable():
+    ev = make_event(detail={"zone": "health_bar", "present": True, "attempt": 2})
+    d = ev.to_dict()
+    keys = set(d)
+    assert keys == {"ts", "seq", "event", "state_before", "state_after", "reason", "detail"}
+    assert json.loads(json.dumps(d)) == d  # JSON-serializable end to end
+    assert d["event"] == "state_enter"  # enums as their string values
+    assert d["state_before"] == "idle"
+    assert d["state_after"] == "recovery"
+    assert d["detail"] == {"zone": "health_bar", "present": True, "attempt": 2}
+
+
+def test_machine_event_seq_is_0_based_and_monotonic():
+    events: list[LoopEvent] = []
+    m, pol = make({SIGNAL_HEALTH_LOW: True}, on_transition=events.append)
+    m.decide(OBS, 1000)  # IDLE -> RECOVERY (seq 0)
+    pol.signals = {SIGNAL_HEALTH_RECOVERED: True}
+    m.decide(OBS, 1001)  # RECOVERY -> IDLE (seq 1)
+    assert [e.seq for e in events] == [0, 1]
+
+
+def test_machine_event_seq_is_per_instance():
+    ev_a: list[LoopEvent] = []
+    m_a, _ = make({SIGNAL_HEALTH_LOW: True}, on_transition=ev_a.append)
+    m_a.decide(OBS, 1000)
+    ev_b: list[LoopEvent] = []
+    m_b, _ = make({SIGNAL_HEALTH_LOW: True}, on_transition=ev_b.append)
+    m_b.decide(OBS, 1000)
+    assert ev_a[0].seq == 0
+    assert ev_b[0].seq == 0  # a fresh machine starts a fresh session
+
+
+def test_watchdog_pause_emits_state_enter_event():
+    events: list[LoopEvent] = []
+    pol = StubPolicy()
+    m = GameStateMachine(policy=pol, on_transition=events.append)
+    pol.signals = {SIGNAL_HEALTH_LOW: True}
+    m.decide(OBS, 1000)  # IDLE -> RECOVERY
+    assert m.decide(OBS, 1005) is AgentState.PAUSED  # watchdog fires
+    ev = events[-1]
+    assert ev.event is EventType.STATE_ENTER
+    assert ev.state_before is AgentState.RECOVERY
+    assert ev.state_after is AgentState.PAUSED
+    assert ev.reason == "state timeout (watchdog)"
+    assert ev.ts == 1005
+
+
+def test_recovery_exhaustion_emits_state_enter_event():
+    events: list[LoopEvent] = []
+    pol = StubPolicy()
+    m = GameStateMachine(policy=pol, on_transition=events.append)
+    pol.signals = {SIGNAL_HEALTH_LOW: True}
+    m.decide(OBS, 1000)  # IDLE -> RECOVERY (seq 0)
+    for _ in range(3):
+        m.note_recovery_attempt()
+    pol.signals = {SIGNAL_HEALTH_RECOVERED: True}
+    assert m.decide(OBS, 1000) is AgentState.PAUSED  # exhausted regardless
+    ev = events[-1]
+    assert ev.event is EventType.STATE_ENTER
+    assert ev.state_before is AgentState.RECOVERY
+    assert ev.state_after is AgentState.PAUSED
+    assert ev.reason == "recovery attempts exhausted; safe pause"
+    assert ev.seq == 1
+
+
+def test_construction_does_not_emit_event():
+    # The initial state has no clock and no transition: no event may exist.
+    events: list[LoopEvent] = []
+    make({SIGNAL_HEALTH_LOW: True}, on_transition=events.append)
+    assert events == []
 
 
 # --- Watchdog ----------------------------------------------------------------

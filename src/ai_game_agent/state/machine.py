@@ -14,15 +14,16 @@ phase-4 invariants that are *independent* of any specific game:
   RECOVERY attempts; once ``recovery_attempts`` pass without a healthy exit,
   the next ``decide()`` returns ``PAUSED`` — no infinite retry.
 * **Self-loop idempotence.** A ``decide()`` that returns the current state is
-  *not* a transition: no ``on_transition`` callback, no counter change,
+  *not* a transition: no ``on_transition`` event, no counter change,
   ``state_entered_at`` preserved.
 * **No I/O, no side effects.** Reads only the policy-produced ``signals``
   dict.
 
-Step-2 scope: transitions, recovery counter, watchdog, and the raw
-``on_transition`` seam. Step 4 refines the callback into a ``LoopEvent``;
-until then the callback is the raw ``(before, after, reason, now)`` tuple
-(§4.3).
+Step-4 scope: the transition seam fires a frozen :class:`LoopEvent`
+(``event=STATE_ENTER``, ``state_before``/``state_after``, the §4.3 ``reason``,
+and the injected ``now``) — the plan §4.2 audit-trail shape. ``seq`` is
+0-based and assigned by the machine (per instance); the machine does not
+construct any other event kind (``TICK``/``ACTION_*`` are the loop's, step 5).
 
 The machine is game-agnostic: it consumes only the stable signal keys the
 policy promises — ``health_low``, ``loot_present``, ``target_present``,
@@ -35,6 +36,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from ai_game_agent.state.events import EventType, LoopEvent
 from ai_game_agent.state.states import AgentState
 
 __all__ = [
@@ -55,7 +57,7 @@ SIGNAL_TARGET_HOSTILE = "target_hostile"
 SIGNAL_TARGET_PRESENT = "target_present"
 
 Signals = dict[str, object]
-OnTransition = Callable[[AgentState, AgentState, str, float], None]
+OnTransition = Callable[[LoopEvent], None]
 
 # Stable, test-asserted, logged verbatim.
 REASON_LOW_HEALTH_IDLE = "low health on idle scan"
@@ -91,7 +93,7 @@ class GameStateMachine:
             {AgentState.RECOVERY, AgentState.AI_ANALYSIS}
         ),
         on_transition: OnTransition | None = None,
-    ) -> None:
+    ) -> None:  # on_transition receives a LoopEvent (plan §4.2, step 4)
         if recovery_attempts < 1:
             raise ValueError("recovery_attempts must be >= 1")
         if state_timeout_s <= 0:
@@ -112,6 +114,8 @@ class GameStateMachine:
         # it instead of incorrectly treating process uptime as state duration.
         self.state_entered_at: float | None = None
         self._recovery_count: int = 0
+        # 0-based session sequence; the machine assigns it, not the callback.
+        self._seq: int = 0
 
     # ---- Public decision / bookkeeping API ----------------------------------
 
@@ -153,7 +157,8 @@ class GameStateMachine:
         The loop uses this for forced moves ``decide()`` cannot express from
         an observation — e.g. a capture/perception failure this tick
         ("observation failure this tick" -> RECOVERY). Idempotent on
-        self-loops (no event, no state change).
+        self-loops (no event, no state change). Fires one ``STATE_ENTER``
+        ``LoopEvent`` on a genuine move (plan §4.2).
         """
         self._enter(new_state, reason, now)
 
@@ -191,7 +196,18 @@ class GameStateMachine:
         elif before is AgentState.RECOVERY and new_state not in self.watchdog_states:
             self._recovery_count = 0
         if self.on_transition is not None:
-            self.on_transition(before, new_state, reason, now)
+            seq = self._seq
+            self._seq += 1
+            self.on_transition(
+                LoopEvent(
+                    ts=now,
+                    seq=seq,
+                    event=EventType.STATE_ENTER,
+                    state_before=before,
+                    state_after=new_state,
+                    reason=reason,
+                )
+            )
 
     def _next(self, state: AgentState, signals: Signals) -> tuple[AgentState, str]:
         """Return ``(next_state, reason)`` for a genuine change, or
