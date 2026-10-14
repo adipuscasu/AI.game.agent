@@ -494,6 +494,27 @@ assert the `LoopEvent` fields).
 
 **Verify:** full suite green.
 
+**Review note (2026-10-14, against commit `fc0df3f`):**
+
+- **`seq` ownership (plan-internal inconsistency, resolved).** This step
+  follows the step-4 contract above: `seq` is 0-based, monotonically
+  increasing *per machine instance*, assigned by the machine. The plan's
+  global note (line 14: "Event sequence numbers are session-wide and
+  assigned by the loop") and the §4.2 sketch (line 158: `seq: int  # 0-based
+  session-wide; assigned by AgentLoop`) assign *session-wide* sequencing to
+  the loop. The authoritative session-wide sequence therefore stays a
+  **step-5 obligation**: the loop owns the sequence across all event kinds
+  (`TICK`, `ACTION_*`, `RECOVERY`, `STOP`, `ERROR`, plus the machine's
+  `STATE_ENTER`), and step 5 must add a test asserting the combined stream
+  has strictly-increasing, unique `seq` numbers across event kinds. Until
+  then the machine's per-instance counter is provisional and test-scoped.
+- **`to_dict()` nested isolation.** A shallow `dict(self.detail)` copy let
+  mutations of the serialized result leak back into the event; `frozen=True`
+  freezes the field binding, not the dict it points at. Resolved: `to_dict()`
+  deep-copies `detail`, covered by
+  `test_loop_event_to_dict_defensively_copies_nested_detail`. JSON-content
+  validation of `detail` values remains the step-8 (record/replay) obligation.
+
 ---
 
 ### Step 5 — `AgentLoop.tick()` + `run()` (loop.py, report.py)

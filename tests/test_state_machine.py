@@ -339,6 +339,19 @@ def test_loop_event_to_dict_is_json_round_trippable():
     assert d["detail"] == {"zone": "health_bar", "present": True, "attempt": 2}
 
 
+def test_loop_event_to_dict_defensively_copies_nested_detail():
+    ev = make_event(detail={"zone": "health_bar", "nested": {"present": True}})
+    d = ev.to_dict()
+    # Mutating the serialized result must not leak back into the event —
+    # neither at the top level nor through nested containers (deep-copy
+    # isolation), even though the dataclass itself is frozen.
+    d["detail"]["nested"]["present"] = False
+    d["detail"]["injected"] = "mutated"
+    assert ev.detail == {"zone": "health_bar", "nested": {"present": True}}
+    # A fresh serialization still yields the original nested values.
+    assert ev.to_dict()["detail"]["nested"] == {"present": True}
+
+
 def test_machine_event_seq_is_0_based_and_monotonic():
     events: list[LoopEvent] = []
     m, pol = make({SIGNAL_HEALTH_LOW: True}, on_transition=events.append)

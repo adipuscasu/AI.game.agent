@@ -18,18 +18,24 @@ Design notes:
   coercion to an unknown value is impossible (``EventType("bogus")`` raises).
 * :class:`LoopEvent` is a frozen dataclass (immutable, hashable) so an event
   is a value that can be logged, replayed, and compared without mutation.
-* ``seq`` is 0-based and assigned by the machine that emits the event — not
-  by the receiving callback — so the machine owns a well-defined session
-  sequence.
-* ``detail`` is always a ``dict[str, JSON-compatible]``; ``to_dict()`` yields
-  a plain, ``json.dumps``-able mapping (enums as their string values).
+* ``seq`` ownership (plan-internal, resolved): this step follows the
+  step-4 contract bullet — 0-based, monotonically increasing *per machine
+  instance*, assigned by the machine, not the callback. The plan's global
+  note and the §4.2 sketch assign *session-wide* sequencing to the agent
+  loop (step 5), which owns the authoritative, session-wide sequence across
+  all event kinds; the machine's per-instance counter is provisional and
+  test-scoped until then.
+* ``detail`` is always a ``dict[str, JSON-compatible]``; ``to_dict()``
+  yields a plain, ``json.dumps``-able mapping (enums as their string
+  values). Validating that ``detail`` values are in fact JSON-compatible
+  is the step-8 record/replay obligation, not step 4's.
 """
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
 
 from ai_game_agent.state.states import AgentState
 
@@ -63,7 +69,10 @@ class LoopEvent:
     """One immutable, append-only event in the session audit trail.
 
     ``ts``      — monotonic-safe epoch seconds (injected clock; deterministic).
-    ``seq``     — 0-based, per-machine session sequence (assigned by the machine).
+    ``seq``     — 0-based, monotonically increasing per machine instance
+                  (assigned by the machine); session-wide authoritative
+                  sequencing is owned by the agent loop (step 5 — see the
+                  module docstring).
     ``event``   — the closed :class:`EventType`.
     ``state_before`` / ``state_after`` — the transition endpoints; either may
                   be ``None`` (e.g. a ``TICK`` with no state change, or a
@@ -81,11 +90,15 @@ class LoopEvent:
     reason: str
     detail: dict[str, object] = field(default_factory=dict)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         """A plain, ``json.dumps``-able mapping of this event.
 
-        Enums are rendered as their string values so the result round-trips
-        through JSON unchanged (``json.loads(json.dumps(ev.to_dict()))``).
+        ``detail`` is deep-copied: mutating the returned mapping (top level
+        or nested) never leaks back into the event — closing the gap
+        ``frozen=True`` cannot cover, since it freezes the field binding, not
+        the dict the field points at. Enums are rendered as their string
+        values so the result round-trips through JSON unchanged
+        (``json.loads(json.dumps(ev.to_dict()))``).
         """
         return {
             "ts": self.ts,
@@ -94,5 +107,5 @@ class LoopEvent:
             "state_before": None if self.state_before is None else self.state_before.value,
             "state_after": None if self.state_after is None else self.state_after.value,
             "reason": self.reason,
-            "detail": dict(self.detail),
+            "detail": deepcopy(self.detail),
         }
