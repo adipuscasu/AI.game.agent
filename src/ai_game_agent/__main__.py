@@ -65,6 +65,7 @@ from ai_game_agent.actions.action import Action
 from ai_game_agent.actions.base import create_backend
 from ai_game_agent.actions.executor import Executor
 from ai_game_agent.actions.modes import OperationMode
+from ai_game_agent.agent import AgentLoop
 from ai_game_agent.capture import Capture, CaptureError, FpsMeter, save_frame
 from ai_game_agent.config import (
     CaptureConfig,
@@ -74,7 +75,9 @@ from ai_game_agent.config import (
     Region,
     load_config,
 )
+from ai_game_agent.games.wow import DeterministicPolicy
 from ai_game_agent.perception import Perception, PerceptionError
+from ai_game_agent.state import GameStateMachine
 
 # NB: the detector *implementation* modules are NOT imported at module top.
 # __main__.py must stay importable — and `perception.enabled: false` must
@@ -111,9 +114,7 @@ def _setup_logging(config: Config) -> None:
         h.close()
 
     handler = logging.FileHandler(log_dir / "agent.log", encoding="utf-8")
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logger.addHandler(handler)
     logger.propagate = False
 
@@ -178,12 +179,8 @@ def _build_capture(
             region=region if region is not None else ccfg.region,
             fps=args.fps if args.fps is not None else ccfg.fps,
             scale=scale if scale is not None else ccfg.scale,
-            record_enabled=(
-                ccfg.record_enabled if record_enabled is None else record_enabled
-            ),
-            record_directory=(
-                str(record_dir) if record_dir is not None else ccfg.record_directory
-            ),
+            record_enabled=(ccfg.record_enabled if record_enabled is None else record_enabled),
+            record_directory=(str(record_dir) if record_dir is not None else ccfg.record_directory),
             record_max_files=(
                 ccfg.record_max_files if record_max_files is None else record_max_files
             ),
@@ -320,9 +317,7 @@ def _build_perception(args: argparse.Namespace, cfg) -> Perception:
         from ai_game_agent.perception.ocr import TesseractEngine
 
         ocr_engine = TesseractEngine()
-    object_colors = (
-        list(perception.object_colors) if perception.objects_enabled else []
-    )
+    object_colors = list(perception.object_colors) if perception.objects_enabled else []
     if getattr(args, "no_objects", False):
         object_colors = []
     object_detector = None
@@ -386,7 +381,9 @@ def _analyze(args: argparse.Namespace, cfg: Config) -> int:
     print(text)
     log.info(
         "analyze: frame=%dx%d detector_errors=%d",
-        frame.width, frame.height, len(observation.detector_errors),
+        frame.width,
+        frame.height,
+        len(observation.detector_errors),
     )
     return 0
 
@@ -446,12 +443,10 @@ def _load_script(path: str | Path) -> list[Action]:
         results = data.get("results")
         if not isinstance(results, list):
             raise ActionError(
-                "act: a --script JSON object must carry a 'results' list "
-                "(ActionLog shape)"
+                "act: a --script JSON object must carry a 'results' list (ActionLog shape)"
             )
         raw_actions = [
-            r.get("action") if isinstance(r, dict) and "action" in r else r
-            for r in results
+            r.get("action") if isinstance(r, dict) and "action" in r else r for r in results
         ]
     else:
         raise ActionError(
@@ -659,33 +654,32 @@ def _parse_action_args(spec: str | None) -> list[Action]:
             actions.append(Action(kind=ActionKind.KEY_PRESS, key=rest.strip()))
         elif head == "hold":
             key, _, ms = rest.partition(":")
-            actions.append(Action(kind=ActionKind.KEY_HOLD, key=key.strip(),
-                                  duration_ms=int(ms or 0)))
+            actions.append(
+                Action(kind=ActionKind.KEY_HOLD, key=key.strip(), duration_ms=int(ms or 0))
+            )
         elif head == "move":
             x, _, y = rest.partition(",")
-            actions.append(Action(kind=ActionKind.MOUSE_MOVE,
-                                  x=int(x), y=int(y)))
+            actions.append(Action(kind=ActionKind.MOUSE_MOVE, x=int(x), y=int(y)))
         elif head == "click":
             button, _, clicks = rest.partition(":")
-            actions.append(Action(kind=ActionKind.MOUSE_CLICK,
-                                  button=button.strip() or "left",
-                                  clicks=int(clicks or 1)))
+            actions.append(
+                Action(
+                    kind=ActionKind.MOUSE_CLICK,
+                    button=button.strip() or "left",
+                    clicks=int(clicks or 1),
+                )
+            )
         elif head == "down":
-            actions.append(Action(kind=ActionKind.MOUSE_DOWN,
-                                  button=rest.strip() or "left"))
+            actions.append(Action(kind=ActionKind.MOUSE_DOWN, button=rest.strip() or "left"))
         elif head == "up":
-            actions.append(Action(kind=ActionKind.MOUSE_UP,
-                                  button=rest.strip() or "left"))
+            actions.append(Action(kind=ActionKind.MOUSE_UP, button=rest.strip() or "left"))
         elif head == "scroll":
-            actions.append(Action(kind=ActionKind.MOUSE_SCROLL,
-                                  scroll=int(rest or 0)))
+            actions.append(Action(kind=ActionKind.MOUSE_SCROLL, scroll=int(rest or 0)))
         elif head == "delay":
-            actions.append(Action(kind=ActionKind.DELAY,
-                                  duration_ms=int(rest or 0)))
+            actions.append(Action(kind=ActionKind.DELAY, duration_ms=int(rest or 0)))
         else:
             raise ValueError(
-                f"act: unknown --do kind {head!r} "
-                "(use key/hold/move/click/down/up/scroll/delay)"
+                f"act: unknown --do kind {head!r} (use key/hold/move/click/down/up/scroll/delay)"
             )
     return actions
 
@@ -695,27 +689,37 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     p_cap = sub.add_parser("capture", help="Grab one screenshot and save it as PNG.")
-    p_cap.add_argument("--backend", default=None,
-                       help="capture backend (mss | mock); default from config")
-    p_cap.add_argument("--monitor", default=None,
-                       help="mss monitor index: 1=primary (default), 2+=secondary, 0=all")
+    p_cap.add_argument(
+        "--backend", default=None, help="capture backend (mss | mock); default from config"
+    )
+    p_cap.add_argument(
+        "--monitor",
+        default=None,
+        help="mss monitor index: 1=primary (default), 2+=secondary, 0=all",
+    )
     p_cap.add_argument("--region", default=None, help="x,y,width,height (integers)")
     p_cap.add_argument("--scale", default=None, help="downscale factor (e.g. 0.5)")
     p_cap.add_argument("--out", default="screenshots", help="output directory")
-    p_cap.add_argument("--fps", type=int, default=None,
-                       help="0 = no pacing; default from config (30)")
     p_cap.add_argument(
-        "--config", default=None,
+        "--fps", type=int, default=None, help="0 = no pacing; default from config (30)"
+    )
+    p_cap.add_argument(
+        "--config",
+        default=None,
         help="YAML config file (default: config/default.yaml); "
-             "provides defaults for --backend/--region/--scale/--fps/--monitor",
+        "provides defaults for --backend/--region/--scale/--fps/--monitor",
     )
     p_cap.set_defaults(func=_capture)
 
     p_obs = sub.add_parser("observe", help="Run a capture loop and print measured FPS.")
-    p_obs.add_argument("--backend", default=None,
-                       help="capture backend (mss | mock); default from config")
-    p_obs.add_argument("--monitor", default=None,
-                       help="mss monitor index: 1=primary (default), 2+=secondary, 0=all")
+    p_obs.add_argument(
+        "--backend", default=None, help="capture backend (mss | mock); default from config"
+    )
+    p_obs.add_argument(
+        "--monitor",
+        default=None,
+        help="mss monitor index: 1=primary (default), 2+=secondary, 0=all",
+    )
     p_obs.add_argument("--region", default=None, help="x,y,width,height (integers)")
     p_obs.add_argument("--scale", default=None, help="downscale factor (e.g. 0.5)")
     p_obs.add_argument("--frames", type=int, default=30)
@@ -724,30 +728,45 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="0 = no pacing (headless/CI); otherwise a ceiling, not a guarantee. "
-             "Default from config (30)",
+        "Default from config (30)",
     )
     # Both flags share the ``record`` destination (store_const True/False,
     # default None) so argparse applies them in command-line order: the
     # last flag wins, and a missing pair falls back to the config.
-    p_obs.add_argument("--record", dest="record", action="store_const",
-                       const=True, default=None,
-                       help="write each frame to --out"
-                            " (default: capture.record.enabled from config)")
-    p_obs.add_argument("--no-record", dest="record", action="store_const",
-                       const=False, default=None,
-                       help="do not record for this run, even if the config "
-                            "enables capture.record.enabled")
-    p_obs.add_argument("--record-max-files", type=int, default=None,
-                       help="max frames to keep before rotation"
-                            " (default: capture.record.max_files from config, 1000)")
-    p_obs.add_argument("--out", default=None,
-                       help="output directory"
-                            " (default: capture.record.directory from config, else recordings)")
     p_obs.add_argument(
-        "--config", default=None,
+        "--record",
+        dest="record",
+        action="store_const",
+        const=True,
+        default=None,
+        help="write each frame to --out (default: capture.record.enabled from config)",
+    )
+    p_obs.add_argument(
+        "--no-record",
+        dest="record",
+        action="store_const",
+        const=False,
+        default=None,
+        help="do not record for this run, even if the config enables capture.record.enabled",
+    )
+    p_obs.add_argument(
+        "--record-max-files",
+        type=int,
+        default=None,
+        help="max frames to keep before rotation"
+        " (default: capture.record.max_files from config, 1000)",
+    )
+    p_obs.add_argument(
+        "--out",
+        default=None,
+        help="output directory (default: capture.record.directory from config, else recordings)",
+    )
+    p_obs.add_argument(
+        "--config",
+        default=None,
         help="YAML config file (default: config/default.yaml); "
-             "provides defaults for --backend/--region/--scale/--fps/--monitor"
-             "/--record/--record-max-files/--no-record",
+        "provides defaults for --backend/--region/--scale/--fps/--monitor"
+        "/--record/--record-max-files/--no-record",
     )
     p_obs.set_defaults(func=_observe)
 
@@ -755,68 +774,221 @@ def build_parser() -> argparse.ArgumentParser:
         "act",
         help="Execute one or more input actions through the Executor (Phase 3).",
     )
-    p_act.add_argument("--do", action="append",
-                       help="action spec (repeatable; ';'-separated for a batch): "
-                            "key:a | hold:a:100 | move:100,200 | click:left:1 | "
-                            "down:left | up:left | scroll:3 | delay:200")
-    p_act.add_argument("--script", default=None,
-                       help="JSON file of actions to replay (a list of action "
-                            "dicts, or an ActionLog as written by --record); "
-                            "used when --do is absent")
-    p_act.add_argument("--demo", action="store_true",
-                       help="run the built-in full-contract demo (all 8 action "
-                            "kinds; default when --do is absent)")
-    p_act.add_argument("--mode", default=None,
-                       choices=["observe_only", "assisted", "semi_autonomous",
-                                "autonomous"],
-                       help="operation mode (default: input.mode from config, "
-                            "observe_only)")
-    p_act.add_argument("--backend", default=None,
-                       help="input backend (mock | windows); default from config")
-    p_act.add_argument("--record", action="store_true",
-                       help="record the ActionLog to --record-dir (default: "
-                            "off)")
-    p_act.add_argument("--record-dir", default=None,
-                       help="directory for recorded ActionLog JSON (default: "
-                            "recordings)")
-    p_act.add_argument("--confirm", action="store_true",
-                       help="required for --backend windows in non-observe_only "
-                            "modes (no-op for mock)")
-    p_act.add_argument("--pretty", action="store_true",
-                       help="pretty-print the JSON result")
     p_act.add_argument(
-        "--config", default=None,
+        "--do",
+        action="append",
+        help="action spec (repeatable; ';'-separated for a batch): "
+        "key:a | hold:a:100 | move:100,200 | click:left:1 | "
+        "down:left | up:left | scroll:3 | delay:200",
+    )
+    p_act.add_argument(
+        "--script",
+        default=None,
+        help="JSON file of actions to replay (a list of action "
+        "dicts, or an ActionLog as written by --record); "
+        "used when --do is absent",
+    )
+    p_act.add_argument(
+        "--demo",
+        action="store_true",
+        help="run the built-in full-contract demo (all 8 action "
+        "kinds; default when --do is absent)",
+    )
+    p_act.add_argument(
+        "--mode",
+        default=None,
+        choices=["observe_only", "assisted", "semi_autonomous", "autonomous"],
+        help="operation mode (default: input.mode from config, observe_only)",
+    )
+    p_act.add_argument(
+        "--backend", default=None, help="input backend (mock | windows); default from config"
+    )
+    p_act.add_argument(
+        "--record", action="store_true", help="record the ActionLog to --record-dir (default: off)"
+    )
+    p_act.add_argument(
+        "--record-dir",
+        default=None,
+        help="directory for recorded ActionLog JSON (default: recordings)",
+    )
+    p_act.add_argument(
+        "--confirm",
+        action="store_true",
+        help="required for --backend windows in non-observe_only modes (no-op for mock)",
+    )
+    p_act.add_argument("--pretty", action="store_true", help="pretty-print the JSON result")
+    p_act.add_argument(
+        "--config",
+        default=None,
         help="YAML config file (default: config/default.yaml); "
-             "provides defaults for --backend/--mode and the safety bounds",
+        "provides defaults for --backend/--mode and the safety bounds",
     )
     p_act.set_defaults(func=_act)
 
     p_an = sub.add_parser(
         "analyze", help="Capture one frame and print the perception Observation as JSON."
     )
-    p_an.add_argument("--backend", default=None,
-                      help="capture backend (mss | mock); default from config")
-    p_an.add_argument("--monitor", default=None,
-                      help="mss monitor index: 1=primary (default), 2+=secondary, 0=all")
+    p_an.add_argument(
+        "--backend", default=None, help="capture backend (mss | mock); default from config"
+    )
+    p_an.add_argument(
+        "--monitor",
+        default=None,
+        help="mss monitor index: 1=primary (default), 2+=secondary, 0=all",
+    )
     p_an.add_argument("--region", default=None, help="x,y,width,height (integers)")
     p_an.add_argument("--scale", default=None, help="downscale factor (e.g. 0.5)")
-    p_an.add_argument("--fps", type=int, default=None,
-                      help="0 = no pacing; default from config (30)")
     p_an.add_argument(
-        "--config", default=None,
+        "--fps", type=int, default=None, help="0 = no pacing; default from config (30)"
+    )
+    p_an.add_argument(
+        "--config",
+        default=None,
         help="YAML config file (default: config/default.yaml)",
     )
-    p_an.add_argument("--no-templates", action="store_true",
-                      help="disable template matching AND UI-zone checks "
-                           "(they share one flag; see docs/phase-2-implementation-plan.md §5.2)")
+    p_an.add_argument(
+        "--no-templates",
+        action="store_true",
+        help="disable template matching AND UI-zone checks "
+        "(they share one flag; see docs/phase-2-implementation-plan.md §5.2)",
+    )
     p_an.add_argument("--no-ocr", action="store_true", help="disable OCR")
     p_an.add_argument(
-        "--no-objects", action="store_true",
+        "--no-objects",
+        action="store_true",
         help="disable color-blob object detection",
     )
     p_an.add_argument("--pretty", action="store_true", help="pretty-print JSON output")
     p_an.set_defaults(func=_analyze)
+
+    p_run = sub.add_parser(
+        "run",
+        help="Run the observe-decide-act loop (Phase 4) and print the report as JSON.",
+    )
+    p_run.add_argument("--once", action="store_true",
+                       help="run exactly one tick then stop (== --max-ticks 1)")
+    p_run.add_argument("--max-ticks", type=int, default=None,
+                       help="stop after N ticks (default: run until stop/PAUSED)")
+    p_run.add_argument("--mode", default=None,
+                       choices=["observe_only", "assisted", "semi_autonomous",
+                                "autonomous"],
+                       help="operation mode (default: input.mode from config, "
+                            "observe_only)")
+    p_run.add_argument("--backend", default=None,
+                       help="input backend (mock | windows); capture backend "
+                            "(default: config)")
+    p_run.add_argument("--confirm", action="store_true",
+                       help="required for --backend windows in non-observe_only "
+                            "modes (no-op for mock)")
+    p_run.add_argument("--record", action="store_true",
+                       help="record each frame to --record-dir (default: off)")
+    p_run.add_argument("--record-dir", default=None,
+                       help="directory for recorded frames (default: recordings)")
+    p_run.add_argument("--no-templates", action="store_true",
+                       help="disable template matching AND UI-zone checks")
+    p_run.add_argument("--no-ocr", action="store_true", help="disable OCR")
+    p_run.add_argument("--no-objects", action="store_true",
+                       help="disable color-blob object detection")
+    p_run.add_argument("--pretty", action="store_true",
+                       help="pretty-print the report JSON")
+    p_run.add_argument(
+        "--config", default=None,
+        help="YAML config file (default: config/default.yaml)",
+    )
+    p_run.set_defaults(func=_run)
     return parser
+
+
+def _build_agent(cfg: Config):
+    """Assemble the game-agnostic loop collaborators for the ``run`` subcommand.
+
+    The loop itself is game-agnostic (Phase 4 §4.4); the game *adapter*
+    (``ai_game_agent.games.wow``) supplies the :class:`StatePolicy`.
+    ``DeterministicPolicy.from_config`` reads the ``agent:`` block straight
+    through (§4.5) and the :class:`GameStateMachine` uses its default
+    ``IDLE`` start + bounded RECOVERY, so a fresh config is all the loop needs.
+
+    Returns:
+        The ``(machine, policy)`` pair the :class:`AgentLoop` takes.
+    """
+    policy = DeterministicPolicy.from_config(cfg)
+    machine = GameStateMachine(policy=policy, recovery_attempts=3)
+    return machine, policy
+
+
+def _run(args: argparse.Namespace, cfg: Config) -> int:
+    """Run the observe-decide-act loop and print the report as JSON.
+
+    Mode / backend precedence mirrors ``act``: ``--mode`` > ``cfg.input.mode``
+    > ``observe_only``; ``--backend`` > ``cfg.input.backend``. The Phase-3
+    ``--confirm`` policy gate still fires for the ``windows`` backend in a
+    non-observe mode *before* the backend is built. ``--once`` is a
+    ``--max-ticks 1`` alias.
+    """
+    from ai_game_agent.actions.modes import OperationMode
+
+    mode = OperationMode(getattr(args, "mode", None) or cfg.input.mode)
+    backend_name = getattr(args, "backend", None) or cfg.input.backend
+
+    # --confirm policy gate (mirrors _act): the real-OS-input backend in an
+    # input-enabled mode requires explicit acknowledgment. It fires before the
+    # backend is built, so a missing pynput can never mask the missing gate,
+    # and it is exempt for OBSERVE_ONLY.
+    if (
+        backend_name.strip().lower() == "windows"
+        and mode is not OperationMode.OBSERVE_ONLY
+        and not getattr(args, "confirm", False)
+    ):
+        raise ActionError(
+            "run: the 'windows' backend in a non-observe_only mode emits real "
+            "OS input and requires --confirm to acknowledge; pass --confirm, "
+            "or use --mode observe_only / --backend mock"
+        )
+
+    perception = _build_perception(args, cfg)
+    # The run subcommand has no --fps/--scale/--monitor capture flags: seed
+    # the Namespace with None sentinels so _build_capture falls back to the
+    # config values (the same pattern _capture/_analyze use).
+    if not hasattr(args, "fps"):
+        args.fps = None
+    if not hasattr(args, "scale"):
+        args.scale = None
+    if not hasattr(args, "monitor"):
+        args.monitor = None
+    cap = _build_capture(
+        cfg,
+        args,
+        record_enabled=getattr(args, "record", False),
+        record_dir=getattr(args, "record_dir", None) or "recordings",
+        record_max_files=1000,
+    )
+    executor, _backend = _build_executor(cfg, backend_name, mode)
+    machine, policy = _build_agent(cfg)
+
+    max_ticks = 1 if getattr(args, "once", False) else getattr(args, "max_ticks", None)
+    if max_ticks is not None and int(max_ticks) < 1:
+        raise ValueError("--max-ticks must be >= 1")
+    loop = AgentLoop(
+        capture=cap,
+        perception=perception,
+        executor=executor,
+        machine=machine,
+        policy=policy,
+        mode=mode,
+        max_ticks=int(max_ticks) if max_ticks is not None else None,
+    )
+    report = loop.run()
+    text = json.dumps(report.to_dict(), sort_keys=True)
+    print(text)
+    log.info(
+        "run: ticks=%d state=%s reason=%s actions=%d/%d",
+        report.ticks,
+        report.final_state.value,
+        report.stopped_reason,
+        report.actions_ok,
+        report.actions_attempted,
+    )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
