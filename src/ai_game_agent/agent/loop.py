@@ -43,6 +43,7 @@ from dataclasses import replace as _replace
 
 from ai_game_agent.actions.action import Action, ActionResult
 from ai_game_agent.actions.executor import Executor
+from ai_game_agent.actions.hotkey import HotkeyListener
 from ai_game_agent.actions.modes import OperationMode
 from ai_game_agent.agent.report import AgentLoopReport
 from ai_game_agent.capture import CaptureError
@@ -99,6 +100,7 @@ class AgentLoop:
         max_ticks: int | None,
         now_fn: Callable[[], float] = time.time,
         stop_event: threading.Event | None = None,
+        hotkey: HotkeyListener | None = None,
         on_event: Callable[[LoopEvent], None] | None = None,
     ) -> None:
         if max_ticks is not None and max_ticks < 1:
@@ -112,6 +114,7 @@ class AgentLoop:
         self._max_ticks = max_ticks
         self._now = now_fn
         self._stop_event = stop_event
+        self._hotkey = hotkey
         self._on_event = on_event
         # Report accumulators (so a lone tick() also works, not just run()).
         self._seq = 0
@@ -289,20 +292,34 @@ class AgentLoop:
     def run(self) -> AgentLoopReport:
         """Blocking loop: grab -> observe -> decide -> act, until stop/limit.
 
-        Exits on: ``stop_event`` pre-set (``"stop_requested"``),
+        Exits on: ``executor.stopped`` (``"emergency_stop"`` — highest
+        priority), ``stop_event`` pre-set (``"stop_requested"``),
         ``max_ticks`` reached (``"max_ticks"``), the machine entering
         ``PAUSED`` (``"paused"``), or a capture-start failure
         (``"capture_start_failed"``). ``capture.stop()`` runs in ``finally``
         on every path; ``executor.release_all()`` is called as belt-and-braces
         before capture stops, and one cleanup failure cannot skip the other.
+
+        When a ``hotkey`` listener is provided it is armed before the loop
+        starts and disarmed in ``finally`` after ``capture.stop()``; a trigger
+        during the loop sets the ``stop_event`` and fires the executor's
+        emergency stop, so the loop exits on its next ``executor.stopped``
+        check with ``stopped_reason == "emergency_stop"``.
         """
         self._reset_report()
         try:
             self._capture.start()
         except Exception:  # noqa: BLE001 - can't start: hard stop, report it
             return self._finish_report("capture_start_failed")
+        if self._hotkey is not None:
+            self._hotkey.arm()
         try:
             while True:
+                # emergency_stop has highest priority: the executor owns the
+                # stop; the loop only observes and reports.
+                if self._executor.stopped:
+                    self._stopped_reason = "emergency_stop"
+                    break
                 if self._stop_event is not None and self._stop_event.is_set():
                     self._stopped_reason = "stop_requested"
                     break
@@ -319,6 +336,11 @@ class AgentLoop:
             except Exception:  # noqa: BLE001 - belt-and-braces; must not mask the stop
                 pass
         finally:
+            if self._hotkey is not None:
+                try:
+                    self._hotkey.disarm()
+                except Exception:  # noqa: BLE001 - disarm must not mask capture.stop
+                    pass
             try:
                 self._capture.stop()
             except Exception:  # noqa: BLE001 - one cleanup failure must not skip this
