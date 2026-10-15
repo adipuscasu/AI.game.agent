@@ -102,6 +102,7 @@ class AgentLoop:
         stop_event: threading.Event | None = None,
         hotkey: HotkeyListener | None = None,
         on_event: Callable[[LoopEvent], None] | None = None,
+        recorder: Callable[[LoopEvent], None] | None = None,
     ) -> None:
         if max_ticks is not None and max_ticks < 1:
             raise ValueError("max_ticks must be >= 1 or None")
@@ -116,6 +117,7 @@ class AgentLoop:
         self._stop_event = stop_event
         self._hotkey = hotkey
         self._on_event = on_event
+        self._recorder = recorder
         # Report accumulators (so a lone tick() also works, not just run()).
         self._seq = 0
         self._ticks = 0
@@ -139,9 +141,11 @@ class AgentLoop:
         return self._seq
 
     def _emit(self, event: LoopEvent) -> None:
-        """Fan one event out to the subscriber (if any)."""
+        """Fan one event out to the subscriber and the recorder (if any)."""
         if self._on_event is not None:
             self._on_event(event)
+        if self._recorder is not None:
+            self._recorder(event)
 
     def _event(
         self,

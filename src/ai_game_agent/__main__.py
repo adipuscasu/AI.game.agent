@@ -896,6 +896,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="YAML config file (default: config/default.yaml)",
     )
     p_run.set_defaults(func=_run)
+
+    p_replay = sub.add_parser(
+        "replay",
+        help="Replay a recorded .jsonl event log and re-derive the state sequence.",
+    )
+    p_replay.add_argument("log_file",
+                          help="path to the .jsonl event log to replay")
+    p_replay.add_argument("--config", default=None,
+                          help="YAML config file (default: config/default.yaml)")
+    p_replay.set_defaults(func=_replay)
     return parser
 
 
@@ -968,6 +978,20 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
     max_ticks = 1 if getattr(args, "once", False) else getattr(args, "max_ticks", None)
     if max_ticks is not None and int(max_ticks) < 1:
         raise ValueError("--max-ticks must be >= 1")
+    # Record events to a .jsonl file when --record is set (one line per
+    # LoopEvent, via the loop's recorder hook). The file is named after the
+    # run timestamp so multiple recordings don't collide.
+    recorder = None
+    if getattr(args, "record", False):
+        rec_dir = Path(getattr(args, "record_dir", None) or "recordings")
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        import time as _t
+        stamp = _t.strftime("%Y%m%d-%H%M%S")
+        rec_path = rec_dir / f"run-{stamp}.jsonl"
+        rec_file = rec_path.open("a", encoding="utf-8")
+        def recorder(event):
+            rec_file.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
+            rec_file.flush()
     loop = AgentLoop(
         capture=cap,
         perception=perception,
@@ -976,6 +1000,7 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         policy=policy,
         mode=mode,
         max_ticks=int(max_ticks) if max_ticks is not None else None,
+        recorder=recorder,
     )
     report = loop.run()
     text = json.dumps(report.to_dict(), sort_keys=True)
@@ -988,6 +1013,97 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         report.actions_ok,
         report.actions_attempted,
     )
+    return 0
+
+
+def _replay(args: argparse.Namespace, cfg: Config) -> int:
+    """Replay a recorded ``.jsonl`` event log through the same machine+policy.
+
+    The plan §Step-8 contract: read the ``.jsonl``, feed the recorded
+    *observations* (zone values carried in the TICK events) back through
+    ``machine.decide()`` with the same policy, and assert the **same** state
+    sequence as the original run.
+
+    The replay does not re-capture or re-perceive; it reads the recorded
+    events, reconstructs the zone signals from each TICK's ``detail.zones``,
+    builds an :class:`Observation`, and drives the machine.
+
+    Output (stdout): a JSON report with ``states`` (the replayed state
+    sequence), ``matched`` (whether it equals the original), and ``ticks``
+    (the number of replayed ticks).
+    """
+    import datetime as _dt
+    import json as _json
+
+    log_path = Path(args.log_file)
+    if not log_path.exists():
+        raise ActionError(f"replay: log file not found: {log_path}")
+
+    events = []
+    with log_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                events.append(_json.loads(line))
+
+    # Reconstruct the observation for each TICK event and drive the machine.
+    from ai_game_agent.games.wow import DeterministicPolicy
+    from ai_game_agent.perception import BBox, Observation, UiZoneHit
+    from ai_game_agent.state import GameStateMachine
+
+    policy = DeterministicPolicy.from_config(cfg)
+    machine = GameStateMachine(policy=policy, recovery_attempts=3)
+
+    original_states: list[str] = []
+    replayed_states: list[str] = []
+    ticks = 0
+
+    for ev in events:
+        if ev.get("event") != "tick":
+            continue
+        ticks += 1
+        # Reconstruct the Observation from the recorded zones.
+        detail = ev.get("detail") or {}
+        zones = detail.get("zones") or {}
+        ui_hits: list[UiZoneHit] = []
+        for zone_name, value in zones.items():
+            ui_hits.append(
+                UiZoneHit(
+                    zone=zone_name,
+                    check="presence",
+                    bbox=BBox(0, 0, 1, 1),
+                    value=float(value),
+                )
+            )
+        # Observation requires all fields; use minimal valid values for the
+        # non-zone fields (the machine only cares about ui_zones for its
+        # transition_signals).
+        obs = Observation(
+            frame_width=1,
+            frame_height=1,
+            captured_at=_dt.datetime.now(_dt.UTC),
+            source="replay",
+            templates=(),
+            ui_zones=tuple(ui_hits),
+            text_regions=(),
+            objects=(),
+            detector_errors=(),
+        )
+        # Record the original state for this tick (from the event).
+        orig_state = ev.get("state_after")
+        if orig_state is not None:
+            original_states.append(orig_state)
+        # Drive the replay machine.
+        machine.decide(obs, now=ev.get("ts", 0.0))
+        replayed_states.append(machine.state.value)
+
+    report = {
+        "states": replayed_states,
+        "original_states": original_states,
+        "matched": original_states == replayed_states,
+        "ticks": ticks,
+    }
+    print(_json.dumps(report, sort_keys=True))
     return 0
 
 
