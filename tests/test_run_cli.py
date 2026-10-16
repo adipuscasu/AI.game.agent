@@ -207,3 +207,56 @@ def test_run_windows_non_observe_requires_confirm(tmp_path) -> None:
         ]
     )
     assert rc != 0
+
+
+# --- --pretty (Phase 4 close-out) --------------------------------------------
+
+
+def test_run_once_pretty_prints_multiline_json(tmp_path, capsys) -> None:
+    """``--pretty`` renders the AgentLoopReport JSON indented (multi-line),
+    honoring the same convention as ``analyze --pretty`` / ``act --pretty``.
+    """
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    rc = main(
+        [
+            "run",
+            "--once",
+            "--backend",
+            "mock",
+            "--mode",
+            "observe_only",
+            "--config",
+            cfg,
+            "--pretty",
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    lines = out.splitlines()
+    assert len(lines) > 1, "pretty output should be multi-line indented JSON"
+    # Still valid JSON, and the report contract holds.
+    report = json.loads(out)
+    assert report["ticks"] == 1
+
+
+def test_run_once_default_compact_json_single_line(tmp_path, capsys) -> None:
+    """Without ``--pretty`` the report stays compact single-line JSON
+    (the existing default the e2e/replay tooling parses)."""
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    rc = main(
+        [
+            "run",
+            "--once",
+            "--backend",
+            "mock",
+            "--mode",
+            "observe_only",
+            "--config",
+            cfg,
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    assert "\n" not in out, "compact JSON should be a single line"
+    report = json.loads(out)
+    assert report["ticks"] == 1

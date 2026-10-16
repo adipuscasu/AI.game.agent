@@ -25,10 +25,7 @@ import json
 import textwrap
 from pathlib import Path
 
-import pytest
-
 from ai_game_agent.__main__ import main
-import ai_game_agent.__main__ as cli
 
 _OBSERVE_CONFIG = textwrap.dedent(
     """\
@@ -107,7 +104,8 @@ def test_replay_subcommand_exists() -> None:
     """The ``replay`` subcommand is registered (not 'invalid choice')."""
     # Just verify it's a valid subcommand: `replay --help` should not fail
     # with "invalid choice".
-    import subprocess, sys
+    import subprocess
+    import sys
 
     proc = subprocess.run(
         [sys.executable, "-m", "ai_game_agent", "replay", "--help"],

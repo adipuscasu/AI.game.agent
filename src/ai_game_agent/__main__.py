@@ -915,14 +915,20 @@ def _build_agent(cfg: Config):
     The loop itself is game-agnostic (Phase 4 §4.4); the game *adapter*
     (``ai_game_agent.games.wow``) supplies the :class:`StatePolicy`.
     ``DeterministicPolicy.from_config`` reads the ``agent:`` block straight
-    through (§4.5) and the :class:`GameStateMachine` uses its default
-    ``IDLE`` start + bounded RECOVERY, so a fresh config is all the loop needs.
+    through (§4.5); the :class:`GameStateMachine` starts in ``IDLE`` and takes
+    its bounded-recovery budget + watchdog timeout from the same ``agent:``
+    block (``recovery_attempts`` / ``state_timeout_s``), so a fresh config is
+    all the loop needs.
 
     Returns:
         The ``(machine, policy)`` pair the :class:`AgentLoop` takes.
     """
     policy = DeterministicPolicy.from_config(cfg)
-    machine = GameStateMachine(policy=policy, recovery_attempts=3)
+    machine = GameStateMachine(
+        policy=policy,
+        recovery_attempts=cfg.agent.recovery_attempts,
+        state_timeout_s=cfg.agent.state_timeout_s,
+    )
     return machine, policy
 
 
@@ -1003,7 +1009,10 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         recorder=recorder,
     )
     report = loop.run()
-    text = json.dumps(report.to_dict(), sort_keys=True)
+    if getattr(args, "pretty", False):
+        text = json.dumps(report.to_dict(), indent=2)
+    else:
+        text = json.dumps(report.to_dict(), sort_keys=True)
     print(text)
     log.info(
         "run: ticks=%d state=%s reason=%s actions=%d/%d",
@@ -1052,7 +1061,13 @@ def _replay(args: argparse.Namespace, cfg: Config) -> int:
     from ai_game_agent.state import GameStateMachine
 
     policy = DeterministicPolicy.from_config(cfg)
-    machine = GameStateMachine(policy=policy, recovery_attempts=3)
+    # Mirror the live run's machine knobs so the replay reproduces the same
+    # bounded-recovery budget + watchdog timeout as the recorded session.
+    machine = GameStateMachine(
+        policy=policy,
+        recovery_attempts=cfg.agent.recovery_attempts,
+        state_timeout_s=cfg.agent.state_timeout_s,
+    )
 
     original_states: list[str] = []
     replayed_states: list[str] = []

@@ -120,3 +120,9 @@ agent:
   recovery_delay_ms: 300
   health_low: 0.30
   health_recovered: 0.50
+  # Loop knobs (Phase 4 close-out) — read by GameStateMachine on both the live
+  # `run` and the `replay` path. state_timeout_s: watchdog, max seconds in a
+  # non-terminal state. recovery_attempts: bounded recovery budget before
+  # PAUSED. Both are validated (positive, bool rejected); defaults match code.
+  state_timeout_s: 5.0
+  recovery_attempts: 3

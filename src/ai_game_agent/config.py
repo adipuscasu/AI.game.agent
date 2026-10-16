@@ -308,6 +308,23 @@ class _AgentConfig(BaseModel):
     recovery_delay_ms: int = Field(default=300, gt=0)
     health_low: float = Field(default=0.30, gt=0, le=1)
     health_recovered: float = Field(default=0.50, gt=0, le=1)
+    # Loop knobs (Phase 4 close-out): the state-machine watchdog timeout and
+    # the bounded-recovery budget. Defaults match the
+    # :class:`~ai_game_agent.state.machine.GameStateMachine` built-ins
+    # (``state_timeout_s=5.0``, ``recovery_attempts=3``), so a config file
+    # without these keys is backward compatible.
+    state_timeout_s: float = Field(default=5.0, gt=0)
+    recovery_attempts: int = Field(default=3, gt=0)
+
+    @field_validator("state_timeout_s", "recovery_attempts", mode="before")
+    @classmethod
+    def _reject_bool(cls, value: object) -> object:
+        # pydantic coerces ``True`` -> ``1`` / ``True`` -> ``1.0`` on bare
+        # int/float fields, so a bool must be rejected *before* coercion
+        # (the same discipline the delay fields use on the public facade).
+        if isinstance(value, bool):
+            raise ValueError(f"must be a number, not a bool (got {value!r})")
+        return value
 
     @model_validator(mode="after")
     def _thresholds_ordered(self) -> _AgentConfig:
@@ -339,6 +356,8 @@ class AgentConfig:
         "recovery_delay_ms",
         "health_low",
         "health_recovered",
+        "state_timeout_s",
+        "recovery_attempts",
     )
 
     def __init__(
@@ -352,6 +371,8 @@ class AgentConfig:
         recovery_delay_ms: int = 300,
         health_low: float = 0.30,
         health_recovered: float = 0.50,
+        state_timeout_s: float = 5.0,
+        recovery_attempts: int = 3,
     ) -> None:
         # Validate against the same rules the model enforces (so a direct
         # AgentConfig(...) call is just as strict as a YAML round-trip).
@@ -382,6 +403,18 @@ class AgentConfig:
             raise ValueError(
                 f"health_low must be < health_recovered, got {health_low!r} !< {health_recovered!r}"
             )
+        if not (
+            isinstance(state_timeout_s, (int, float))
+            and not isinstance(state_timeout_s, bool)
+            and state_timeout_s > 0
+        ):
+            raise ValueError(f"state_timeout_s must be a positive number, got {state_timeout_s!r}")
+        if not (
+            isinstance(recovery_attempts, int)
+            and not isinstance(recovery_attempts, bool)
+            and recovery_attempts > 0
+        ):
+            raise ValueError(f"recovery_attempts must be a positive int, got {recovery_attempts!r}")
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "combat_keys", tuple(combat_keys))
         object.__setattr__(self, "combat_delay_ms", combat_delay_ms)
@@ -391,6 +424,8 @@ class AgentConfig:
         object.__setattr__(self, "recovery_delay_ms", recovery_delay_ms)
         object.__setattr__(self, "health_low", health_low)
         object.__setattr__(self, "health_recovered", health_recovered)
+        object.__setattr__(self, "state_timeout_s", state_timeout_s)
+        object.__setattr__(self, "recovery_attempts", recovery_attempts)
 
     @classmethod
     def from_model(cls, model: _AgentConfig) -> AgentConfig:
@@ -404,6 +439,8 @@ class AgentConfig:
             recovery_delay_ms=model.recovery_delay_ms,
             health_low=model.health_low,
             health_recovered=model.health_recovered,
+            state_timeout_s=model.state_timeout_s,
+            recovery_attempts=model.recovery_attempts,
         )
 
     def __setattr__(self, name: str, value: object) -> None:  # pragma: no cover
@@ -415,7 +452,9 @@ class AgentConfig:
             f"combat_delay_ms={self.combat_delay_ms!r}, "
             f"loot_pickup_key={self.loot_pickup_key!r}, loot_delay_ms={self.loot_delay_ms!r}, "
             f"recovery_key={self.recovery_key!r}, recovery_delay_ms={self.recovery_delay_ms!r}, "
-            f"health_low={self.health_low!r}, health_recovered={self.health_recovered!r})"
+            f"health_low={self.health_low!r}, health_recovered={self.health_recovered!r}, "
+            f"state_timeout_s={self.state_timeout_s!r}, "
+            f"recovery_attempts={self.recovery_attempts!r})"
         )
 
     def __eq__(self, other: object) -> bool:
@@ -431,6 +470,8 @@ class AgentConfig:
             and self.recovery_delay_ms == other.recovery_delay_ms
             and self.health_low == other.health_low
             and self.health_recovered == other.health_recovered
+            and self.state_timeout_s == other.state_timeout_s
+            and self.recovery_attempts == other.recovery_attempts
         )
 
     def __hash__(self) -> int:
@@ -445,6 +486,8 @@ class AgentConfig:
                 self.recovery_delay_ms,
                 self.health_low,
                 self.health_recovered,
+                self.state_timeout_s,
+                self.recovery_attempts,
             )
         )
 
