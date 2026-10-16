@@ -101,20 +101,29 @@ def test_run_record_writes_jsonl(tmp_path) -> None:
 
 
 def test_replay_subcommand_exists() -> None:
-    """The ``replay`` subcommand is registered (not 'invalid choice')."""
-    # Just verify it's a valid subcommand: `replay --help` should not fail
-    # with "invalid choice".
+    """The ``replay`` subcommand is registered (not 'invalid choice').
+
+    Spawn the real ``python -m ai_game_agent`` entry point (mirrors a user
+    invocation, like the e2e harness) and confirm ``replay --help`` is a valid
+    subcommand. The repo root is derived from this file's location and the
+    parent environment is inherited, so this is portable across Windows and
+    Linux — the previous version hardcoded ``/workspace/AI.game.agent`` for
+    ``cwd``/``PATH``/``PYTHONPATH``, which breaks on Windows with
+    ``WinError 267`` (the directory does not exist there).
+    """
+    import os
     import subprocess
     import sys
 
+    repo_root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": str(repo_root / "src")}
     proc = subprocess.run(
         [sys.executable, "-m", "ai_game_agent", "replay", "--help"],
         capture_output=True,
         text=True,
         timeout=10,
-        cwd="/workspace/AI.game.agent",
-        env={"PATH": "/workspace/AI.game.agent/.venv/bin:/usr/bin:/bin",
-             "PYTHONPATH": "/workspace/AI.game.agent/src"},
+        cwd=repo_root,
+        env=env,
     )
     assert proc.returncode == 0, f"replay --help failed: {proc.stderr}"
 
