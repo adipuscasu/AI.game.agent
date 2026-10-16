@@ -222,8 +222,13 @@ class AgentLoop:
     def _dispatch(
         self, actions: tuple[Action, ...], now: float
     ) -> tuple[ActionResult, ...]:
-        """Execute an action batch; record each result; stop on pause/stop."""
-        self._actions_attempted += len(actions)
+        """Execute an action batch; record each result; stop on pause/stop.
+
+        ``actions_attempted`` counts only the actions actually dispatched to
+        the executor (one per ``execute()`` call), not the full batch size —
+        so a mid-batch stop does not inflate the counter with undelivered
+        actions (matches the ``AgentLoopReport`` docstring).
+        """
         self._emit(
             self._event(
                 event=EventType.ACTION_BATCH,
@@ -238,6 +243,7 @@ class AgentLoop:
         for action in actions:
             if self._executor.stopped or self._executor.state.name == "PAUSED":
                 break
+            self._actions_attempted += 1  # F3: count only dispatched actions
             try:
                 result = self._executor.execute(action)
             except Exception as exc:  # noqa: BLE001 - record, don't crash the batch
@@ -300,24 +306,34 @@ class AgentLoop:
         priority), ``stop_event`` pre-set (``"stop_requested"``),
         ``max_ticks`` reached (``"max_ticks"``), the machine entering
         ``PAUSED`` (``"paused"``), or a capture-start failure
-        (``"capture_start_failed"``). ``capture.stop()`` runs in ``finally``
-        on every path; ``executor.release_all()`` is called as belt-and-braces
-        before capture stops, and one cleanup failure cannot skip the other.
+        (``"capture_start_failed"``).
 
-        When a ``hotkey`` listener is provided it is armed before the loop
-        starts and disarmed in ``finally`` after ``capture.stop()``; a trigger
-        during the loop sets the ``stop_event`` and fires the executor's
-        emergency stop, so the loop exits on its next ``executor.stopped``
-        check with ``stopped_reason == "emergency_stop"``.
+        Cleanup runs in ``finally`` on every path — including exceptions
+        from ``tick()`` — in the order ``release_all()`` → ``disarm()`` →
+        ``capture.stop()``; each step is wrapped in its own ``try/except``
+        so one cleanup failure cannot skip the others. The original
+        exception (if any) propagates; it is never converted into a success
+        report.
+
+        When a ``hotkey`` listener is provided it is armed inside the
+        ``try`` (so an arm failure still triggers cleanup) and disarmed in
+        ``finally``; a trigger during the loop sets the ``stop_event`` and
+        fires the executor's emergency stop, so the loop exits on its next
+        ``executor.stopped`` check with ``stopped_reason == "emergency_stop"``.
         """
         self._reset_report()
         try:
             self._capture.start()
         except Exception:  # noqa: BLE001 - can't start: hard stop, report it
+            # Defensive cleanup: nothing was armed or dispatched, but a
+            # partially-opened backend must still be released (the real
+            # facade's stop() is idempotent; release_all() is a no-op with
+            # no held inputs).
+            self._cleanup()
             return self._finish_report("capture_start_failed")
-        if self._hotkey is not None:
-            self._hotkey.arm()
         try:
+            if self._hotkey is not None:
+                self._hotkey.arm()
             while True:
                 # emergency_stop has highest priority: the executor owns the
                 # stop; the loop only observes and reports.
@@ -335,21 +351,35 @@ class AgentLoop:
                 if self._machine.state is AgentState.PAUSED:
                     self._stopped_reason = "paused"
                     break
-            try:
-                self._executor.release_all()
-            except Exception:  # noqa: BLE001 - belt-and-braces; must not mask the stop
-                pass
+                self._capture.wait_next_frame()  # F2: pace before the next tick
         finally:
-            if self._hotkey is not None:
-                try:
-                    self._hotkey.disarm()
-                except Exception:  # noqa: BLE001 - disarm must not mask capture.stop
-                    pass
-            try:
-                self._capture.stop()
-            except Exception:  # noqa: BLE001 - one cleanup failure must not skip this
-                pass
+            # F1: cleanup runs on every exit path (break, exception, …);
+            # the original exception (if any) propagates after cleanup.
+            self._cleanup()
         return self._finish_report(self._stopped_reason)
+
+    def _cleanup(self) -> None:
+        """release_all() → disarm() → capture.stop().
+
+        Each step is wrapped in its own ``try/except`` so one cleanup
+        failure cannot skip the others, and a cleanup failure must never
+        mask the original exception (``finally``) or the
+        ``capture_start_failed`` report. All three are idempotent on a
+        clean state, so calling this on every exit path is safe.
+        """
+        try:
+            self._executor.release_all()
+        except Exception:  # noqa: BLE001 - belt-and-braces; must not mask the stop
+            pass
+        if self._hotkey is not None:
+            try:
+                self._hotkey.disarm()
+            except Exception:  # noqa: BLE001 - disarm must not mask capture.stop
+                pass
+        try:
+            self._capture.stop()
+        except Exception:  # noqa: BLE001 - one cleanup failure must not skip this
+            pass
 
     # ---- report assembly ----------------------------------------------------
 

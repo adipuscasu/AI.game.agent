@@ -33,6 +33,7 @@ import threading
 import pytest
 
 from ai_game_agent.actions import Executor, OperationMode, SafetyGuard
+from ai_game_agent.actions.hotkey import FakeHotkeyListener
 from ai_game_agent.actions.mock import MockBackend
 from ai_game_agent.agent import AgentLoop, AgentLoopReport
 from ai_game_agent.capture import CaptureError
@@ -80,6 +81,7 @@ class _FakeCapture:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
         self.grab_count = 0
+        self.wait_count = 0
         self.started = False
         self.stopped = False
 
@@ -96,6 +98,7 @@ class _FakeCapture:
         return object()  # the fake perception ignores the frame payload
 
     def wait_next_frame(self) -> float:
+        self.wait_count += 1
         return 0.0
 
 
@@ -119,6 +122,17 @@ class _StubDecisionPolicy:
         return dict(self._signals)
 
 
+class _RaisingSignalPolicy:
+    """StatePolicy whose transition_signals raises.
+
+    Forces an exception out of ``machine.decide()`` (and therefore out of
+    ``tick()`` / ``run()``) — the failure seam for the F1 regression test.
+    """
+
+    def transition_signals(self, observation):
+        raise RuntimeError("simulated decision failure (F1 regression)")
+
+
 @pytest.fixture
 def action_backend() -> MockBackend:
     return MockBackend()
@@ -132,6 +146,8 @@ def make_loop(action_backend: MockBackend):
         capture: _FakeCapture | None = None,
         perception: _FakePerception | None = None,
         machine: GameStateMachine | None = None,
+        executor: Executor | None = None,
+        hotkey: FakeHotkeyListener | None = None,
         max_ticks: int | None = None,
         stop_event: threading.Event | None = None,
         on_event=None,
@@ -142,7 +158,7 @@ def make_loop(action_backend: MockBackend):
             initial=AgentState.IDLE,
             recovery_attempts=recovery_attempts,
         )
-        executor = Executor(
+        executor = executor or Executor(
             backend=action_backend,
             safety=SafetyGuard(mode=mode),
         )
@@ -156,6 +172,7 @@ def make_loop(action_backend: MockBackend):
             max_ticks=max_ticks,
             now_fn=lambda: 0.0,
             stop_event=stop_event,
+            hotkey=hotkey,
             on_event=on_event,
         )
 
@@ -232,3 +249,165 @@ def test_tick_event_carries_zone_detail(make_loop) -> None:
     assert ZONE_LOOT_GLOW in zones
     assert ZONE_TARGET in zones
     assert ZONE_TARGET_HOSTILE in zones
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 close-out regression tests — lock the working-tree fixes in
+# AgentLoop.run() before they are committed:
+#
+# * F1 — cleanup runs on every exit path (even when tick() raises), in the
+#   mandated order: release_all -> disarm -> capture.stop;
+# * F2 — pacing is owned by the capture facade: exactly one
+#   wait_next_frame() per completed tick, and none after an exit where no
+#   tick completed;
+# * F3 — actions_attempted counts only the actions actually dispatched
+#   (a mid-batch emergency stop must not count the undelivered ones).
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_runs_in_order_when_tick_raises(make_loop, action_backend) -> None:
+    """F1: an exception escaping tick() must propagate out of run() (never a
+    success report), and cleanup must still run in the required order:
+    release_all -> disarm -> capture.stop.
+
+    Pre-fix, release_all() sat inside the same try as the loop body, so an
+    exception in tick() skipped it (only disarm + capture.stop ran, from the
+    finally). The shared ``order`` list proves both occurrence and sequence,
+    including that disarm runs.
+    """
+    machine = GameStateMachine(
+        policy=_RaisingSignalPolicy(),
+        initial=AgentState.IDLE,
+        recovery_attempts=3,
+    )
+    executor = Executor(
+        backend=action_backend,
+        safety=SafetyGuard(mode=OperationMode.AUTONOMOUS),
+    )
+    order: list[str] = []
+
+    _orig_release_all = executor.release_all
+
+    def recording_release_all() -> bool:
+        order.append("release_all")
+        return _orig_release_all()
+
+    executor.release_all = recording_release_all  # type: ignore[method-assign]
+
+    hotkey = FakeHotkeyListener(on_trigger=lambda: None)
+    _orig_disarm = hotkey.disarm
+
+    def recording_disarm() -> None:
+        order.append("disarm")
+        _orig_disarm()
+
+    hotkey.disarm = recording_disarm  # type: ignore[method-assign]
+
+    capture = _FakeCapture()
+    _orig_stop = capture.stop
+
+    def recording_stop() -> None:
+        order.append("capture.stop")
+        _orig_stop()
+
+    capture.stop = recording_stop  # type: ignore[method-assign]
+
+    loop = make_loop(
+        capture=capture,
+        machine=machine,
+        executor=executor,
+        hotkey=hotkey,
+        max_ticks=5,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated decision failure"):
+        loop.run()
+    # The exception propagated (not swallowed into a report), and cleanup ran
+    # in the mandated order — all three steps, including disarm:
+    assert order == ["release_all", "disarm", "capture.stop"], (
+        f"cleanup order wrong on the exception path: {order}"
+    )
+
+
+def test_pacing_at_tick_boundary(make_loop, action_backend) -> None:
+    """F2: the loop paces via the capture facade — exactly one
+    wait_next_frame() per completed tick (plan §4.6) — and never paces after
+    an exit where no tick completed.
+
+    Scenario 1 (normal): 3 ticks -> exactly 3 pacing calls.
+    Scenario 2 (boundary): an emergency stop fired before any tick -> the
+    loop exits without pacing at all (wait_count == 0).
+
+    Pre-fix, run() never called wait_next_frame() at all (no throttle), so
+    scenario 1 fails with wait_count == 0.
+    """
+    # Scenario 1: one pacing call per completed tick.
+    capture = _FakeCapture()
+    loop = make_loop(capture=capture, max_ticks=3)
+    report = loop.run()
+    assert report.ticks == 3
+    assert report.stopped_reason == "max_ticks"
+    assert capture.wait_count == 3, (
+        f"expected wait_next_frame() once per tick (3), got {capture.wait_count}"
+    )
+
+    # Scenario 2: emergency stop before any tick -> no pacing at all.
+    boundary_capture = _FakeCapture()
+    executor = Executor(
+        backend=action_backend,
+        safety=SafetyGuard(mode=OperationMode.AUTONOMOUS),
+    )
+    executor.trigger_emergency_stop("pre-run stop")
+    loop2 = make_loop(capture=boundary_capture, executor=executor, max_ticks=5)
+    report2 = loop2.run()
+    assert report2.ticks == 0
+    assert report2.stopped_reason == "emergency_stop"
+    assert boundary_capture.wait_count == 0, (
+        "must not pace after an exit where no tick completed "
+        f"(got {boundary_capture.wait_count})"
+    )
+
+
+def test_actions_attempted_counts_only_dispatched_actions(
+    make_loop, action_backend
+) -> None:
+    """F3: a mid-batch emergency stop must not inflate actions_attempted with
+    undelivered actions.
+
+    COMBAT dispatches a 3-action batch (key, delay, key). Stopping the
+    executor from the first execute() call means only 1 action was actually
+    dispatched — the report must say 1, not the batch size of 3.
+
+    Pre-fix, the counter was seeded with len(batch) up front, so a mid-batch
+    stop over-counted (actions_attempted == 3).
+    """
+    action_backend.open()
+    machine = GameStateMachine(
+        policy=_StubDecisionPolicy(),
+        initial=AgentState.COMBAT,
+        recovery_attempts=3,
+    )
+    executor = Executor(
+        backend=action_backend,
+        safety=SafetyGuard(mode=OperationMode.AUTONOMOUS),
+    )
+    calls = {"n": 0}
+    _orig_execute = executor.execute
+
+    def execute_and_stop(action):
+        calls["n"] += 1
+        result = _orig_execute(action)
+        executor.trigger_emergency_stop("mid-batch stop")
+        return result
+
+    executor.execute = execute_and_stop  # type: ignore[method-assign]
+
+    loop = make_loop(machine=machine, executor=executor, max_ticks=1)
+    report = loop.run()
+    assert executor.stopped is True
+    assert report.stopped_reason == "emergency_stop"
+    assert calls["n"] == 1, f"expected exactly 1 execute() call, got {calls['n']}"
+    assert report.actions_attempted == 1, (
+        f"actions_attempted must count only dispatched actions (1), "
+        f"got {report.actions_attempted}"
+    )
