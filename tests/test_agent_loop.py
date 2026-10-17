@@ -103,12 +103,19 @@ class _FakeCapture:
 
 
 class _FakePerception:
-    def __init__(self, observation: Observation | None = None) -> None:
+    def __init__(
+        self,
+        observation: Observation | None = None,
+        on_observe: object | None = None,
+    ) -> None:
         self._obs = observation if observation is not None else _observation()
+        self._on_observe = on_observe
         self.observe_count = 0
 
     def observe(self, frame):
         self.observe_count += 1
+        if self._on_observe is not None:
+            self._on_observe()  # P2 seam: fire a stop DURING the tick
         return self._obs
 
 
@@ -411,3 +418,86 @@ def test_actions_attempted_counts_only_dispatched_actions(
         f"actions_attempted must count only dispatched actions (1), "
         f"got {report.actions_attempted}"
     )
+
+
+# ---------------------------------------------------------------------------
+# P2 close-out (review of 1848b9e): a stop that fires DURING a tick must
+# not pay a wait_next_frame() before the loop notices it. The executor
+# releases held input the instant it is triggered, but the loop's own
+# cleanup (disarm + capture.stop) and its exit still ran a full frame
+# period late. Now: after each completed tick, recheck the stop conditions
+# (emergency_stop first, then stop_event) BEFORE pacing — same priority
+# order as the top-of-loop checks.
+# ---------------------------------------------------------------------------
+
+
+def test_emergency_stop_during_tick_exits_without_pacing(
+    make_loop, action_backend
+) -> None:
+    """P2-A: the emergency-stop hotkey fires inside the tick (during
+    perception); run() must exit right after that tick with
+    stopped_reason == "emergency_stop" and ZERO pacing calls.
+
+    IDLE + empty observation dispatches no actions, so the discriminator
+    is purely the pacing: pre-fix, run() paced once after the tick
+    (wait_count == 1) and only saw the stop at the next iteration top.
+    """
+    executor = Executor(
+        backend=action_backend,
+        safety=SafetyGuard(mode=OperationMode.AUTONOMOUS),
+    )
+    hotkey = FakeHotkeyListener(
+        on_trigger=lambda: executor.trigger_emergency_stop("hotkey test")
+    )
+    # The listener is armed by run() before the first tick, so this fires.
+    perception = _FakePerception(on_observe=lambda: hotkey.trigger("f12"))
+    capture = _FakeCapture()
+    loop = make_loop(
+        capture=capture,
+        perception=perception,
+        executor=executor,
+        hotkey=hotkey,
+        max_ticks=10,
+    )
+
+    report = loop.run()
+    assert report.ticks == 1, f"expected 1 tick before the stop, got {report.ticks}"
+    assert report.stopped_reason == "emergency_stop", (
+        f"stopped_reason should be emergency_stop, got {report.stopped_reason}"
+    )
+    assert capture.wait_count == 0, (
+        "must not pace after an emergency stop fired during tick() "
+        f"(got wait_count={capture.wait_count})"
+    )
+    assert executor.stopped is True
+    assert capture.stopped is True, "capture.stop() must run in cleanup"
+
+
+def test_stop_event_during_tick_exits_without_pacing(
+    make_loop, action_backend
+) -> None:
+    """P2-B: stop_event is set inside the tick (during perception); run()
+    must exit right after that tick with stopped_reason ==
+    "stop_requested" and ZERO pacing calls — the same responsiveness
+    contract as the emergency-stop path, at its own priority level.
+    """
+    stop_event = threading.Event()
+    perception = _FakePerception(on_observe=stop_event.set)
+    capture = _FakeCapture()
+    loop = make_loop(
+        capture=capture,
+        perception=perception,
+        stop_event=stop_event,
+        max_ticks=10,
+    )
+
+    report = loop.run()
+    assert report.ticks == 1, f"expected 1 tick before the stop, got {report.ticks}"
+    assert report.stopped_reason == "stop_requested", (
+        f"stopped_reason should be stop_requested, got {report.stopped_reason}"
+    )
+    assert capture.wait_count == 0, (
+        "must not pace after stop_event fired during tick() "
+        f"(got wait_count={capture.wait_count})"
+    )
+    assert capture.stopped is True, "capture.stop() must run in cleanup"

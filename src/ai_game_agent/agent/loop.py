@@ -318,8 +318,9 @@ class AgentLoop:
         When a ``hotkey`` listener is provided it is armed inside the
         ``try`` (so an arm failure still triggers cleanup) and disarmed in
         ``finally``; a trigger during the loop sets the ``stop_event`` and
-        fires the executor's emergency stop, so the loop exits on its next
-        ``executor.stopped`` check with ``stopped_reason == "emergency_stop"``.
+        fires the executor's emergency stop, so the loop exits immediately
+        after the tick in flight — before pacing — with
+        ``stopped_reason == "emergency_stop"``.
         """
         self._reset_report()
         try:
@@ -350,6 +351,18 @@ class AgentLoop:
                 self._ticks += 1
                 if self._machine.state is AgentState.PAUSED:
                     self._stopped_reason = "paused"
+                    break
+                # P2 (review of 1848b9e): a stop that fires DURING the tick
+                # (emergency stop or stop_event) must not pay a
+                # wait_next_frame() before the loop notices it — recheck the
+                # stop conditions here, in the same priority order as the
+                # top-of-loop checks (emergency stop first), and exit without
+                # pacing when one is set.
+                if self._executor.stopped:
+                    self._stopped_reason = "emergency_stop"
+                    break
+                if self._stop_event is not None and self._stop_event.is_set():
+                    self._stopped_reason = "stop_requested"
                     break
                 self._capture.wait_next_frame()  # F2: pace before the next tick
         finally:
