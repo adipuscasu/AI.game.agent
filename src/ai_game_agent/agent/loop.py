@@ -349,20 +349,22 @@ class AgentLoop:
                     break
                 self.tick()
                 self._ticks += 1
-                if self._machine.state is AgentState.PAUSED:
-                    self._stopped_reason = "paused"
-                    break
-                # P2 (review of 1848b9e): a stop that fires DURING the tick
-                # (emergency stop or stop_event) must not pay a
+                # P2 (review of 1848b9e) / P3 (review of 924bc29): a stop
+                # that fires DURING the tick must not pay a
                 # wait_next_frame() before the loop notices it — recheck the
-                # stop conditions here, in the same priority order as the
-                # top-of-loop checks (emergency stop first), and exit without
-                # pacing when one is set.
+                # stop conditions here in the documented priority order
+                # (emergency stop first, then stop_event), and exit without
+                # pacing when one is set. These take precedence over a
+                # same-tick PAUSED entry so the reported reason always honors
+                # the highest-priority stop.
                 if self._executor.stopped:
                     self._stopped_reason = "emergency_stop"
                     break
                 if self._stop_event is not None and self._stop_event.is_set():
                     self._stopped_reason = "stop_requested"
+                    break
+                if self._machine.state is AgentState.PAUSED:
+                    self._stopped_reason = "paused"
                     break
                 self._capture.wait_next_frame()  # F2: pace before the next tick
         finally:

@@ -107,15 +107,19 @@ class _FakePerception:
         self,
         observation: Observation | None = None,
         on_observe: object | None = None,
+        fail: bool = False,
     ) -> None:
         self._obs = observation if observation is not None else _observation()
         self._on_observe = on_observe
+        self.fail = fail
         self.observe_count = 0
 
     def observe(self, frame):
         self.observe_count += 1
         if self._on_observe is not None:
-            self._on_observe()  # P2 seam: fire a stop DURING the tick
+            self._on_observe()  # P2/P3 seam: fire a stop DURING the tick
+        if self.fail:
+            raise RuntimeError("simulated perception failure (P3 test)")
         return self._obs
 
 
@@ -498,6 +502,60 @@ def test_stop_event_during_tick_exits_without_pacing(
     )
     assert capture.wait_count == 0, (
         "must not pace after stop_event fired during tick() "
+        f"(got wait_count={capture.wait_count})"
+    )
+    assert capture.stopped is True, "capture.stop() must run in cleanup"
+
+
+# ---------------------------------------------------------------------------
+# P3 (review of 924bc29): when a single tick BOTH fires the emergency stop
+# AND lands the machine in PAUSED, the documented priority contract must
+# still hold — "emergency_stop" is the highest-priority exit reason. The
+# post-tick check order previously let the PAUSED check shadow it.
+# ---------------------------------------------------------------------------
+
+
+def test_emergency_stop_during_tick_outranks_paused(
+    make_loop, action_backend
+) -> None:
+    """P3: one tick fires the emergency stop (hotkey trigger) and raises a
+    perception failure; with recovery_attempts=1 the pipeline-error path
+    exhausts recovery and the machine enters PAUSED in that SAME tick.
+    run() must still report stopped_reason == "emergency_stop" (not
+    "paused"), exit without pacing, and clean up.
+    """
+    executor = Executor(
+        backend=action_backend,
+        safety=SafetyGuard(mode=OperationMode.AUTONOMOUS),
+    )
+    hotkey = FakeHotkeyListener(
+        on_trigger=lambda: executor.trigger_emergency_stop("hotkey test")
+    )
+    # Fires the stop, then fails: the failure routes through
+    # _on_pipeline_error -> PAUSED (recovery exhausted at attempts=1).
+    perception = _FakePerception(
+        on_observe=lambda: hotkey.trigger("f12"),
+        fail=True,
+    )
+    capture = _FakeCapture()
+    loop = make_loop(
+        capture=capture,
+        perception=perception,
+        executor=executor,
+        hotkey=hotkey,
+        max_ticks=10,
+        recovery_attempts=1,
+    )
+
+    report = loop.run()
+    assert report.ticks == 1, f"expected 1 tick before the stop, got {report.ticks}"
+    assert executor.stopped is True
+    assert report.stopped_reason == "emergency_stop", (
+        "emergency stop is the documented highest-priority exit reason and "
+        f"must not be shadowed by a same-tick PAUSED (got {report.stopped_reason})"
+    )
+    assert capture.wait_count == 0, (
+        "must not pace after an emergency stop fired during tick() "
         f"(got wait_count={capture.wait_count})"
     )
     assert capture.stopped is True, "capture.stop() must run in cleanup"
