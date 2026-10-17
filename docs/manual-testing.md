@@ -444,3 +444,105 @@ And the whole suite must stay green in a **bare venv** (no `vision` / `ocr` /
 uv run pytest -q
 ```
 ```
+
+## 5. Phase 4 — the `run` loop and its stop semantics
+
+The `run` subcommand is the generic, game-agnostic observe-decide-act loop
+(Phase 4 §4.4). See `docs/phase-4-loop.md` for the full reference; the steps
+here are the manual smoke tests plus the **honest** stop semantics you should
+verify against the live tree.
+
+### 5.1 Headless run (mock capture + mock input, no display, no OS input)
+
+```powershell
+# One tick, clean report, exit 0 (observe_only emits zero OS input)
+uv run python -m ai_game_agent run --once --backend mock --mode observe_only
+# -> report JSON on stdout: "stopped_reason": "max_ticks", "final_state": "idle"
+$LASTEXITCODE   # -> 0
+
+# N ticks, pretty-printed (indent=2; still valid JSON)
+uv run python -m ai_game_agent run --max-ticks 5 --backend mock --mode observe_only --pretty
+```
+
+`--max-ticks N` (or `--once`) is the **deterministic, report-producing** way to
+end a loop. This is the clean stop — not Ctrl+C (see §5.3).
+
+### 5.2 The two loop config knobs
+
+`config/default.yaml` `agent:` block now carries `state_timeout_s` (default
+`5.0`, watchdog seconds in a non-terminal state) and `recovery_attempts`
+(default `3`, bounded recovery budget before `PAUSED`). Both are validated
+(positive, **bool rejected**) and threaded to `GameStateMachine` on both the
+live `run` and the `replay` path. A bad value must fail loudly:
+
+```powershell
+# Put "recovery_attempts: 0" (or "state_timeout_s: true") in a scratch config,
+# then expect a clean "error: ..." + exit 1, not a traceback:
+uv run python -m ai_game_agent run --once --backend mock --config config\bad.yaml
+$LASTEXITCODE   # -> 1
+```
+
+### 5.3 Ctrl+C / SIGINT — an **abort**, not a clean stop (verified)
+
+**There is no SIGINT handler and no `KeyboardInterrupt` catch in `src/`.** So
+Ctrl+C is an abort, and the honest behavior is:
+
+- a `KeyboardInterrupt` traceback goes to **stderr**;
+- **no report is printed to stdout** (stdout stays empty);
+- the process exits **non-zero** (130 under bash).
+
+The loop's `finally` cleanup (`capture.stop()`, `executor.release_all()`) still
+runs, but only as a side effect of exception unwinding — it is **not** a
+designed clean-stop contract. Do **not** rely on Ctrl+C for a "clean partial
+report." Use `--once` / `--max-ticks` for a deterministic, report-producing
+stop.
+
+### 5.4 F12 emergency stop / hotkey — implemented + tested, **not wired into `run`**
+
+The machinery exists and is tested: `Executor.trigger_emergency_stop()`, the
+`AgentLoop(hotkey=, stop_event=)` hooks, and `WindowsBackend`'s armed F12
+`_HotkeyDecider`. **But the `run` CLI does not wire it:**
+
+- `create_backend` builds `WindowsBackend()` with `on_stop=None` (no-op);
+- `_run` passes **neither** `hotkey=` nor `stop_event=` to `AgentLoop`;
+- `run` never calls `backend.open()` (that's the `act` path), so the pynput
+  listener isn't even started.
+
+**Therefore, in the `run` CLI as it stands, F12 does not stop the loop.**
+`stop_requested` and `emergency_stop` are valid report values in code but
+**unreachable from the `run` CLI today.** This is a known wiring gap (a
+follow-up), documented here so the manual tests match the tree. A programmatic
+caller can still wire it by passing a `HotkeyListener` (with `on_trigger`
+calling `executor.trigger_emergency_stop()`) plus a `threading.Event`.
+
+### 5.5 Mock backend has no emergency-stop trigger
+
+`MockBackend` exposes `open`/`close`, the input verbs, `release_all`, and an
+`events` log — but **no** `trigger_emergency_stop` and **no** hotkey. The mock
+is for deterministic, backend-free runs (CI, replay), not for exercising the
+real stop path. For a real stop source you need the `windows` backend (and per
+§5.4 it is not yet wired into `run`).
+
+### 5.6 Replay workflow
+
+```powershell
+# Record a run's event log (one .jsonl line per LoopEvent):
+uv run python -m ai_game_agent run --max-ticks 50 --backend mock --mode observe_only --record --record-dir recordings
+
+# Replay it — re-derive the state sequence without touching a real app:
+uv run python -m ai_game_agent replay <recorded>.jsonl --config config\default.yaml
+```
+
+Replay uses the same `agent.recovery_attempts` / `agent.state_timeout_s` knobs
+as the live path, so it reproduces the same bounded-recovery budget and
+watchdog timeout as the recorded session.
+
+### 5.7 Phase 4 test suite (optional cross-check)
+
+```powershell
+# Loop, safety, config, and the run/replay CLI contracts
+uv run pytest tests/test_agent_loop.py tests/test_agent_loop_safety.py tests/test_agent_config.py tests/test_run_cli.py tests/test_replay.py -q
+
+# And the whole suite must stay green (CI must not need a desktop or a live game):
+uv run pytest -q
+```

@@ -101,3 +101,28 @@ perception:
 logging:
   level: INFO
   directory: logs
+
+
+# --- Agent policy (Phase 4, §4.5) --------------------------------------------
+# Parameterizes games/wow/policy.py: DeterministicPolicy via
+# DeterministicPolicy.from_config. Defaults match the policy's built-in
+# defaults, so omitting a key (or the whole block) preserves current behavior.
+# health_low / health_recovered are thresholds only — the calibrated health
+# reading is a runtime callable (DeterministicPolicy.set_health_fraction),
+# never stored here.
+agent:
+  name: wow
+  combat_keys: [q, w]      # keys pressed per combat tick (lowercase)
+  combat_delay_ms: 120
+  loot_pickup_key: f
+  loot_delay_ms: 200
+  recovery_key: r
+  recovery_delay_ms: 300
+  health_low: 0.30
+  health_recovered: 0.50
+  # Loop knobs (Phase 4 close-out) — read by GameStateMachine on both the live
+  # `run` and the `replay` path. state_timeout_s: watchdog, max seconds in a
+  # non-terminal state. recovery_attempts: bounded recovery budget before
+  # PAUSED. Both are validated (positive, bool rejected); defaults match code.
+  state_timeout_s: 5.0
+  recovery_attempts: 3
