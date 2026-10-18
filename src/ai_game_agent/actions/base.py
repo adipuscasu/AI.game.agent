@@ -22,6 +22,7 @@ without the ``input`` extra never imports pynput and gets a clean
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 from ai_game_agent.config import InputConfig
@@ -175,7 +176,10 @@ class InputBackend(Keyboard, Mouse, Protocol):
 # ---------------------------------------------------------------------------
 
 
-def create_backend(input_cfg: InputConfig) -> InputBackend:
+def create_backend(
+    input_cfg: InputConfig,
+    on_stop: Callable[[], None] | None = None,
+) -> InputBackend:
     """Factory: return the input backend named in ``input_cfg``.
 
     Mirrors :func:`ai_game_agent.capture.create_backend`: the backend is a
@@ -185,6 +189,9 @@ def create_backend(input_cfg: InputConfig) -> InputBackend:
 
     Args:
         input_cfg: :class:`InputConfig` (``input_cfg.backend`` selects).
+        on_stop: optional emergency-stop callback wired into the backend's
+            stop mechanism (the F12 seam). ``None`` leaves the backend with
+            no stop callback (the hotkey is inert).
 
     Returns:
         A :class:`MockBackend` for ``backend == "mock"`` or a
@@ -200,7 +207,7 @@ def create_backend(input_cfg: InputConfig) -> InputBackend:
     if name == "mock":
         from ai_game_agent.actions.mock import MockBackend
 
-        return MockBackend()
+        return MockBackend(on_stop=on_stop)
     if name == "windows":
         if not _pynput_available():
             raise InputBackendError(
@@ -210,7 +217,7 @@ def create_backend(input_cfg: InputConfig) -> InputBackend:
             )
         from ai_game_agent.actions.windows import WindowsBackend
 
-        return WindowsBackend()
+        return WindowsBackend(on_stop=on_stop)
     raise ActionError(f"unknown input backend: {input_cfg.backend!r}")
 
 

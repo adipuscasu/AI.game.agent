@@ -19,6 +19,8 @@ as Phase 1's mock made capture testable.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from ai_game_agent.actions.base import InputBackendError
 
 
@@ -34,11 +36,15 @@ class MockBackend:
 
     name = "mock"
 
-    def __init__(self) -> None:
+    def __init__(
+        self, on_stop: Callable[[], None] | None = None
+    ) -> None:
         self.events: list[tuple[object, ...]] = []
         self.held_keys: set[str] = set()
         self.held_buttons: set[str] = set()
         self.opened = False
+        self.stopped = False
+        self._on_stop: Callable[[], None] | None = on_stop
 
     # --- lifecycle ----------------------------------------------------------
 
@@ -121,3 +127,32 @@ class MockBackend:
             self.events.append(("mouse_up", button))
         self.held_keys.clear()
         self.held_buttons.clear()
+
+    # --- emergency stop (test seam) ----------------------------------------
+
+    def set_on_stop(self, callback: Callable[[], None] | None) -> None:
+        """Set (or clear) the emergency-stop callback.
+
+        Called by the factory or by ``_run`` after the executor exists, so the
+        callback can close over the executor without a construction-order cycle.
+        """
+        self._on_stop = callback
+
+    def trigger_emergency_stop(self, reason: str = "emergency") -> None:
+        """Simulate an emergency-stop hotkey press (the F12 test seam).
+
+        Order (mirrors ``Executor.trigger_emergency_stop``):
+
+        1. ``release_all()`` — release every held key and button;
+        2. set ``stopped = True`` — terminal for this backend's lifetime;
+        3. fire ``_on_stop()`` — the wired callback (stop_event.set() +
+           executor.trigger_emergency_stop) — at most once.
+
+        Idempotent: a second call is a no-op (no re-release, no crash).
+        """
+        if self.stopped:
+            return
+        self.release_all()
+        self.stopped = True
+        if self._on_stop is not None:
+            self._on_stop()
