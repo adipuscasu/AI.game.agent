@@ -302,11 +302,17 @@ class AgentLoop:
     def run(self) -> AgentLoopReport:
         """Blocking loop: grab -> observe -> decide -> act, until stop/limit.
 
-        Exits on: ``executor.stopped`` (``"emergency_stop"`` — highest
-        priority), ``stop_event`` pre-set (``"stop_requested"``),
-        ``max_ticks`` reached (``"max_ticks"``), the machine entering
-        ``PAUSED`` (``"paused"``), or a capture-start failure
-        (``"capture_start_failed"``).
+        Exits on (in priority order): ``executor.stopped``
+        (``"emergency_stop"``), ``stop_event`` (``"stop_requested"``), the
+        machine entering ``PAUSED`` (``"paused"``), ``max_ticks`` reached
+        (``"max_ticks"``), or a capture-start failure
+        (``"capture_start_failed"``). ``emergency_stop`` and
+        ``stop_requested`` are always highest priority. When the final
+        permitted tick both exhausts the tick budget AND lands the machine
+        in ``PAUSED`` (e.g. recovery exhausted on the last tick),
+        ``"paused"`` is reported because it is the more actionable
+        diagnosis — a routine budget limit must not obscure a
+        safety-related pause.
 
         Cleanup runs in ``finally`` on every path — including exceptions
         from ``tick()`` — in the order ``release_all()`` → ``disarm()`` →

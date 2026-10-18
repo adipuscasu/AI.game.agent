@@ -559,3 +559,58 @@ def test_emergency_stop_during_tick_outranks_paused(
         f"(got wait_count={capture.wait_count})"
     )
     assert capture.stopped is True, "capture.stop() must run in cleanup"
+
+
+# ---------------------------------------------------------------------------
+# P4 (review of 23d9b8c): when the final permitted tick BOTH exhausts the
+# tick budget AND lands the machine in PAUSED, "paused" is the reported
+# reason — the safety-related state must not be obscured by a routine
+# budget limit. Pins the existing (intended) behavior; no control-flow
+# change accompanies this test.
+# ---------------------------------------------------------------------------
+
+
+def test_final_tick_paused_outranks_max_ticks(make_loop) -> None:
+    """P4: with ``recovery_attempts=1`` and a perception that always
+    fails, tick 1 exhausts recovery and the machine enters PAUSED in the
+    SAME tick that reaches ``max_ticks=1``. run() must report
+    ``stopped_reason == "paused"`` (not ``"max_ticks"``) so a consumer
+    sees the safety-related state, must run exactly one tick, and must
+    leave the machine in PAUSED.
+
+    This test passes against the CURRENT implementation (it pins the
+    documented precedence); it is not a red-first regression but a
+    contract-pinning guard against future reorderings.
+    """
+    perception = _FakePerception(fail=True)
+    machine = GameStateMachine(
+        policy=_StubDecisionPolicy(),
+        initial=AgentState.IDLE,
+        recovery_attempts=1,
+    )
+    capture = _FakeCapture()
+    loop = make_loop(
+        capture=capture,
+        perception=perception,
+        machine=machine,
+        max_ticks=1,
+    )
+
+    report = loop.run()
+    assert report.ticks == 1, f"expected exactly 1 tick, got {report.ticks}"
+    assert machine.state is AgentState.PAUSED, (
+        f"machine must be PAUSED after recovery exhaustion, "
+        f"got {machine.state}"
+    )
+    assert report.final_state is AgentState.PAUSED
+    assert report.stopped_reason == "paused", (
+        "the safety-related paused state must not be obscured by the "
+        f"routine max_ticks budget limit (got {report.stopped_reason})"
+    )
+    # Pacing semantics: no tick completes past the PAUSED exit, so no
+    # wait_next_frame() runs after the final tick. (If the loop continued
+    # to pace, this would catch a double-wait regression.)
+    assert capture.wait_count == 0, (
+        f"no pacing after a PAUSED exit on the final tick (got {capture.wait_count})"
+    )
+    assert capture.stopped is True, "capture.stop() must run in cleanup"
