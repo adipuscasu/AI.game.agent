@@ -44,7 +44,9 @@ import argparse
 import json
 import logging
 import sys
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 # Phase 3 action execution. ``create_backend``/``SafetyGuard``/``Executor`` are
@@ -392,12 +394,18 @@ def _build_executor(
     cfg: Config,
     backend_name: str | None = None,
     mode: OperationMode | None = None,
+    on_stop: Callable[[], None] | None = None,
 ) -> tuple[Executor, object]:
     """Wire backend + guard + executor from config.
 
     ``backend_name`` (a ``--backend`` CLI flag) overrides ``cfg.input.backend``;
     ``mode`` (a ``--mode`` CLI flag) overrides ``cfg.input.mode``. Otherwise the
     config values are used, so a YAML edit changes behavior without touching code.
+
+    ``on_stop`` is the emergency-stop callback (the F12 hotkey) wired into the
+    backend's stop mechanism via ``create_backend``. ``None`` leaves the hotkey
+    inert. It is a deferred callback so the caller can close over the executor
+    (built here, *after* the backend) without a construction-order cycle.
 
     Raises:
         InputBackendError: the ``windows`` backend needs pynput (``input`` extra).
@@ -408,7 +416,10 @@ def _build_executor(
 
     mode = mode if mode is not None else OperationMode(cfg.input.mode)
     backend_name = backend_name if backend_name is not None else cfg.input.backend
-    backend = create_backend(InputConfig(backend=backend_name, mode=cfg.input.mode))
+    backend = create_backend(
+        InputConfig(backend=backend_name, mode=cfg.input.mode),
+        on_stop=on_stop,
+    )
     # Bounds come from the safety config (cfg.safety.*); only the mode is
     # overridable by the CLI flag. SafetyGuard.from_config already wires mode
     # from cfg.input.mode, so for the CLI-override case we re-apply the mode.
@@ -978,7 +989,25 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         record_dir=getattr(args, "record_dir", None) or "recordings",
         record_max_files=1000,
     )
-    executor, _backend = _build_executor(cfg, backend_name, mode)
+    # Emergency-stop wiring (AGENTS.md: the stop mechanism is independent of the
+    # AI and of the executor's own bookkeeping). A live ``threading.Event`` is the
+    # loop's stop gate; the input backend's F12 hotkey (its ``on_stop`` callback)
+    # sets that event AND triggers the executor's terminal stop, so a physical
+    # F12 mid-run releases every held input and halts the decision loop. The
+    # callback closes over a holder because the executor is built *after* the
+    # backend (inside ``_build_executor``), so it is filled in post-construction
+    # and read lazily — no construction-order cycle.
+    stop_event = threading.Event()
+    _executor_holder: dict[str, Executor] = {}
+
+    def _f12() -> None:
+        stop_event.set()
+        ex = _executor_holder.get("executor")
+        if ex is not None:
+            ex.trigger_emergency_stop("f12")
+
+    executor, _backend = _build_executor(cfg, backend_name, mode, on_stop=_f12)
+    _executor_holder["executor"] = executor
     machine, policy = _build_agent(cfg)
 
     max_ticks = 1 if getattr(args, "once", False) else getattr(args, "max_ticks", None)
@@ -1006,6 +1035,7 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         policy=policy,
         mode=mode,
         max_ticks=int(max_ticks) if max_ticks is not None else None,
+        stop_event=stop_event,
         recorder=recorder,
     )
     report = loop.run()

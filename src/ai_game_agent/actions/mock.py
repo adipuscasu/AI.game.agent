@@ -115,18 +115,30 @@ class MockBackend:
     # --- release-all --------------------------------------------------------
 
     def release_all(self) -> None:
-        """Release every held key and button, recording the release events.
+        """Release every held key and button.
+
+        Fault-tolerant, mirroring the real backends: each held input is
+        released through the same per-input path as an individual ``key_up`` /
+        ``mouse_up`` (so a fault injected there is honored), one failure does
+        not stop the rest, and an input whose release fails **stays held** for
+        a later retry. This is what makes the mock a faithful stand-in: a
+        backend whose ``key_up`` can fail is not one whose ``release_all``
+        silently releases that same input.
 
         Idempotent: once nothing is held, a further call is a no-op (no events
         are emitted) so the emergency stop can call it repeatedly and the
         mock's event log stays stable.
         """
         for key in sorted(self.held_keys):
-            self.events.append(("key_up", key))
+            try:
+                self.key_up(key)
+            except Exception:  # noqa: BLE001 - keep it held for retry; continue
+                pass
         for button in sorted(self.held_buttons):
-            self.events.append(("mouse_up", button))
-        self.held_keys.clear()
-        self.held_buttons.clear()
+            try:
+                self.mouse_up(button)
+            except Exception:  # noqa: BLE001 - keep it held for retry; continue
+                pass
 
     # --- emergency stop (test seam) ----------------------------------------
 

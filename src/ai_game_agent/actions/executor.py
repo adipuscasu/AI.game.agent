@@ -190,6 +190,21 @@ class Executor:
             else:
                 self._unreleased_buttons.discard(button)
         self.held_buttons.clear()
+        # AGENTS.md: the emergency stop must release *all* held input — not only
+        # what the executor dispatched. A key/button can be held on the backend
+        # by a path the executor never tracked (e.g. held mid-dispatch), so
+        # backstop with the backend's own release_all(). It is fault-tolerant:
+        # it releases each still-held input through the same per-input path
+        # (so a failure is honored) and only touches inputs the per-key path
+        # above did not already release, so it cannot double-emit or mask the
+        # per-key retry bookkeeping. Its outcome does not affect this method's
+        # return value, which reflects the executor's own tracked releases —
+        # a backstop failure leaves the backend-held input unresolved, which
+        # is the honest state and is never reported as a confirmed release.
+        try:
+            self._backend.release_all()
+        except Exception:  # noqa: BLE001 - backstop is best-effort, not fatal
+            pass
         return ok
 
     # -- emergency stop --------------------------------------------------

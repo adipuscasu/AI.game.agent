@@ -19,8 +19,8 @@ from ai_game_agent.__main__ import main
 from ai_game_agent.actions.action import Action, ActionKind
 from ai_game_agent.actions.base import InputConfig, create_backend
 from ai_game_agent.actions.executor import Executor
-from ai_game_agent.actions.modes import OperationMode
 from ai_game_agent.actions.mock import MockBackend
+from ai_game_agent.actions.modes import OperationMode
 from ai_game_agent.actions.safety import SafetyGuard
 
 _OBSERVE_CONFIG = """
@@ -162,7 +162,7 @@ def test_emergency_stop_during_inflight_action() -> None:
         safety=SafetyGuard(mode=OperationMode.AUTONOMOUS),
         sleeper=lambda d: None,
     )
-    executor.execute(Action(kind=ActionKind.KEY_HOLD, key="w", duration_ms=0))
+    executor.execute(Action(kind=ActionKind.KEY_HOLD, key="w", duration_ms=1))
     backend.key_down("a")  # a second in-flight hold
     assert "a" in backend.held_keys
 
@@ -177,26 +177,38 @@ def test_emergency_stop_during_inflight_action() -> None:
 # --- 6. End-to-end: F12 mid-loop stops the run and releases held input -------
 
 
-def test_run_f12_stops_loop_and_reports_emergency_stop(tmp_path, monkeypatch) -> None:
+def test_run_f12_stops_loop_and_reports_emergency_stop(
+    tmp_path, monkeypatch, capsys
+) -> None:
     """Firing the wired on_stop mid-loop must stop the run cleanly (rc == 0)
     with ``stopped_reason == "emergency_stop"`` — the headless analog of
     pressing F12 during ``run``.
 
-    The hook fires on the first tick (monkeypatched into the loop's pace
-    point via the backend's on_stop callback, driven here by a stubbed
-    ``wait_next_frame`` so the test is deterministic and timing-free).
+    The hook fires at the loop's first pace point (``wait_next_frame``) by
+    invoking the spy backend's ``trigger_emergency_stop`` — the same call the
+    real Windows backend's F12 hotkey handler makes. The spy is wired with the
+    live ``on_stop`` callback (via ``set_on_stop``) exactly as the real factory
+    would be, so this exercises the true F12 path: ``stop_event.set()`` +
+    ``executor.trigger_emergency_stop``. Deterministic and timing-free.
     """
+    from ai_game_agent.capture import Capture
+
     cfg = _write(tmp_path, _OBSERVE_CONFIG)
+    spy = MockBackend()
+
+    def spy_create_backend(cfg, on_stop=None):
+        # Wire the callback exactly as the real factory does (create_backend
+        # forwards on_stop to the backend's stop seam).
+        spy.set_on_stop(on_stop)
+        return spy
+
+    monkeypatch.setattr(cli, "create_backend", spy_create_backend)
 
     def stub_wait_next_frame(self):
         # Fire the emergency stop exactly once, when the loop first paces.
         if not getattr(self, "_fired", False):
             object.__setattr__(self, "_fired", True)
-            stop = getattr(self, "trigger_emergency_stop", None)
-            if callable(stop):
-                stop("f12")
-
-    from ai_game_agent.capture import Capture
+            spy.trigger_emergency_stop("f12")  # simulate the physical F12 press
 
     monkeypatch.setattr(Capture, "wait_next_frame", stub_wait_next_frame)
 
@@ -214,11 +226,6 @@ def test_run_f12_stops_loop_and_reports_emergency_stop(tmp_path, monkeypatch) ->
         ]
     )
     assert rc == 0
-    out = json.loads(
-        __import__("capsys", fromlist=["x"]) if False else _read_last_stdout()
-    )
-    assert out["stopped_reason"] == "emergency_stop"
-
-
-def _read_last_stdout() -> str:  # pragma: no cover - replaced under pytest
-    raise AssertionError("must not be called outside pytest (use capsys)")
+    out = capsys.readouterr().out.strip().splitlines()
+    report = json.loads(out[-1])
+    assert report["stopped_reason"] == "emergency_stop"
