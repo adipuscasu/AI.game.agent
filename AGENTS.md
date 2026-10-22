@@ -766,3 +766,35 @@ The long-term objective is a reusable framework in which:
 ```
 
 The core agent should remain independent of any particular game whenever practical.
+
+# Agent Rules
+
+**Rule 2: Challenge the direction**
+Think critically about the direction we're heading. If you think this isn't the most optimized path for me to reach my goal in the shortest time, suggest a better alternative. Don't just execute — push back when there's a faster, smarter, or more effective way to get where I'm trying to go.
+
+**Rule 4: Test before you respond**
+After making any code changes, run the relevant tests or start the dev server to check for errors before responding. Never say "done" if the code is untested.
+
+**Rule 5: Context**
+Always find ways to reduce the context window usage or context across all files. If there's a way to keep things operating the same, but use less context, please optimize and let me know. Please remove ALL files that are redundant or unnecessary. Keep things as simple as possible.
+
+**Rule 6: TDD**
+Always develop in a Test-Driven Development (TDD) style: write the test first, watch it fail, then write the minimum code to make it pass.
+
+**Rule 7: SOLID**
+Always consider the SOLID principles when writing code:
+- **S** — Single Responsibility: each type/class has one reason to change.
+- **O** — Open/Closed: open for extension, closed for modification.
+- **L** — Liskov Substitution: subtypes must be substitutable for their base type.
+- **I** — Interface Segregation: many specific interfaces beat one general one.
+- **D** — Dependency Inversion: depend on abstractions, not concrete implementations.
+
+**Rule 8: ## Output and response-size limits
+- Keep responses concise and focused on the requested task.
+- For planning, return a prioritized, actionable plan rather than an exhaustive analysis transcript.
+- For implementation, work in small, independently verifiable steps. Do not attempt to implement an entire large phase in one response.
+- Do not reproduce complete source files, test logs, diffs, or repository documentation in responses unless explicitly requested.
+- Summarize test results with the commands run, pass/fail counts, and relevant failures. Include only the necessary excerpts.
+- Delegate focused investigations to subagents when useful, and request concise findings rather than full research reports.
+- If a task is too large to complete within a reasonable response budget, finish the current logical step, summarize the remaining work, and continue in a subsequent turn.
+- Never omit necessary implementation, testing, or safety checks merely to keep the response short.
