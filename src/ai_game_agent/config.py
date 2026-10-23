@@ -13,7 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CONFIG_FILE = _REPO_ROOT / "config" / "default.yaml"
@@ -93,6 +93,7 @@ class _AIConfig(BaseModel):
     provider: str = "ollama"
     model: str = "qwen3.8:27b"
     base_url: str = "http://localhost:11434"
+    timeout: float = Field(default=60.0, gt=0, le=600)
 
 
 class _InputConfig(BaseModel):
@@ -646,8 +647,13 @@ class AIConfig(_FrozenConfig):
         provider: str = "ollama",
         model: str = "qwen3.8:27b",
         base_url: str = "http://localhost:11434",
+        timeout: float = 60.0,
     ) -> None:
-        super().__init__(_AIConfig(provider=provider, model=model, base_url=base_url))
+        try:
+            m = _AIConfig(provider=provider, model=model, base_url=base_url, timeout=timeout)
+        except ValidationError as exc:
+            raise ConfigError(f"invalid AI configuration: {exc}") from exc
+        super().__init__(m)
 
     @property
     def provider(self) -> str:
@@ -660,6 +666,10 @@ class AIConfig(_FrozenConfig):
     @property
     def base_url(self) -> str:
         return self._m.base_url
+
+    @property
+    def timeout(self) -> float:
+        return self._m.timeout
 
 
 class CaptureConfig(_FrozenConfig):
@@ -949,7 +959,9 @@ def _region_from_model(region: _Region | None) -> Region | None:
 
 def _config_from_model(model: _Config) -> Config:
     return Config(
-        ai=AIConfig(model.ai.provider, model.ai.model, model.ai.base_url),
+        ai=AIConfig(
+            model.ai.provider, model.ai.model, model.ai.base_url, model.ai.timeout
+        ),
         capture=CaptureConfig(
             backend=model.capture.backend,
             region=_region_from_model(model.capture.region),
