@@ -497,31 +497,42 @@ designed clean-stop contract. Do **not** rely on Ctrl+C for a "clean partial
 report." Use `--once` / `--max-ticks` for a deterministic, report-producing
 stop.
 
-### 5.4 F12 emergency stop / hotkey — implemented + tested, **not wired into `run`**
+### 5.4 F12 emergency stop / hotkey — **wired into `run`** (non-observe modes)
 
-The machinery exists and is tested: `Executor.trigger_emergency_stop()`, the
-`AgentLoop(hotkey=, stop_event=)` hooks, and `WindowsBackend`'s armed F12
-`_HotkeyDecider`. **But the `run` CLI does not wire it:**
+The machinery is implemented, tested, **and wired into the `run` CLI**:
+`Executor.trigger_emergency_stop()`, the `AgentLoop(stop_event=)` hook, and
+`WindowsBackend`'s armed F12 `_HotkeyDecider`. How the CLI connects it:
 
-- `create_backend` builds `WindowsBackend()` with `on_stop=None` (no-op);
-- `_run` passes **neither** `hotkey=` nor `stop_event=` to `AgentLoop`;
-- `run` never calls `backend.open()` (that's the `act` path), so the pynput
-  listener isn't even started.
+- `_run` builds a live `threading.Event` and an `_f12` callback that sets that
+  event **and** calls `executor.trigger_emergency_stop("f12")`;
+- that callback is passed to `create_backend(..., on_stop=_f12)`, which forwards
+  it to the backend's hotkey decider, so a physical F12 press fires it;
+- the same `stop_event` is passed into `AgentLoop`, which reports
+  `emergency_stop` (F12) or `stop_requested` (a set `stop_event`);
+- `_run` calls `backend.open()` before the loop and `backend.close()` in
+  `finally` (mirroring `act`), so the pynput listener arms on entry and disarms
+  (releasing any held input) on exit.
 
-**Therefore, in the `run` CLI as it stands, F12 does not stop the loop.**
-`stop_requested` and `emergency_stop` are valid report values in code but
-**unreachable from the `run` CLI today.** This is a known wiring gap (a
-follow-up), documented here so the manual tests match the tree. A programmatic
-caller can still wire it by passing a `HotkeyListener` (with `on_trigger`
-calling `executor.trigger_emergency_stop()`) plus a `threading.Event`.
+**Verified in CI** (`tests/test_stop_wiring.py`): the F12 path stops the run
+with `stopped_reason == "emergency_stop"` and releases held input; a set
+`stop_event` stops it with `stop_requested`. Headless (mock backend), no pynput.
 
-### 5.5 Mock backend has no emergency-stop trigger
+**Genuine limitation:** under `observe_only` the CLI leaves the backend
+closed (zero OS input), so the `windows` backend's hotkey listener is **not
+armed** there and a physical F12 is not captured in that mode. A programmatic
+`stop_event.set()` still works in every mode, and the headless mock tests cover
+the full stop path without any listener.
 
-`MockBackend` exposes `open`/`close`, the input verbs, `release_all`, and an
-`events` log — but **no** `trigger_emergency_stop` and **no** hotkey. The mock
-is for deterministic, backend-free runs (CI, replay), not for exercising the
-real stop path. For a real stop source you need the `windows` backend (and per
-§5.4 it is not yet wired into `run`).
+### 5.5 Mock backend **does** expose an emergency-stop trigger
+
+`MockBackend` exposes `open`/`close`, the input verbs, `release_all`, an
+`events` log, **and** a deterministic `trigger_emergency_stop(reason)` (releases
+held input, sets `stopped`, fires `on_stop` at most once). This is what lets CI
+exercise the real stop path **headless, in a bare venv** — no pynput, no OS
+input — so both `emergency_stop` and `stop_requested` are pinned from the `run`
+CLI (see `tests/test_stop_wiring.py`). For a *physical* F12 source you still
+need the `windows` backend, whose listener is armed by `open()` (and per §5.4
+only in non-observe `run` modes).
 
 ### 5.6 Replay workflow
 

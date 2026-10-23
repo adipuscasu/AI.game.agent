@@ -1006,7 +1006,7 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         if ex is not None:
             ex.trigger_emergency_stop("f12")
 
-    executor, _backend = _build_executor(cfg, backend_name, mode, on_stop=_f12)
+    executor, backend = _build_executor(cfg, backend_name, mode, on_stop=_f12)
     _executor_holder["executor"] = executor
     machine, policy = _build_agent(cfg)
 
@@ -1038,7 +1038,19 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         stop_event=stop_event,
         recorder=recorder,
     )
-    report = loop.run()
+    # The loop owns only the *capture* facade (start/stop); the *input* backend
+    # lifecycle is the CLI's job, exactly like _act(): open before dispatch and
+    # close in finally. Under OBSERVE_ONLY the gate holds end to end (the loop
+    # dispatches nothing), so the backend is left closed — mirroring _act and
+    # avoiding the real backend's hotkey-listener side effect in observe-only.
+    open_backend = mode is not OperationMode.OBSERVE_ONLY
+    if open_backend:
+        backend.open()
+    try:
+        report = loop.run()
+    finally:
+        if open_backend:
+            backend.close()
     if getattr(args, "pretty", False):
         text = json.dumps(report.to_dict(), indent=2)
     else:

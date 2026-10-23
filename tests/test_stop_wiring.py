@@ -229,3 +229,72 @@ def test_run_f12_stops_loop_and_reports_emergency_stop(
     out = capsys.readouterr().out.strip().splitlines()
     report = json.loads(out[-1])
     assert report["stopped_reason"] == "emergency_stop"
+
+
+# --- 7. End-to-end: a set stop_event stops the run (stop_requested) ---------
+
+
+def test_run_stop_event_stops_loop_and_reports_stop_requested(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Setting the loop's ``stop_event`` mid-run must stop the run cleanly
+    (rc == 0) with ``stopped_reason == "stop_requested"`` — the other clean,
+    report-producing stop path, distinct from the F12 / ``emergency_stop``
+    test above (different reason string, different trigger: the stop token
+    rather than the backend hotkey).
+
+    This is the *real* path, not just the constructor kwarg (that is pinned by
+    ``test_run_wires_real_stop_event_into_agentloop``): we capture the *live*
+    ``threading.Event`` that ``_run`` hands to ``AgentLoop``, set it at the
+    loop's first pace point (exactly when an external stop source would fire —
+    a future hotkey/IPC), and assert the loop detects it on the next check and
+    exits *early* with the stop-requested reason instead of burning through its
+    ``--max-ticks`` budget.
+
+    Cleanup: in ``observe_only`` no input is ever held, so there is nothing to
+    release; the loop's ``finally`` cleanup (``capture.stop()``) runs on every
+    exit path, which is proven here by the clean rc == 0 and the report on
+    stdout. This deliberately does not duplicate the F12 test's held-input
+    release assertion (that belongs to the ``emergency_stop`` path).
+    """
+    from ai_game_agent.capture import Capture
+
+    cfg = _write(tmp_path, _OBSERVE_CONFIG)
+    real_agentloop = cli.AgentLoop
+    captured: dict = {}
+
+    def factory(*args, **kwargs):
+        captured["stop_event"] = kwargs.get("stop_event")
+        return real_agentloop(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "AgentLoop", factory)
+
+    def stub_wait_next_frame(self):
+        # Fire the stop request exactly once, when the loop first paces —
+        # the in-loop analog of an external source setting the stop token.
+        event = captured.get("stop_event")
+        if event is not None and not event.is_set():
+            event.set()
+
+    monkeypatch.setattr(Capture, "wait_next_frame", stub_wait_next_frame)
+
+    rc = main(
+        [
+            "run",
+            "--max-ticks",
+            "50",
+            "--backend",
+            "mock",
+            "--mode",
+            "observe_only",
+            "--config",
+            cfg,
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out.strip().splitlines()
+    report = json.loads(out[-1])
+    assert report["stopped_reason"] == "stop_requested"
+    # Proof the loop stopped *because* of the stop request (early), not by
+    # running out its 50-tick budget: the check caught it before max_ticks.
+    assert report["ticks"] < 50
