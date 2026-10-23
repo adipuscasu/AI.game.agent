@@ -444,3 +444,116 @@ And the whole suite must stay green in a **bare venv** (no `vision` / `ocr` /
 uv run pytest -q
 ```
 ```
+
+## 5. Phase 4 — the `run` loop and its stop semantics
+
+The `run` subcommand is the generic, game-agnostic observe-decide-act loop
+(Phase 4 §4.4). See `docs/phase-4-loop.md` for the full reference; the steps
+here are the manual smoke tests plus the **honest** stop semantics you should
+verify against the live tree.
+
+### 5.1 Headless run (mock capture + mock input, no display, no OS input)
+
+```powershell
+# One tick, clean report, exit 0 (observe_only emits zero OS input)
+uv run python -m ai_game_agent run --once --backend mock --mode observe_only
+# -> report JSON on stdout: "stopped_reason": "max_ticks", "final_state": "idle"
+$LASTEXITCODE   # -> 0
+
+# N ticks, pretty-printed (indent=2; still valid JSON)
+uv run python -m ai_game_agent run --max-ticks 5 --backend mock --mode observe_only --pretty
+```
+
+`--max-ticks N` (or `--once`) is the **deterministic, report-producing** way to
+end a loop. This is the clean stop — not Ctrl+C (see §5.3).
+
+### 5.2 The two loop config knobs
+
+`config/default.yaml` `agent:` block now carries `state_timeout_s` (default
+`5.0`, watchdog seconds in a non-terminal state) and `recovery_attempts`
+(default `3`, bounded recovery budget before `PAUSED`). Both are validated
+(positive, **bool rejected**) and threaded to `GameStateMachine` on both the
+live `run` and the `replay` path. A bad value must fail loudly:
+
+```powershell
+# Put "recovery_attempts: 0" (or "state_timeout_s: true") in a scratch config,
+# then expect a clean "error: ..." + exit 1, not a traceback:
+uv run python -m ai_game_agent run --once --backend mock --config config\bad.yaml
+$LASTEXITCODE   # -> 1
+```
+
+### 5.3 Ctrl+C / SIGINT — an **abort**, not a clean stop (verified)
+
+**There is no SIGINT handler and no `KeyboardInterrupt` catch in `src/`.** So
+Ctrl+C is an abort, and the honest behavior is:
+
+- a `KeyboardInterrupt` traceback goes to **stderr**;
+- **no report is printed to stdout** (stdout stays empty);
+- the process exits **non-zero** (130 under bash).
+
+The loop's `finally` cleanup (`capture.stop()`, `executor.release_all()`) still
+runs, but only as a side effect of exception unwinding — it is **not** a
+designed clean-stop contract. Do **not** rely on Ctrl+C for a "clean partial
+report." Use `--once` / `--max-ticks` for a deterministic, report-producing
+stop.
+
+### 5.4 F12 emergency stop / hotkey — **wired into `run`** (non-observe modes)
+
+The machinery is implemented, tested, **and wired into the `run` CLI**:
+`Executor.trigger_emergency_stop()`, the `AgentLoop(stop_event=)` hook, and
+`WindowsBackend`'s armed F12 `_HotkeyDecider`. How the CLI connects it:
+
+- `_run` builds a live `threading.Event` and an `_f12` callback that sets that
+  event **and** calls `executor.trigger_emergency_stop("f12")`;
+- that callback is passed to `create_backend(..., on_stop=_f12)`, which forwards
+  it to the backend's hotkey decider, so a physical F12 press fires it;
+- the same `stop_event` is passed into `AgentLoop`, which reports
+  `emergency_stop` (F12) or `stop_requested` (a set `stop_event`);
+- `_run` calls `backend.open()` before the loop and `backend.close()` in
+  `finally` (mirroring `act`), so the pynput listener arms on entry and disarms
+  (releasing any held input) on exit.
+
+**Verified in CI** (`tests/test_stop_wiring.py`): the F12 path stops the run
+with `stopped_reason == "emergency_stop"` and releases held input; a set
+`stop_event` stops it with `stop_requested`. Headless (mock backend), no pynput.
+
+**Genuine limitation:** under `observe_only` the CLI leaves the backend
+closed (zero OS input), so the `windows` backend's hotkey listener is **not
+armed** there and a physical F12 is not captured in that mode. A programmatic
+`stop_event.set()` still works in every mode, and the headless mock tests cover
+the full stop path without any listener.
+
+### 5.5 Mock backend **does** expose an emergency-stop trigger
+
+`MockBackend` exposes `open`/`close`, the input verbs, `release_all`, an
+`events` log, **and** a deterministic `trigger_emergency_stop(reason)` (releases
+held input, sets `stopped`, fires `on_stop` at most once). This is what lets CI
+exercise the real stop path **headless, in a bare venv** — no pynput, no OS
+input — so both `emergency_stop` and `stop_requested` are pinned from the `run`
+CLI (see `tests/test_stop_wiring.py`). For a *physical* F12 source you still
+need the `windows` backend, whose listener is armed by `open()` (and per §5.4
+only in non-observe `run` modes).
+
+### 5.6 Replay workflow
+
+```powershell
+# Record a run's event log (one .jsonl line per LoopEvent):
+uv run python -m ai_game_agent run --max-ticks 50 --backend mock --mode observe_only --record --record-dir recordings
+
+# Replay it — re-derive the state sequence without touching a real app:
+uv run python -m ai_game_agent replay <recorded>.jsonl --config config\default.yaml
+```
+
+Replay uses the same `agent.recovery_attempts` / `agent.state_timeout_s` knobs
+as the live path, so it reproduces the same bounded-recovery budget and
+watchdog timeout as the recorded session.
+
+### 5.7 Phase 4 test suite (optional cross-check)
+
+```powershell
+# Loop, safety, config, and the run/replay CLI contracts
+uv run pytest tests/test_agent_loop.py tests/test_agent_loop_safety.py tests/test_agent_config.py tests/test_run_cli.py tests/test_replay.py -q
+
+# And the whole suite must stay green (CI must not need a desktop or a live game):
+uv run pytest -q
+```

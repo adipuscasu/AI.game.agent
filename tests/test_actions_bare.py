@@ -127,6 +127,16 @@ def test_create_backend_windows_still_fails_cleanly_without_pynput() -> None:
 # --- Meta: environment drift detection ---------------------------------------
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "cross-OS venv rule (shared-mount-cross-os-venv / §15): pynput is "
+        "Windows-only. On the Windows box the 'input' extra is installed in "
+        "the same venv, so pynput IS present there — the bare-venv contract "
+        "is inverted and does not apply. The test still enforces the bare "
+        "contract on Linux/CI, where a bare venv is the expected state."
+    ),
+)
 def test_shared_venv_does_not_have_pynput_installed() -> None:
     """The shared dev venv is *expected* to be bare of pynput (the ``input``
     extra is installed only on the Windows box, per the cross-OS venv rule).

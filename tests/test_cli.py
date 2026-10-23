@@ -990,7 +990,7 @@ def test_cli_act_observe_only_zero_events(monkeypatch) -> None:
     from ai_game_agent.actions.mock import MockBackend
 
     spy = MockBackend()
-    monkeypatch.setattr(cli, "create_backend", lambda cfg: spy)
+    monkeypatch.setattr(cli, "create_backend", lambda cfg, on_stop=None: spy)
     rc = cli.main(
         ["act", "--backend", "mock", "--demo", "--mode", "observe_only"]
     )
@@ -1004,7 +1004,7 @@ def test_cli_act_autonomous_closes_and_releases(monkeypatch) -> None:
     from ai_game_agent.actions.mock import MockBackend
 
     spy = MockBackend()
-    monkeypatch.setattr(cli, "create_backend", lambda cfg: spy)
+    monkeypatch.setattr(cli, "create_backend", lambda cfg, on_stop=None: spy)
     rc = cli.main(
         ["act", "--backend", "mock", "--demo", "--mode", "autonomous"]
     )

@@ -19,6 +19,8 @@ as Phase 1's mock made capture testable.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from ai_game_agent.actions.base import InputBackendError
 
 
@@ -34,11 +36,15 @@ class MockBackend:
 
     name = "mock"
 
-    def __init__(self) -> None:
+    def __init__(
+        self, on_stop: Callable[[], None] | None = None
+    ) -> None:
         self.events: list[tuple[object, ...]] = []
         self.held_keys: set[str] = set()
         self.held_buttons: set[str] = set()
         self.opened = False
+        self.stopped = False
+        self._on_stop: Callable[[], None] | None = on_stop
 
     # --- lifecycle ----------------------------------------------------------
 
@@ -109,15 +115,56 @@ class MockBackend:
     # --- release-all --------------------------------------------------------
 
     def release_all(self) -> None:
-        """Release every held key and button, recording the release events.
+        """Release every held key and button.
+
+        Fault-tolerant, mirroring the real backends: each held input is
+        released through the same per-input path as an individual ``key_up`` /
+        ``mouse_up`` (so a fault injected there is honored), one failure does
+        not stop the rest, and an input whose release fails **stays held** for
+        a later retry. This is what makes the mock a faithful stand-in: a
+        backend whose ``key_up`` can fail is not one whose ``release_all``
+        silently releases that same input.
 
         Idempotent: once nothing is held, a further call is a no-op (no events
         are emitted) so the emergency stop can call it repeatedly and the
         mock's event log stays stable.
         """
         for key in sorted(self.held_keys):
-            self.events.append(("key_up", key))
+            try:
+                self.key_up(key)
+            except Exception:  # noqa: BLE001 - keep it held for retry; continue
+                pass
         for button in sorted(self.held_buttons):
-            self.events.append(("mouse_up", button))
-        self.held_keys.clear()
-        self.held_buttons.clear()
+            try:
+                self.mouse_up(button)
+            except Exception:  # noqa: BLE001 - keep it held for retry; continue
+                pass
+
+    # --- emergency stop (test seam) ----------------------------------------
+
+    def set_on_stop(self, callback: Callable[[], None] | None) -> None:
+        """Set (or clear) the emergency-stop callback.
+
+        Called by the factory or by ``_run`` after the executor exists, so the
+        callback can close over the executor without a construction-order cycle.
+        """
+        self._on_stop = callback
+
+    def trigger_emergency_stop(self, reason: str = "emergency") -> None:
+        """Simulate an emergency-stop hotkey press (the F12 test seam).
+
+        Order (mirrors ``Executor.trigger_emergency_stop``):
+
+        1. ``release_all()`` — release every held key and button;
+        2. set ``stopped = True`` — terminal for this backend's lifetime;
+        3. fire ``_on_stop()`` — the wired callback (stop_event.set() +
+           executor.trigger_emergency_stop) — at most once.
+
+        Idempotent: a second call is a no-op (no re-release, no crash).
+        """
+        if self.stopped:
+            return
+        self.release_all()
+        self.stopped = True
+        if self._on_stop is not None:
+            self._on_stop()
