@@ -23,7 +23,6 @@ import unittest
 
 import pytest
 
-
 # ===================================================================== #
 # config: AIConfig.timeout                                              #
 # ===================================================================== #
@@ -158,32 +157,32 @@ class TestAIDecision:
         assert dec.reasoning == ""
 
     def test_from_dict_missing_action_raises(self):
-        from ai_game_agent.ai import AIError, AIDecision
+        from ai_game_agent.ai import AIDecision, AIError
 
         with pytest.raises(AIError):
             AIDecision.from_dict({"reasoning": "no action"})
 
     def test_from_dict_non_dict_action_raises(self):
-        from ai_game_agent.ai import AIError, AIDecision
+        from ai_game_agent.ai import AIDecision, AIError
 
         with pytest.raises(AIError):
             AIDecision.from_dict({"action": "click"})
 
     def test_from_dict_invalid_action_kind_raises(self):
-        from ai_game_agent.ai import AIError, AIDecision
+        from ai_game_agent.ai import AIDecision, AIError
 
         with pytest.raises(AIError):
             AIDecision.from_dict({"action": {"kind": "teleport",
                                               "schema_version": 1}})
 
     def test_from_dict_non_dict_top_raises(self):
-        from ai_game_agent.ai import AIError, AIDecision
+        from ai_game_agent.ai import AIDecision, AIError
 
         with pytest.raises(AIError):
             AIDecision.from_dict([1, 2, 3])
 
     def test_from_dict_bad_confidence_raises(self):
-        from ai_game_agent.ai import AIError, AIDecision
+        from ai_game_agent.ai import AIDecision, AIError
 
         with pytest.raises(AIError):
             AIDecision.from_dict(
@@ -191,7 +190,7 @@ class TestAIDecision:
             )
 
     def test_from_dict_confidence_string_raises(self):
-        from ai_game_agent.ai import AIError, AIDecision
+        from ai_game_agent.ai import AIDecision, AIError
 
         with pytest.raises(AIError):
             AIDecision.from_dict(
@@ -199,7 +198,7 @@ class TestAIDecision:
             )
 
     def test_from_dict_confidence_bool_rejected(self):
-        from ai_game_agent.ai import AIError, AIDecision
+        from ai_game_agent.ai import AIDecision, AIError
 
         with pytest.raises(AIError):
             AIDecision.from_dict(

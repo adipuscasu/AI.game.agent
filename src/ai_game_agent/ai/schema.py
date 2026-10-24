@@ -13,7 +13,7 @@ stays the same.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from ..actions.action import Action, ActionValidationError
 from .base import AIError
@@ -72,7 +72,7 @@ class AIDecision:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "AIDecision":
+    def from_dict(cls, data: dict) -> AIDecision:
         """Deserialize and validate an AI decision payload.
 
         Expected shape::

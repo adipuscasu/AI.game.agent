@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import base64
 import json
-import socket
 import urllib.error
 import urllib.request
 
@@ -194,7 +193,6 @@ class OllamaProvider:
 
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                status = getattr(resp, "status", None)
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
             err_body = exc.read()[:512]
@@ -206,7 +204,7 @@ class OllamaProvider:
             raise AIError(
                 f"Ollama connection failed ({path}): {exc.reason}"
             ) from exc
-        except socket.timeout as exc:
+        except TimeoutError as exc:
             raise AIError(
                 f"Ollama request timed out after {self.timeout}s ({path})"
             ) from exc
@@ -275,7 +273,7 @@ class OllamaProvider:
             if start == -1 or end == -1 or end <= start:
                 raise AIError(
                     f"Could not parse AI decision as JSON: {text[:200]!r}"
-                )
+                ) from None
             try:
                 data = json.loads(candidate[start : end + 1])
             except json.JSONDecodeError as exc:

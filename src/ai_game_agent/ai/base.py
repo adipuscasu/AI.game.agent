@@ -94,7 +94,7 @@ class AIProvider(Protocol):
         ...
 
 
-def create_client(config: "AIConfig", **kwargs: object) -> AIProvider:
+def create_client(config: AIConfig, **kwargs: object) -> AIProvider:
     """Instantiate an AI provider from :class:`AIConfig`.
 
     Supported providers (Phase 5): ``ollama``.
