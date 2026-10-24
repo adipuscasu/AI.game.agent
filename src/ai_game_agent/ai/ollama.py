@@ -25,6 +25,7 @@ import urllib.error
 import urllib.request
 
 from .base import AIError
+from .schema import AIDecision
 
 #: Default per-request timeout (seconds); overridable per config.
 _DEFAULT_TIMEOUT = 60.0
@@ -123,13 +124,16 @@ class OllamaProvider:
         temperature: float = 0.1,
         max_tokens: int | None = None,
         format_schema: dict | None = None,
-    ) -> dict:
-        """Ask Ollama for a JSON decision object and parse it.
+    ) -> AIDecision:
+        """Ask Ollama for a JSON decision object and validate it.
 
-        Uses ``format: "json"`` (or a JSON schema) to force structured output.
+        Uses ``format: "json"`` (or a JSON schema) to force structured output,
+        then parses and validates the payload via :meth:`AIDecision.from_dict`
+        so a malformed or unknown action never reaches the caller.
 
         Raises:
-            AIError: On transport failure or unparseable JSON.
+            AIError: On transport failure, unparseable JSON, or a decision
+                that fails :class:`AIDecision` validation.
         """
         if image is not None and image_mime not in _IMAGE_MIMES:
             raise AIError(
@@ -169,7 +173,13 @@ class OllamaProvider:
         if not isinstance(text, str):
             raise AIError("Ollama decision response missing 'response' string")
 
-        return self._parse_json(text)
+        data = self._parse_json(text)
+        try:
+            return AIDecision.from_dict(data)
+        except AIError:
+            raise
+        except Exception as exc:  # defensive: from_dict should only raise AIError
+            raise AIError(f"invalid AI decision: {exc}") from exc
 
     # ------------------------------------------------------------------ #
     # Transport                                                           #

@@ -102,6 +102,18 @@ class TestOllamaProviderTimeoutValidation:
         with pytest.raises(AIError):
             self._provider(float("-inf"))
 
+    def test_zero_timeout_rejected(self):
+        from ai_game_agent.ai import AIError
+
+        with pytest.raises(AIError):
+            self._provider(0.0)
+
+    def test_negative_finite_timeout_rejected(self):
+        from ai_game_agent.ai import AIError
+
+        with pytest.raises(AIError):
+            self._provider(-1.0)
+
     def test_finite_positive_timeout_accepted(self):
         p = self._provider(12.5)
         assert p.timeout == 12.5
@@ -191,6 +203,83 @@ class TestAIDecisionDirectConstruction:
             AIDecision.from_dict(
                 {"action": _noop_action_dict(), "reasoning": ["a", "b"]}
             )
+
+
+
+class TestAIDecisionProvenance:
+    """An AI-generated decision's action is AI-originated.
+
+    ``Action.source`` defaults to ``"user"``. An :class:`AIDecision` must
+    stamp its action's provenance to ``"ai"`` so the executor, logs, and
+    replay can distinguish AI actions from human-entered ones.
+    """
+
+    def test_from_dict_stamps_ai_source(self):
+        from ai_game_agent.ai import AIDecision
+
+        dec = AIDecision.from_dict({"action": _noop_action_dict()})
+        assert dec.action.source == "ai"
+
+    def test_direct_construction_stamps_ai_source(self):
+        from ai_game_agent.ai import AIDecision
+
+        dec = AIDecision(action=_click_action(), reasoning="r", confidence=0.5)
+        assert dec.action.source == "ai"
+
+    def test_model_supplied_source_is_overridden(self):
+        from ai_game_agent.ai import AIDecision
+
+        # Even if the model claims a different origin, an AI decision is
+        # AI-originated.
+        payload = dict(_noop_action_dict(), source="user")
+        dec = AIDecision.from_dict({"action": payload})
+        assert dec.action.source == "ai"
+
+    def test_roundtrip_preserves_ai_source(self):
+        from ai_game_agent.ai import AIDecision
+
+        dec = AIDecision.from_dict({"action": _noop_action_dict()})
+        dec2 = AIDecision.from_dict(dec.to_dict())
+        assert dec2.action.source == "ai"
+
+
+
+class TestAIDecisionConfidenceConsistency:
+    """The decision's confidence is the single source of truth.
+
+    An ``action.confidence`` that contradicts the decision's confidence is
+    ambiguous model output and must be rejected (fail loud) rather than
+    silently normalized. A consistent (or absent) action confidence is
+    accepted.
+    """
+
+    def test_conflicting_action_confidence_rejected(self):
+        from ai_game_agent.ai import AIDecision, AIError
+
+        action = dict(_noop_action_dict(), confidence=0.3)
+        with pytest.raises(AIError):
+            AIDecision.from_dict({"action": action, "confidence": 0.9})
+
+    def test_matching_action_confidence_accepted(self):
+        from ai_game_agent.ai import AIDecision
+
+        action = dict(_noop_action_dict(), confidence=0.7)
+        dec = AIDecision.from_dict({"action": action, "confidence": 0.7})
+        assert dec.confidence == 0.7
+
+    def test_action_confidence_absent_accepted(self):
+        from ai_game_agent.ai import AIDecision
+
+        dec = AIDecision.from_dict({"action": _noop_action_dict(), "confidence": 0.4})
+        assert dec.confidence == 0.4
+
+    def test_direct_construction_conflicting_rejected(self):
+        from ai_game_agent.actions import Action
+        from ai_game_agent.ai import AIDecision, AIError
+
+        action = Action.from_dict(dict(_noop_action_dict(), confidence=0.1))
+        with pytest.raises(AIError):
+            AIDecision(action=action, confidence=0.8)
 
 
 
@@ -454,6 +543,63 @@ def _png_bytes() -> bytes:
     return sig + ihdr + idat + iend
 
 
+class TestDecideValidation:
+    """decide() must return a *validated* AIDecision, not a raw dict.
+
+    The package contract ("model proposes; application validates") means a
+    malformed or unknown action (e.g. an invented ``"noop"`` kind) is
+    rejected with AIError instead of being handed back for execution.
+    """
+
+    def test_decide_returns_validated_decision(self):
+        from ai_game_agent.ai import AIDecision, OllamaProvider
+
+        resp = {"response": json.dumps(
+            {"action": {"kind": "mouse_click", "schema_version": 1}}
+        )}
+        server = _ScriptedOllamaServer(response=resp)
+        base_url = server.start()
+        try:
+            p = OllamaProvider(model="m", base_url=base_url, timeout=5.0)
+            out = p.decide("choose")
+            assert isinstance(out, AIDecision)
+            assert out.action.kind.value == "mouse_click"
+            assert out.action.source == "ai"
+        finally:
+            server.stop()
+
+    def test_decide_rejects_unknown_action_kind(self):
+        from ai_game_agent.ai import AIError, OllamaProvider
+
+        # "noop" is not an ActionKind: the model inventing kinds must be
+        # rejected, not handed back for execution.
+        resp = {"response": json.dumps(
+            {"action": {"kind": "noop", "schema_version": 1}}
+        )}
+        server = _ScriptedOllamaServer(response=resp)
+        base_url = server.start()
+        try:
+            p = OllamaProvider(model="m", base_url=base_url, timeout=5.0)
+            with pytest.raises(AIError):
+                p.decide("choose")
+        finally:
+            server.stop()
+
+    def test_decide_rejects_missing_action(self):
+        from ai_game_agent.ai import AIError, OllamaProvider
+
+        resp = {"response": json.dumps({"reasoning": "no action available"})}
+        server = _ScriptedOllamaServer(response=resp)
+        base_url = server.start()
+        try:
+            p = OllamaProvider(model="m", base_url=base_url, timeout=5.0)
+            with pytest.raises(AIError):
+                p.decide("choose")
+        finally:
+            server.stop()
+
+
+
 class TestOllamaRequestShape:
     def test_generate_request_shape(self):
         from ai_game_agent.ai import OllamaProvider
@@ -510,15 +656,14 @@ class TestOllamaRequestShape:
     def test_decide_forces_json_mode(self):
         from ai_game_agent.ai import OllamaProvider
 
-        resp = {"response": json.dumps({"action": {"kind": "noop",
+        resp = {"response": json.dumps({"action": {"kind": "mouse_click",
                                                      "schema_version": 1}})}
         server = _ScriptedOllamaServer(response=resp)
         base_url = server.start()
         try:
             p = OllamaProvider(model="m", base_url=base_url, timeout=5.0)
             out = p.decide("choose an action")
-            assert isinstance(out, dict)
-            assert out["action"]["kind"] == "noop"
+            assert out.action.kind.value == "mouse_click"
 
             req = server.requests[-1]
             assert req["payload"]["format"] == "json"
@@ -529,7 +674,7 @@ class TestOllamaRequestShape:
     def test_decide_with_format_schema(self):
         from ai_game_agent.ai import OllamaProvider
 
-        resp = {"response": json.dumps({"action": {"kind": "noop",
+        resp = {"response": json.dumps({"action": {"kind": "mouse_click",
                                                      "schema_version": 1}})}
         server = _ScriptedOllamaServer(response=resp)
         base_url = server.start()
@@ -545,7 +690,7 @@ class TestOllamaRequestShape:
     def test_decide_max_tokens_sets_num_predict(self):
         from ai_game_agent.ai import OllamaProvider
 
-        resp = {"response": json.dumps({"action": {"kind": "noop",
+        resp = {"response": json.dumps({"action": {"kind": "mouse_click",
                                                      "schema_version": 1}})}
         server = _ScriptedOllamaServer(response=resp)
         base_url = server.start()
@@ -575,7 +720,7 @@ class TestOllamaResponseParsing:
         from ai_game_agent.ai import OllamaProvider
 
         payload = {
-            "action": {"kind": "noop", "schema_version": 1},
+            "action": {"kind": "mouse_click", "schema_version": 1},
             "reasoning": "safe",
         }
         fenced = "```json\n" + json.dumps(payload) + "\n```"
@@ -584,22 +729,22 @@ class TestOllamaResponseParsing:
         try:
             p = OllamaProvider(model="m", base_url=base_url, timeout=5.0)
             out = p.decide("choose")
-            assert out["action"]["kind"] == "noop"
-            assert out["reasoning"] == "safe"
+            assert out.action.kind.value == "mouse_click"
+            assert out.reasoning == "safe"
         finally:
             server.stop()
 
     def test_decide_embedded_json_in_prose(self):
         from ai_game_agent.ai import OllamaProvider
 
-        payload = {"action": {"kind": "noop", "schema_version": 1}}
+        payload = {"action": {"kind": "mouse_click", "schema_version": 1}}
         text = "Sure, here is my decision: " + json.dumps(payload)
         server = _ScriptedOllamaServer(response={"response": text})
         base_url = server.start()
         try:
             p = OllamaProvider(model="m", base_url=base_url, timeout=5.0)
             out = p.decide("choose")
-            assert out["action"]["kind"] == "noop"
+            assert out.action.kind.value == "mouse_click"
         finally:
             server.stop()
 

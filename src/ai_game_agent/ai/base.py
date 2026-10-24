@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..config import AIConfig
+    from .schema import AIDecision
 
 
 class AIError(Exception):
@@ -75,21 +76,25 @@ class AIProvider(Protocol):
         temperature: float = 0.1,
         max_tokens: int | None = None,
         format_schema: dict | None = None,
-    ) -> dict:
-        """Ask the model for a structured decision and parse it.
+    ) -> AIDecision:
+        """Ask the model for a structured decision and validate it.
 
-        Returns a :class:`dict` that must conform to :class:`AIDecision`
-        (validated by the caller via :meth:`AIDecision.from_dict`).
+        Returns a :class:`AIDecision` that has been parsed *and* validated
+        via :meth:`AIDecision.from_dict`: the action is re-checked against
+        the Phase-3 action contract, its provenance is stamped to ``ai``,
+        and any malformed or unknown action raises :class:`AIError` before
+        it can reach the caller. (Callers do not need to re-validate.)
 
         Args:
             format_schema: Optional JSON schema for structured output
                 (provider-specific; Ollama uses this for ``format``).
 
         Returns:
-            Parsed JSON object (dict).
+            A validated :class:`AIDecision`.
 
         Raises:
-            AIError: On transport failure or unparseable response.
+            AIError: On transport failure, unparseable response, or a
+                decision that fails validation.
         """
         ...
 

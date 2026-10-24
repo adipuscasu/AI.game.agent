@@ -52,6 +52,15 @@ class AIDecision:
             raise AIError(
                 f"AI suggested an invalid action: {exc}"
             ) from exc
+        # Provenance: an AI decision's action is AI-originated. Action
+        # defaults to source="user", so stamp it explicitly (Action is
+        # frozen; replace with a stamped copy rather than mutating).
+        import dataclasses
+
+        if self.action.source != "ai":
+            object.__setattr__(
+                self, "action", dataclasses.replace(self.action, source="ai")
+            )
         if not isinstance(self.reasoning, str):
             raise AIError(
                 f"AI decision reasoning must be a string, got "
@@ -69,6 +78,17 @@ class AIDecision:
         if not 0.0 <= self.confidence <= 1.0:
             raise AIError(
                 f"AI decision confidence must be in [0.0, 1.0], got {self.confidence!r}"
+            )
+        # The decision's confidence is the single source of truth. A
+        # contradicting action.confidence is ambiguous model output — reject
+        # it rather than silently normalize.
+        if (
+            self.action.confidence is not None
+            and self.action.confidence != self.confidence
+        ):
+            raise AIError(
+                f"AI decision confidence {self.confidence!r} contradicts "
+                f"action confidence {self.action.confidence!r}"
             )
 
     @property
