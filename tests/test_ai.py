@@ -283,6 +283,51 @@ class TestAIDecisionConfidenceConsistency:
 
 
 
+class TestAIDecisionConfidenceType:
+    """``AIDecision.confidence`` is always a ``float``, on every path.
+
+    ``from_dict`` normalizes via ``float(confidence)`` but direct
+    construction stored the value as-given, so an ``int`` confidence
+    (legal in Python: ``isinstance(1, (int, float))``) produced
+    ``dec.confidence == 1`` (int) from one path and ``1.0`` (float) from
+    the other, and ``to_dict()`` serialized the same logical decision as
+    ``1`` vs ``1.0``. The contract (schema.py: "Model-reported confidence
+    in [0.0, 1.0]") and the field annotation (``float``) say float; both
+    paths must agree.
+    """
+
+    def test_direct_construction_int_confidence_is_float(self):
+        from ai_game_agent.ai import AIDecision
+
+        dec = AIDecision(action=_click_action(), confidence=1)
+        assert dec.confidence == 1.0
+        assert type(dec.confidence) is float
+
+    def test_direct_construction_int_zero_confidence_is_float(self):
+        from ai_game_agent.ai import AIDecision
+
+        dec = AIDecision(action=_click_action(), confidence=0)
+        assert dec.confidence == 0.0
+        assert type(dec.confidence) is float
+
+    def test_both_construction_paths_serialize_identically(self):
+        """Same logical decision, same JSON bytes, whichever path built it."""
+        import json
+
+        from ai_game_agent.actions import Action
+        from ai_game_agent.ai import AIDecision
+
+        payload = dict(_noop_action_dict(), confidence=1)
+        direct = AIDecision(action=Action.from_dict(payload), confidence=1)
+        via_dict = AIDecision.from_dict({"action": payload, "confidence": 1})
+        assert json.dumps(direct.to_dict(), sort_keys=True) == json.dumps(
+            via_dict.to_dict(), sort_keys=True
+        )
+        assert direct.to_dict()["confidence"] == via_dict.to_dict()["confidence"]
+        assert type(direct.to_dict()["confidence"]) is float
+
+
+
 class TestCreateClient:
     def test_returns_ollama_provider(self):
         from ai_game_agent.ai import create_client
