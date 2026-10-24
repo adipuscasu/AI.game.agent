@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import urllib.error
 import urllib.request
 
@@ -51,8 +52,10 @@ class OllamaProvider:
             raise AIError("Ollama model name must be a non-empty string")
         if not base_url:
             raise AIError("Ollama base_url must be a non-empty string")
-        if timeout <= 0:
-            raise AIError(f"Ollama timeout must be positive, got {timeout!r}")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise AIError(
+                f"Ollama timeout must be a finite positive number, got {timeout!r}"
+            )
 
         self.model = model
         # Normalise: strip trailing slash, no trailing path.

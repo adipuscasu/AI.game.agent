@@ -68,6 +68,132 @@ class TestAIConfigTimeout:
 # ===================================================================== #
 
 
+class TestOllamaProviderTimeoutValidation:
+    """OllamaProvider is public — constructor must validate timeout itself.
+
+    The config layer (``AIConfig.timeout``) rejects non-finite values via
+    pydantic, but direct instantiation can bypass it. The constructor must
+    accept only a finite, strictly positive timeout and raise ``AIError``
+    (not let a bad value leak into the HTTP transport).
+    """
+
+    def _provider(self, timeout: float):
+        from ai_game_agent.ai import OllamaProvider
+
+        return OllamaProvider(
+            model="m", base_url="http://localhost:11434", timeout=timeout
+        )
+
+    def test_nan_timeout_rejected(self):
+        from ai_game_agent.ai import AIError
+
+        with pytest.raises(AIError):
+            self._provider(float("nan"))
+
+    def test_positive_infinity_timeout_rejected(self):
+        from ai_game_agent.ai import AIError
+
+        with pytest.raises(AIError):
+            self._provider(float("inf"))
+
+    def test_negative_infinity_timeout_rejected(self):
+        from ai_game_agent.ai import AIError
+
+        with pytest.raises(AIError):
+            self._provider(float("-inf"))
+
+    def test_finite_positive_timeout_accepted(self):
+        p = self._provider(12.5)
+        assert p.timeout == 12.5
+
+
+def _click_action():
+    """A valid minimal mouse_click Action (Phase-3 canonical vocabulary)."""
+    from ai_game_agent.actions import Action
+
+    return Action.from_dict(_noop_action_dict())
+
+
+class TestAIDecisionDirectConstruction:
+    """Direct construction must apply the same invariants as from_dict.
+
+    bool is an int subclass in Python, so range checks alone would accept
+    confidence=True; from_dict rejects both bool confidence and non-string
+    reasoning, and the dataclass constructor must match those rules.
+    """
+
+    def test_direct_valid_decision(self):
+        from ai_game_agent.ai import AIDecision
+
+        dec = AIDecision(action=_click_action(), reasoning="why", confidence=0.4)
+        assert dec.confidence == 0.4
+        assert dec.reasoning == "why"
+
+    def test_direct_non_string_reasoning_rejected(self):
+        from ai_game_agent.ai import AIDecision, AIError
+
+        with pytest.raises(AIError):
+            AIDecision(action=_click_action(), reasoning=42)  # type: ignore[arg-type]
+
+    def test_direct_bool_confidence_rejected(self):
+        from ai_game_agent.ai import AIDecision, AIError
+
+        with pytest.raises(AIError):
+            AIDecision(action=_click_action(), confidence=True)  # type: ignore[arg-type]
+
+    def test_direct_nan_confidence_rejected(self):
+        from ai_game_agent.ai import AIDecision, AIError
+
+        with pytest.raises(AIError):
+            AIDecision(action=_click_action(), confidence=float("nan"))
+
+    @pytest.mark.parametrize("bad", [float("inf"), float("-inf")])
+    def test_direct_infinite_confidence_rejected(self, bad: float):
+        from ai_game_agent.ai import AIDecision, AIError
+
+        with pytest.raises(AIError):
+            AIDecision(action=_click_action(), confidence=bad)
+
+    @pytest.mark.parametrize("bad", [-0.1, 1.0001, -1.0, 2.0])
+    def test_direct_out_of_range_confidence_rejected(self, bad: float):
+        from ai_game_agent.ai import AIDecision, AIError
+
+        with pytest.raises(AIError):
+            AIDecision(action=_click_action(), confidence=bad)
+
+    @pytest.mark.parametrize("edge", [0.0, 1.0])
+    def test_direct_boundary_confidence_accepted(self, edge: float):
+        from ai_game_agent.ai import AIDecision
+
+        dec = AIDecision(action=_click_action(), confidence=edge)
+        assert dec.confidence == edge
+
+    def test_from_dict_nan_confidence_rejected(self):
+        from ai_game_agent.ai import AIDecision, AIError
+
+        with pytest.raises(AIError):
+            AIDecision.from_dict(
+                {"action": _noop_action_dict(), "confidence": float("nan")}
+            )
+
+    def test_from_dict_infinite_confidence_rejected(self):
+        from ai_game_agent.ai import AIDecision, AIError
+
+        with pytest.raises(AIError):
+            AIDecision.from_dict(
+                {"action": _noop_action_dict(), "confidence": float("inf")}
+            )
+
+    def test_from_dict_non_string_reasoning_rejected(self):
+        from ai_game_agent.ai import AIDecision, AIError
+
+        with pytest.raises(AIError):
+            AIDecision.from_dict(
+                {"action": _noop_action_dict(), "reasoning": ["a", "b"]}
+            )
+
+
+
 class TestCreateClient:
     def test_returns_ollama_provider(self):
         from ai_game_agent.ai import create_client

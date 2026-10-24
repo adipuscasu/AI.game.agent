@@ -52,6 +52,20 @@ class AIDecision:
             raise AIError(
                 f"AI suggested an invalid action: {exc}"
             ) from exc
+        if not isinstance(self.reasoning, str):
+            raise AIError(
+                f"AI decision reasoning must be a string, got "
+                f"{type(self.reasoning).__name__}"
+            )
+        # bool is an int subclass, so explicitly reject it before the range
+        # check (confidence=True would otherwise satisfy 0.0 <= x <= 1.0).
+        if isinstance(self.confidence, bool) or not isinstance(
+            self.confidence, (int, float)
+        ):
+            raise AIError(
+                f"AI decision confidence must be a number, got "
+                f"{type(self.confidence).__name__}"
+            )
         if not 0.0 <= self.confidence <= 1.0:
             raise AIError(
                 f"AI decision confidence must be in [0.0, 1.0], got {self.confidence!r}"
