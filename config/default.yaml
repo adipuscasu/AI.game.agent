@@ -12,6 +12,7 @@ ai:
   provider: ollama
   model: qwen3.8:27b
   base_url: http://localhost:11434
+  timeout: 60.0
 
 # Screen capture (Phase 1).
 capture:
