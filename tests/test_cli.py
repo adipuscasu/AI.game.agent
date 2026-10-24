@@ -940,8 +940,20 @@ def test_cli_act_windows_requires_confirm(capsys) -> None:
     assert "confirm" in err.lower()
 
 
-def test_cli_act_windows_confirm_absent_still_clean_on_missing_pynput(capsys) -> None:
-    """With --confirm but pynput absent: still a clean error naming the extra."""
+def test_cli_act_windows_confirm_absent_still_clean_on_missing_pynput(monkeypatch, capsys) -> None:
+    """With --confirm but pynput absent: still a clean error naming the extra.
+
+    Forces pynput absent *inside the test* (``sys.modules["pynput"] = None``
+    makes any ``import pynput`` raise ImportError) so the clean-degradation
+    path is exercised on every OS. On the Windows box the ``input`` extra is
+    installed, so pynput is importable there and the absent path cannot be
+    reached naturally — the same shared-OS venv rule that gates
+    ``test_shared_venv_does_not_have_pynput_installed`` (cross-OS venv rule,
+    plan §15). ``monkeypatch`` restores ``sys.modules`` after the test.
+    """
+    import sys
+
+    monkeypatch.setitem(sys.modules, "pynput", None)
     rc = main(
         [
             "act", "--backend", "windows", "--demo", "--mode", "assisted",
