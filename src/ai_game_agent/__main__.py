@@ -901,6 +901,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--no-ocr", action="store_true", help="disable OCR")
     p_run.add_argument("--no-objects", action="store_true",
                        help="disable color-blob object detection")
+    p_run.add_argument("--approve-all", action="store_true",
+                       help="ASSISTED mode only: auto-approve every AI proposal "
+                            "(CI/non-interactive); default is an interactive y/N "
+                            "prompt")
+    p_run.add_argument("--approve-timeout", type=float, default=None,
+                       help="ASSISTED mode only: seconds to wait for an approval "
+                            "answer (no timeout by default; fail-safe = reject "
+                            "on timeout/EOF/no-input)")
     p_run.add_argument("--pretty", action="store_true",
                        help="pretty-print the report JSON")
     p_run.add_argument(
@@ -1014,6 +1022,26 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
     # ai_enabled flag is on (opt-in). When off, the loop gets ai=None and
     # AI_ANALYSIS behaves exactly as the Phase-4 slot (watchdog -> PAUSED).
     ai_client = create_client(cfg.ai) if cfg.agent.ai_enabled else None
+    # Phase 6: the assisted-mode approval gate. Only wired in ASSISTED mode, so
+    # the other modes (and their tests) are byte-for-byte unchanged. Default is
+    # TerminalApprover (interactive y/N) for a real run; --approve-all /
+    # --approve-timeout switch it. The loop stays the single gate-owner: the
+    # approver is consulted only for AI-proposed actions in ASSISTED mode.
+    from ai_game_agent.actions.approver import AutoApprover, TerminalApprover
+
+    approver = None
+    if mode is OperationMode.ASSISTED:
+        if getattr(args, "approve_all", False):
+            approver = AutoApprover()
+        else:
+            timeout_s = getattr(args, "approve_timeout", None)
+            if timeout_s is not None:
+                timeout_s = float(timeout_s)
+                if not timeout_s > 0:
+                    raise ValueError(
+                        "--approve-timeout must be a positive number of seconds"
+                    )
+            approver = TerminalApprover(timeout_s=timeout_s)
 
     max_ticks = 1 if getattr(args, "once", False) else getattr(args, "max_ticks", None)
     if max_ticks is not None and int(max_ticks) < 1:
@@ -1043,6 +1071,7 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         stop_event=stop_event,
         recorder=recorder,
         ai=ai_client,
+        approver=approver,
     )
     # The loop owns only the *capture* facade (start/stop); the *input* backend
     # lifecycle is the CLI's job, exactly like _act(): open before dispatch and

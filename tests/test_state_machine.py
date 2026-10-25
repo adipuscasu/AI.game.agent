@@ -292,10 +292,12 @@ def test_state_package_reexports_the_event_contract():
 
 
 def test_event_type_is_closed_with_exactly_the_plan_values():
-    assert len(EventType) == 8
+    # Phase 6 added APPROVAL (the assisted-gate audit event) to the closed
+    # vocabulary; the plan's original eight plus that one make nine.
+    assert len(EventType) == 9
     assert {e.name for e in EventType} == {
         "TICK", "STATE_ENTER", "STATE_EXIT", "ACTION_BATCH",
-        "ACTION_RESULT", "RECOVERY", "STOP", "ERROR",
+        "ACTION_RESULT", "APPROVAL", "RECOVERY", "STOP", "ERROR",
     }
     for e in EventType:  # closed str-enum: string interop + round-trip
         assert isinstance(e, str)

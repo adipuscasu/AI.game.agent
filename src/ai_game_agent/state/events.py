@@ -62,6 +62,7 @@ class EventType(StrEnum):
     STATE_EXIT = "state_exit"
     ACTION_BATCH = "action_batch"
     ACTION_RESULT = "action_result"
+    APPROVAL = "approval"
     RECOVERY = "recovery"
     STOP = "stop"
     ERROR = "error"
