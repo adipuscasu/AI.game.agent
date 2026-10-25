@@ -47,6 +47,7 @@ __all__ = [
     "SIGNAL_LOOT_PRESENT",
     "SIGNAL_TARGET_HOSTILE",
     "SIGNAL_TARGET_PRESENT",
+    "SIGNAL_AI_ANALYSIS_REQUIRED",
 ]
 
 # Stable signal keys: the machine's consumption seam (step 3 produces these).
@@ -55,6 +56,7 @@ SIGNAL_HEALTH_RECOVERED = "health_recovered"
 SIGNAL_LOOT_PRESENT = "loot_present"
 SIGNAL_TARGET_HOSTILE = "target_hostile"
 SIGNAL_TARGET_PRESENT = "target_present"
+SIGNAL_AI_ANALYSIS_REQUIRED = "ai_analysis_required"
 
 Signals = dict[str, object]
 OnTransition = Callable[[LoopEvent], None]
@@ -67,6 +69,7 @@ REASON_TARGET_LOST = "target lost, exiting combat"
 REASON_HEALTH_FLOOR_COMBAT = "health floor breached in combat"
 REASON_LOOT_CLEARED = "loot cleared"
 REASON_HEALTH_RECOVERED = "health recovered above floor"
+REASON_AI_ANALYSIS_REQUIRED = "no deterministic rule matched; requesting AI analysis"
 REASON_RECOVERY_EXHAUSTED = "recovery attempts exhausted; safe pause"
 REASON_STATE_TIMEOUT = "state timeout (watchdog)"
 REASON_NO_ACTIONABLE_SIGNAL = "no actionable zone signal"
@@ -237,6 +240,8 @@ class GameStateMachine:
                 and self._is_true(signals, SIGNAL_TARGET_HOSTILE)
             ):
                 return AgentState.COMBAT, REASON_HOSTILE_TARGET
+            if self._is_true(signals, SIGNAL_AI_ANALYSIS_REQUIRED):
+                return AgentState.AI_ANALYSIS, REASON_AI_ANALYSIS_REQUIRED
             return AgentState.IDLE, REASON_NO_ACTIONABLE_SIGNAL
         if state is AgentState.COMBAT:
             # A present but non-hostile target is not the same as no target.
