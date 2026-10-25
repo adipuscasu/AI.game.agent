@@ -29,6 +29,7 @@ from ai_game_agent.actions.modes import OperationMode
 from ai_game_agent.games.wow.zones import ZONE_LOOT_GLOW, ZONE_TARGET, ZONE_TARGET_HOSTILE
 from ai_game_agent.perception.observation import BBox, Observation
 from ai_game_agent.state.machine import (
+    SIGNAL_AI_ANALYSIS_REQUIRED,
     SIGNAL_HEALTH_LOW,
     SIGNAL_HEALTH_RECOVERED,
     SIGNAL_LOOT_PRESENT,
@@ -128,6 +129,7 @@ class DeterministicPolicy:
         health_low: float = 0.30,
         health_recovered: float = 0.50,
         health_fraction: Callable[[Observation], float | None] | None = None,
+        ai_enabled: bool = False,
     ) -> None:
         if not _valid_key(name):
             raise ValueError(f"policy name must be a non-empty string, got {name!r}")
@@ -162,6 +164,8 @@ class DeterministicPolicy:
             raise ValueError(
                 f"health_low must be < health_recovered, got {health_low!r} !< {health_recovered!r}"
             )
+        if not isinstance(ai_enabled, bool):
+            raise ValueError(f"ai_enabled must be a bool, got {ai_enabled!r}")
 
         self._name = name
         self._combat_keys = tuple(combat_keys)
@@ -173,6 +177,12 @@ class DeterministicPolicy:
         self._health_low = health_low
         self._health_recovered = health_recovered
         self._health_fraction = health_fraction
+        self._ai_enabled = ai_enabled
+
+    @property
+    def ai_enabled(self) -> bool:
+        """Whether the AI_ANALYSIS signal producer is active (opt-in)."""
+        return self._ai_enabled
 
     @classmethod
     def from_config(
@@ -220,6 +230,7 @@ class DeterministicPolicy:
             health_low=agent.health_low,
             health_recovered=agent.health_recovered,
             health_fraction=health_fraction,
+            ai_enabled=getattr(agent, "ai_enabled", False),
         )
 
     def set_health_fraction(
@@ -260,6 +271,35 @@ class DeterministicPolicy:
         # IDLE / AI_ANALYSIS / PAUSED: nothing to do deterministically.
         return ()
 
+    def ai_prompt(
+        self,
+        state: AgentState,
+        observation: Observation,
+    ) -> str:
+        """Build the text prompt for the AI provider in :data:`AgentState.AI_ANALYSIS`.
+
+        Game-specific framing lives here (policy owns the prompt; the loop
+        only passes the string to ``provider.decide()``). Serializes the
+        current UI zones so the model sees what is on screen.
+        """
+        lines = [
+            "You control a World of Warcraft character. Current UI state:",
+        ]
+        for zone in observation.ui_zones:
+            lines.append(
+                f"  {zone.zone}: ({zone.bbox.x}, {zone.bbox.y}, "
+                f"{zone.bbox.width}, {zone.bbox.height})"
+            )
+        lines.append(
+            "Suggested action options: key_press, key_hold, mouse_move, mouse_click, "
+            "mouse_scroll, delay."
+        )
+        lines.append(
+            'Return a JSON object: {"action": "<kind>", "key": "<optional>", '
+            '"x": <int>, "y": <int>, "confidence": <0-1>}'
+        )
+        return "\n".join(lines)
+
     def transition_signals(self, observation: Observation) -> dict[str, object]:
         signals: dict[str, object] = {
             SIGNAL_LOOT_PRESENT: _presence(observation, ZONE_LOOT_GLOW),
@@ -267,6 +307,16 @@ class DeterministicPolicy:
             SIGNAL_TARGET_HOSTILE: _presence(observation, ZONE_TARGET_HOSTILE),
         }
         signals.update(self._health_signals(observation))
+        if self._ai_enabled:
+            # The AI slot is requested only when no deterministic rule has
+            # actionable work. Absent when ai_enabled=False (default) so the
+            # returned dict keeps its existing exact key set.
+            idle_actionable = (
+                signals.get(SIGNAL_LOOT_PRESENT) is True
+                or signals.get(SIGNAL_TARGET_HOSTILE) is True
+                or signals.get(SIGNAL_HEALTH_LOW) is True
+            )
+            signals[SIGNAL_AI_ANALYSIS_REQUIRED] = not idle_actionable
         return signals
 
     # -- per-state action builders (private) --------------------------------

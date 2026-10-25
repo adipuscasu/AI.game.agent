@@ -364,3 +364,58 @@ def test_no_zone_literal_leaks_outside_games_wow():
         source = fh.read()
     for literal in ZONE_LITERALS:
         assert literal not in source, f"zone literal {literal} must live in zones.py"
+
+
+# --- Phase 5 close-out: ai_enabled signal producer + ai_prompt --------------
+# The policy owns the SIGNAL_AI_ANALYSIS_REQUIRED producer and the ai_prompt()
+# method. The signal is only present in the returned dict when ai_enabled is
+# True (the existing "exactly 5 keys" test above holds by default).
+
+
+def test_ai_signal_absent_by_default():
+    """Default ai_enabled=False -> the key is not in the returned dict."""
+    p = DeterministicPolicy()
+    obs = _obs()  # clean idle observation
+    assert "ai_analysis_required" not in p.transition_signals(obs)
+
+
+def test_ai_signal_present_when_enabled_idle():
+    p = DeterministicPolicy(ai_enabled=True)
+    obs = _obs()  # clean idle observation
+    assert p.transition_signals(obs)["ai_analysis_required"] is True
+
+
+def test_ai_signal_suppressed_when_hostile():
+    p = DeterministicPolicy(ai_enabled=True)
+    obs = _obs(zones=(_zone(ZONE_TARGET), _zone(ZONE_TARGET_HOSTILE)))
+    assert p.transition_signals(obs)["ai_analysis_required"] is False
+
+
+def test_ai_signal_suppressed_when_loot():
+    p = DeterministicPolicy(ai_enabled=True)
+    obs = _obs(zones=(_zone(ZONE_LOOT_GLOW),))
+    assert p.transition_signals(obs)["ai_analysis_required"] is False
+
+
+def test_ai_signal_absent_when_enabled_false_explicit():
+    p = DeterministicPolicy(ai_enabled=False)
+    obs = _obs()
+    assert "ai_analysis_required" not in p.transition_signals(obs)
+
+
+def test_ai_prompt_returns_string():
+    p = DeterministicPolicy(ai_enabled=True)
+    obs = _obs(zones=(_zone(ZONE_TARGET_HOSTILE),))
+    prompt = p.ai_prompt(AgentState.AI_ANALYSIS, obs)
+    assert isinstance(prompt, str)
+    assert len(prompt) > 0
+
+
+def test_ai_enabled_defaults_false():
+    p = DeterministicPolicy()
+    assert p.ai_enabled is False
+
+
+def test_ai_enabled_true_round_trip():
+    p = DeterministicPolicy(ai_enabled=True)
+    assert p.ai_enabled is True

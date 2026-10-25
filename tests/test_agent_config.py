@@ -357,3 +357,36 @@ def test_from_config_missing_loot_marker_never_clicks():
     obs = _obs()  # no loot_glow zone present
     actions = p.actions(AgentState.LOOTING, obs, OperationMode.AUTONOMOUS)
     assert all(a.kind is not ActionKind.MOUSE_CLICK for a in actions)
+
+
+# --- Phase 5 close-out: ai_enabled config flag ------------------------------
+# ai_enabled lives in the agent: block (DeterministicPolicy reads it via
+# from_config). Default is False (opt-in) so existing configs and every
+# existing test are unaffected.
+
+
+def test_ai_enabled_defaults_false():
+    assert AgentConfig().ai_enabled is False
+
+
+def test_ai_enabled_true_round_trip():
+    assert AgentConfig(ai_enabled=True).ai_enabled is True
+
+
+def test_ai_enabled_rejects_non_bool():
+    with pytest.raises(ValueError):
+        AgentConfig(ai_enabled="yes")
+
+
+def test_from_config_policy_reads_ai_enabled():
+    cfg = Config(agent=AgentConfig(ai_enabled=True))
+    p = DeterministicPolicy.from_config(cfg)
+    assert p.ai_enabled is True
+    assert "ai_analysis_required" in p.transition_signals(_obs())
+
+
+def test_from_config_policy_default_ai_disabled():
+    cfg = Config()
+    p = DeterministicPolicy.from_config(cfg)
+    assert p.ai_enabled is False
+    assert "ai_analysis_required" not in p.transition_signals(_obs())

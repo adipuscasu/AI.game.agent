@@ -614,3 +614,88 @@ def test_final_tick_paused_outranks_max_ticks(make_loop) -> None:
         f"no pacing after a PAUSED exit on the final tick (got {capture.wait_count})"
     )
     assert capture.stopped is True, "capture.stop() must run in cleanup"
+
+
+# --- Phase 5 close-out: AI_ANALYSIS decide -> act path ----------------------
+# The loop consults the injected AI provider in AI_ANALYSIS, dispatches the
+# validated AIDecision.action, and routes an AIError to bounded RECOVERY
+# (never out of tick()). ai=None (default) keeps today's behavior exactly.
+
+
+class _FakeAI:
+    """Duck-typed AIProvider: decide() returns a fixed decision or raises."""
+
+    def __init__(self, decision=None, error=None) -> None:
+        self._decision = decision
+        self._error = error
+        self.decide_calls = 0
+        self.last_prompt = None
+
+    def decide(self, prompt, **kwargs):
+        self.decide_calls += 1
+        self.last_prompt = prompt
+        if self._error is not None:
+            raise self._error
+        return self._decision
+
+
+def _ai_decision():
+    from ai_game_agent.actions.action import Action, ActionKind
+    from ai_game_agent.ai.schema import AIDecision
+    return AIDecision(
+        action=Action(kind=ActionKind.KEY_PRESS, key="e", source="ai"),
+        confidence=0.9,
+    )
+
+
+def _loop_in_ai_analysis(make_loop, action_backend, *, mode, ai=None):
+    """Build a loop already in AI_ANALYSIS, with the real executor + policy."""
+    machine = GameStateMachine(policy=_StubDecisionPolicy(), initial=AgentState.AI_ANALYSIS)
+    loop = make_loop(mode=mode, machine=machine)
+    if ai is not None:
+        loop._ai = ai
+    return loop
+
+
+def test_ai_decision_dispatched_in_ai_analysis(make_loop, action_backend) -> None:
+    ai = _FakeAI(decision=_ai_decision())
+    loop = _loop_in_ai_analysis(make_loop, action_backend,
+                                mode=OperationMode.AUTONOMOUS, ai=ai)
+    action_backend.open()  # loop does not own backend lifecycle (test convention)
+    result = loop.tick()
+    assert ai.decide_calls == 1, "the loop must consult the provider in AI_ANALYSIS"
+    assert result.state is AgentState.AI_ANALYSIS
+    # The validated action (key "e") was dispatched through the executor.
+    assert action_backend.events, "the AI action must reach the backend"
+    keys = [ev for ev in action_backend.events]
+    assert any("e" in str(k) for k in keys)
+
+
+def test_ai_error_routes_to_recovery_not_raised(make_loop, action_backend) -> None:
+    from ai_game_agent.ai.base import AIError
+    ai = _FakeAI(error=AIError("ollama down"))
+    loop = _loop_in_ai_analysis(make_loop, action_backend,
+                                mode=OperationMode.AUTONOMOUS, ai=ai)
+    # Must NOT raise out of tick(); routed to bounded RECOVERY.
+    result = loop.tick()
+    assert result.error is not None
+    assert result.state is not AgentState.PAUSED  # one attempt: RECOVERY, not PAUSED yet
+    assert action_backend.events == []  # no input emitted on the failure path
+
+
+def test_ai_observe_only_zero_backend_events(make_loop, action_backend) -> None:
+    ai = _FakeAI(decision=_ai_decision())
+    loop = _loop_in_ai_analysis(make_loop, action_backend,
+                                mode=OperationMode.OBSERVE_ONLY, ai=ai)
+    loop.tick()
+    # The AI may be consulted, but OBSERVE_ONLY must emit zero OS input.
+    assert action_backend.events == []
+
+
+def test_no_provider_ai_analysis_dispatches_nothing(make_loop, action_backend) -> None:
+    """Default ai=None: AI_ANALYSIS behaves exactly as today (no dispatch)."""
+    machine = GameStateMachine(policy=_StubDecisionPolicy(), initial=AgentState.AI_ANALYSIS)
+    loop = make_loop(mode=OperationMode.AUTONOMOUS, machine=machine)
+    result = loop.tick()
+    assert result.state is AgentState.AI_ANALYSIS
+    assert action_backend.events == []

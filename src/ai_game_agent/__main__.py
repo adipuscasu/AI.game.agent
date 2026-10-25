@@ -55,6 +55,7 @@ from pathlib import Path
 # without the ``input`` extra stays importable (the contract the
 # bare-import test asserts).
 from ai_game_agent.actions import (
+
     ActionError,
     ActionKind,
     ActionLog,
@@ -68,6 +69,7 @@ from ai_game_agent.actions.base import create_backend
 from ai_game_agent.actions.executor import Executor
 from ai_game_agent.actions.modes import OperationMode
 from ai_game_agent.agent import AgentLoop
+from ai_game_agent.ai import AIError, create_client
 from ai_game_agent.capture import Capture, CaptureError, FpsMeter, save_frame
 from ai_game_agent.config import (
     CaptureConfig,
@@ -1009,6 +1011,10 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
     executor, backend = _build_executor(cfg, backend_name, mode, on_stop=_f12)
     _executor_holder["executor"] = executor
     machine, policy = _build_agent(cfg)
+    # Phase 5 close-out: build the AI provider only when the agent's
+    # ai_enabled flag is on (opt-in). When off, the loop gets ai=None and
+    # AI_ANALYSIS behaves exactly as the Phase-4 slot (watchdog -> PAUSED).
+    ai_client = create_client(cfg.ai) if cfg.agent.ai_enabled else None
 
     max_ticks = 1 if getattr(args, "once", False) else getattr(args, "max_ticks", None)
     if max_ticks is not None and int(max_ticks) < 1:
@@ -1037,6 +1043,7 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         max_ticks=int(max_ticks) if max_ticks is not None else None,
         stop_event=stop_event,
         recorder=recorder,
+        ai=ai_client,
     )
     # The loop owns only the *capture* facade (start/stop); the *input* backend
     # lifecycle is the CLI's job, exactly like _act(): open before dispatch and
@@ -1190,6 +1197,7 @@ def main(argv: list[str] | None = None) -> int:
         ActionError,
         InputBackendError,
         ModeViolation,
+        AIError,
     ) as exc:
         # OSError covers genuine I/O failures (permission, full disk,
         # read-only target) raised by save_frame/Recorder while writing

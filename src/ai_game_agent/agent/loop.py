@@ -103,6 +103,7 @@ class AgentLoop:
         hotkey: HotkeyListener | None = None,
         on_event: Callable[[LoopEvent], None] | None = None,
         recorder: Callable[[LoopEvent], None] | None = None,
+        ai: object | None = None,
     ) -> None:
         if max_ticks is not None and max_ticks < 1:
             raise ValueError("max_ticks must be >= 1 or None")
@@ -118,6 +119,11 @@ class AgentLoop:
         self._hotkey = hotkey
         self._on_event = on_event
         self._recorder = recorder
+        # Phase 5 close-out: optional AI provider (duck-typed AIProvider).
+        # The loop never imports ai_game_agent.ai — it only calls
+        # provider.decide(prompt) -> AIDecision. None (default) keeps
+        # AI_ANALYSIS behaving exactly as today (no dispatch, watchdog fires).
+        self._ai = ai
         # Report accumulators (so a lone tick() also works, not just run()).
         self._seq = 0
         self._ticks = 0
@@ -197,7 +203,20 @@ class AgentLoop:
 
         self._machine.decide(observation, now=now)
         state = self._machine.state
-        actions = self._policy.actions(state, observation, self._mode)
+        if state is AgentState.AI_ANALYSIS and self._ai is not None:
+            # AI seam: the policy owns the prompt (game-agnostic loop only
+            # passes the string to the provider). A provider failure is
+            # classified, routed to bounded RECOVERY, never raised out of
+            # tick() — same contract as capture/perception.
+            prompt_fn = getattr(self._policy, "ai_prompt", None)
+            prompt = prompt_fn(state, observation) if prompt_fn else ""
+            try:
+                decision = self._ai.decide(prompt)
+                actions = (decision.action,)
+            except Exception as exc:  # noqa: BLE001 - classify, never kill the loop
+                return self._on_pipeline_error(exc, "ai", now)
+        else:
+            actions = self._policy.actions(state, observation, self._mode)
         results: tuple[ActionResult, ...] = ()
         if self._mode.input_allowed and actions:
             results = self._dispatch(actions, now)

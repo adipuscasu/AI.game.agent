@@ -23,6 +23,7 @@ import pytest
 
 from ai_game_agent.state.events import EventType, LoopEvent
 from ai_game_agent.state.machine import (
+    SIGNAL_AI_ANALYSIS_REQUIRED,
     SIGNAL_HEALTH_LOW,
     SIGNAL_HEALTH_RECOVERED,
     SIGNAL_LOOT_PRESENT,
@@ -502,3 +503,58 @@ def test_constructor_rejects_mixed_type_watchdog_states():
             policy=StubPolicy(),
             watchdog_states={AgentState.RECOVERY, AgentState.PAUSED, 7},
         )
+
+
+# --- Phase 5 close-out: SIGNAL_AI_ANALYSIS_REQUIRED edge --------------------
+# The IDLE -> AI_ANALYSIS edge already exists in machine.py (uncommitted dirty
+# diff). These tests are the spec for that edge and the priority ordering
+# that keeps the existing combat/loot/health rules dominant over the AI slot.
+
+
+def test_idle_ai_analysis_required_to_ai_analysis():
+    m, _ = make({SIGNAL_AI_ANALYSIS_REQUIRED: True})
+    assert m.decide(OBS, 1000) is AgentState.AI_ANALYSIS
+
+
+def test_idle_ai_analysis_required_false_stays_idle():
+    m, _ = make({SIGNAL_AI_ANALYSIS_REQUIRED: False})
+    assert m.decide(OBS, 1000) is AgentState.IDLE
+
+
+def test_idle_ai_analysis_required_absent_stays_idle():
+    """Absent key is treated as not-True (the _is_true contract)."""
+    m, _ = make({})
+    assert m.decide(OBS, 1000) is AgentState.IDLE
+
+
+def test_idle_hostile_wins_over_ai_analysis():
+    m, _ = make({
+        SIGNAL_TARGET_PRESENT: True,
+        SIGNAL_TARGET_HOSTILE: True,
+        SIGNAL_AI_ANALYSIS_REQUIRED: True,
+    })
+    assert m.decide(OBS, 1000) is AgentState.COMBAT
+
+
+def test_idle_loot_wins_over_ai_analysis():
+    m, _ = make({
+        SIGNAL_LOOT_PRESENT: True,
+        SIGNAL_AI_ANALYSIS_REQUIRED: True,
+    })
+    assert m.decide(OBS, 1000) is AgentState.LOOTING
+
+
+def test_idle_health_wins_over_ai_analysis():
+    m, _ = make({
+        SIGNAL_HEALTH_LOW: True,
+        SIGNAL_AI_ANALYSIS_REQUIRED: True,
+    })
+    assert m.decide(OBS, 1000) is AgentState.RECOVERY
+
+
+def test_ai_analysis_watchdog_to_paused():
+    """AI_ANALYSIS is stable; the watchdog is what moves it to PAUSED."""
+    m, _ = make({}, initial=AgentState.AI_ANALYSIS)
+    assert m.decide(OBS, 1000) is AgentState.AI_ANALYSIS
+    assert m.decide(OBS, 1004.9) is AgentState.AI_ANALYSIS
+    assert m.decide(OBS, 1005) is AgentState.PAUSED

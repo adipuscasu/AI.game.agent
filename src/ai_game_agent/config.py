@@ -316,6 +316,10 @@ class _AgentConfig(BaseModel):
     # without these keys is backward compatible.
     state_timeout_s: float = Field(default=5.0, gt=0)
     recovery_attempts: int = Field(default=3, gt=0)
+    # Phase 5 close-out: opt-in flag for the AI_ANALYSIS seam. Default False
+    # (AI off) keeps every existing config + test unchanged; the policy only
+    # emits SIGNAL_AI_ANALYSIS_REQUIRED when this is True.
+    ai_enabled: bool = Field(default=False)
 
     @field_validator("state_timeout_s", "recovery_attempts", mode="before")
     @classmethod
@@ -359,6 +363,7 @@ class AgentConfig:
         "health_recovered",
         "state_timeout_s",
         "recovery_attempts",
+        "ai_enabled",
     )
 
     def __init__(
@@ -374,6 +379,7 @@ class AgentConfig:
         health_recovered: float = 0.50,
         state_timeout_s: float = 5.0,
         recovery_attempts: int = 3,
+        ai_enabled: bool = False,
     ) -> None:
         # Validate against the same rules the model enforces (so a direct
         # AgentConfig(...) call is just as strict as a YAML round-trip).
@@ -416,6 +422,8 @@ class AgentConfig:
             and recovery_attempts > 0
         ):
             raise ValueError(f"recovery_attempts must be a positive int, got {recovery_attempts!r}")
+        if not isinstance(ai_enabled, bool):
+            raise ValueError(f"ai_enabled must be a bool, got {ai_enabled!r}")
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "combat_keys", tuple(combat_keys))
         object.__setattr__(self, "combat_delay_ms", combat_delay_ms)
@@ -427,6 +435,7 @@ class AgentConfig:
         object.__setattr__(self, "health_recovered", health_recovered)
         object.__setattr__(self, "state_timeout_s", state_timeout_s)
         object.__setattr__(self, "recovery_attempts", recovery_attempts)
+        object.__setattr__(self, "ai_enabled", ai_enabled)
 
     @classmethod
     def from_model(cls, model: _AgentConfig) -> AgentConfig:
@@ -442,6 +451,7 @@ class AgentConfig:
             health_recovered=model.health_recovered,
             state_timeout_s=model.state_timeout_s,
             recovery_attempts=model.recovery_attempts,
+            ai_enabled=model.ai_enabled,
         )
 
     def __setattr__(self, name: str, value: object) -> None:  # pragma: no cover
@@ -473,6 +483,7 @@ class AgentConfig:
             and self.health_recovered == other.health_recovered
             and self.state_timeout_s == other.state_timeout_s
             and self.recovery_attempts == other.recovery_attempts
+            and self.ai_enabled == other.ai_enabled
         )
 
     def __hash__(self) -> int:
@@ -489,6 +500,7 @@ class AgentConfig:
                 self.health_recovered,
                 self.state_timeout_s,
                 self.recovery_attempts,
+                self.ai_enabled,
             )
         )
 
