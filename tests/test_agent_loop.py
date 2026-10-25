@@ -158,6 +158,8 @@ def make_loop(action_backend: MockBackend):
         perception: _FakePerception | None = None,
         machine: GameStateMachine | None = None,
         executor: Executor | None = None,
+        policy: DeterministicPolicy | None = None,
+        ai: _FakeAI | None = None,
         hotkey: FakeHotkeyListener | None = None,
         max_ticks: int | None = None,
         stop_event: threading.Event | None = None,
@@ -178,13 +180,14 @@ def make_loop(action_backend: MockBackend):
             perception=perception or _FakePerception(),
             executor=executor,
             machine=machine,
-            policy=DeterministicPolicy(),
+            policy=policy or DeterministicPolicy(),
             mode=mode,
             max_ticks=max_ticks,
             now_fn=lambda: 0.0,
             stop_event=stop_event,
             hotkey=hotkey,
             on_event=on_event,
+            ai=ai,
         )
 
     return _make
@@ -698,4 +701,148 @@ def test_no_provider_ai_analysis_dispatches_nothing(make_loop, action_backend) -
     loop = make_loop(mode=OperationMode.AUTONOMOUS, machine=machine)
     result = loop.tick()
     assert result.state is AgentState.AI_ANALYSIS
+
+
+# --- PR #5 review: AI decision lifecycle (one decision per episode) --------
+# AI_ANALYSIS is a watchdog state: it is *meant* to persist across ticks
+# until the watchdog fires. The provider must therefore be consulted at
+# most once per AI_ANALYSIS episode — not re-asked (and its action
+# re-dispatched) on every tick while the state persists. A new episode
+# (the state leaves and re-enters AI_ANALYSIS) is a fresh analysis trigger
+# and may consult again. A prompt-construction failure is an AI failure:
+# same bounded-RECOVERY contract as a provider failure, never raised out
+# of tick().
+
+
+class _ScriptedPerception:
+    """Perception that replays a scripted sequence of results/failures."""
+
+    def __init__(self, steps: list[object]) -> None:
+        self._steps = list(steps)
+        self.observe_count = 0
+
+    def observe(self, frame):
+        self.observe_count += 1
+        step = self._steps.pop(0) if self._steps else _observation()
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+
+class _ScriptedSignalsPolicy:
+    """Machine signal policy with a scripted per-tick signal sequence."""
+
+    def __init__(self, sequences: list[dict[str, object]]) -> None:
+        self._sequences = list(sequences)
+
+    def transition_signals(self, observation):
+        if self._sequences:
+            return dict(self._sequences.pop(0))
+        return {}
+
+
+class _RaisingPromptPolicy:
+    """DeterministicPolicy whose ``ai_prompt`` raises (prompt failure)."""
+
+    def __init__(self) -> None:
+        self._base = DeterministicPolicy(ai_enabled=True)
+
+    def name(self) -> str:
+        return self._base.name()
+
+    def actions(self, state, observation, mode):
+        return self._base.actions(state, observation, mode)
+
+    def transition_signals(self, observation):
+        return self._base.transition_signals(observation)
+
+    def ai_prompt(self, state, observation):
+        raise RuntimeError("simulated prompt construction failure")
+
+
+def test_ai_consulted_once_per_ai_analysis_episode(make_loop, action_backend) -> None:
+    """Repeated ticks in a persistent AI_ANALYSIS must consult the provider
+    at most once — and dispatch its action exactly once — per episode."""
+    machine = GameStateMachine(
+        policy=_StubDecisionPolicy(), initial=AgentState.AI_ANALYSIS
+    )
+    ai = _FakeAI(decision=_ai_decision())
+    loop = make_loop(mode=OperationMode.AUTONOMOUS, machine=machine, ai=ai)
+    action_backend.open()
+    # The fixed 0.0 clock never trips the watchdog, so the state persists
+    # across all three ticks — exactly the persistent-episode scenario.
+    for _ in range(3):
+        loop.tick()
+    assert machine.state is AgentState.AI_ANALYSIS
+    assert ai.decide_calls == 1, (
+        "the provider must be consulted at most once per AI_ANALYSIS "
+        f"episode (got {ai.decide_calls} calls)"
+    )
+    assert action_backend.events == [("press", "e")], (
+        "the AI action must be dispatched exactly once per episode "
+        f"(got {action_backend.events!r})"
+    )
+
+
+def test_ai_reconsulted_on_new_episode(make_loop, action_backend) -> None:
+    """Pinning guard: a *new* AI_ANALYSIS episode (state left and re-entered)
+    is a fresh analysis trigger and may consult the provider again — the
+    once-per-episode rule must not degrade into 'once ever'."""
+    # t1: AI_ANALYSIS (initial) -> consult #1.
+    # t2: perception fails -> RECOVERY (episode ends).
+    # t3: health recovered -> IDLE.
+    # t4: ai_analysis_required -> AI_ANALYSIS again -> consult #2 (new episode).
+    perception = _ScriptedPerception(
+        [
+            _observation(),
+            RuntimeError("simulated perception failure (episode test)"),
+            _observation(),
+            _observation(),
+        ]
+    )
+    # Note: only three signal entries — the failing tick (t2) never reaches
+    # machine.decide(), so it consumes neither a perception step nor a signal.
+    machine = GameStateMachine(
+        policy=_ScriptedSignalsPolicy(
+            [
+                {},  # t1: AI_ANALYSIS (initial) — stable
+                {"health_recovered": True},  # t3: RECOVERY -> IDLE
+                {"ai_analysis_required": True},  # t4: IDLE -> AI_ANALYSIS (new episode)
+            ]
+        ),
+        initial=AgentState.AI_ANALYSIS,
+    )
+    ai = _FakeAI(decision=_ai_decision())
+    loop = make_loop(
+        mode=OperationMode.AUTONOMOUS, perception=perception, machine=machine, ai=ai
+    )
+    action_backend.open()
+    for _ in range(4):
+        loop.tick()
+    assert machine.state is AgentState.AI_ANALYSIS
+    assert ai.decide_calls == 2, (
+        "a re-entry into AI_ANALYSIS is a new episode and must be allowed "
+        f"to consult again (got {ai.decide_calls} calls)"
+    )
+
+
+def test_ai_prompt_failure_routes_to_recovery_not_raised(make_loop, action_backend) -> None:
+    """A failing ``policy.ai_prompt`` must follow the same contract as a
+    provider failure: bounded RECOVERY, never raised out of tick(), no input.
+    """
+    machine = GameStateMachine(
+        policy=_StubDecisionPolicy(), initial=AgentState.AI_ANALYSIS
+    )
+    ai = _FakeAI(decision=_ai_decision())
+    loop = make_loop(
+        mode=OperationMode.AUTONOMOUS,
+        machine=machine,
+        policy=_RaisingPromptPolicy(),
+        ai=ai,
+    )
+    result = loop.tick()  # must not raise out of tick()
+    assert ai.decide_calls == 0, "a broken prompt must not reach the provider"
+    assert result.error is not None
+    assert machine.state is AgentState.RECOVERY
+    assert action_backend.events == []
     assert action_backend.events == []

@@ -124,6 +124,12 @@ class AgentLoop:
         # provider.decide(prompt) -> AIDecision. None (default) keeps
         # AI_ANALYSIS behaving exactly as today (no dispatch, watchdog fires).
         self._ai = ai
+        # AI episode bookkeeping: once the provider has been consulted for
+        # the current AI_ANALYSIS episode, it must not be consulted again
+        # while the state persists (a watchdog state that is *meant* to
+        # survive ticks). Re-entering AI_ANALYSIS is a fresh analysis
+        # trigger; the flag is cleared as soon as the machine leaves it.
+        self._ai_consulted = False
         # Report accumulators (so a lone tick() also works, not just run()).
         self._seq = 0
         self._ticks = 0
@@ -203,18 +209,30 @@ class AgentLoop:
 
         self._machine.decide(observation, now=now)
         state = self._machine.state
-        if state is AgentState.AI_ANALYSIS and self._ai is not None:
+        if state is not AgentState.AI_ANALYSIS:
+            # Not in an AI episode: the next entry into AI_ANALYSIS is a
+            # fresh analysis trigger and may consult the provider again.
+            self._ai_consulted = False
+        if (
+            state is AgentState.AI_ANALYSIS
+            and self._ai is not None
+            and not self._ai_consulted
+        ):
             # AI seam: the policy owns the prompt (game-agnostic loop only
-            # passes the string to the provider). A provider failure is
+            # passes the string to the provider). At most one consult per
+            # AI_ANALYSIS episode: the state persists until its watchdog
+            # timeout, so re-asking every tick would re-emit the same
+            # decision. A prompt-construction or provider failure is
             # classified, routed to bounded RECOVERY, never raised out of
             # tick() — same contract as capture/perception.
             prompt_fn = getattr(self._policy, "ai_prompt", None)
-            prompt = prompt_fn(state, observation) if prompt_fn else ""
             try:
+                prompt = prompt_fn(state, observation) if prompt_fn else ""
                 decision = self._ai.decide(prompt)
-                actions = (decision.action,)
             except Exception as exc:  # noqa: BLE001 - classify, never kill the loop
                 return self._on_pipeline_error(exc, "ai", now)
+            self._ai_consulted = True
+            actions = (decision.action,)
         else:
             actions = self._policy.actions(state, observation, self._mode)
         results: tuple[ActionResult, ...] = ()
