@@ -55,7 +55,6 @@ from pathlib import Path
 # without the ``input`` extra stays importable (the contract the
 # bare-import test asserts).
 from ai_game_agent.actions import (
-
     ActionError,
     ActionKind,
     ActionLog,
