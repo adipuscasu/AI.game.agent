@@ -503,6 +503,66 @@ def test_terminal_approver_timeout_rejects(quiet_stdout, monkeypatch):
     assert decision.reason == "timeout"
 
 
+def test_terminal_approver_timeout_when_select_rejects_fd(quiet_stdout, monkeypatch):
+    """A timeout must still reject when ``select`` refuses the fd.
+
+    On Windows ``select.select`` only accepts sockets and raises
+    ``OSError [WinError 10038]`` for pipes / console fds — so the approver
+    must not crash on the real Windows production path (an ASSISTED-mode
+    prompt on a console would raise here), and must fall back to a bounded
+    read that still times out (fail-safe rejection, never an approval).
+
+    The contract (timeout → rejection, no crash) is OS-independent, so we
+    pin the Windows behaviour from the Linux host by making ``select.select``
+    raise the same ``OSError``. This is the regression guard for the
+    cross-platform read path.
+    """
+    import os
+    import select
+    import time
+
+    def _select_rejects(*args, **kwargs):
+        raise OSError(
+            10038, "An operation was attempted on something that is not a socket"
+        )
+
+    class _PipeStdin:
+        def __init__(self, reply: bytes, delay: float) -> None:
+            self.r, self.w = os.pipe()
+
+            def _write() -> None:
+                time.sleep(delay)
+                try:
+                    os.write(self.w, reply)
+                except OSError:
+                    pass
+                finally:
+                    os.close(self.w)
+
+            threading.Thread(target=_write, daemon=True).start()
+
+        def fileno(self):
+            return self.r
+
+        def readline(self):  # pragma: no cover - the bounded path reads the raw fd
+            buf = b""
+            while True:
+                c = os.read(self.r, 1)
+                if not c:
+                    break
+                buf += c
+                if c == b"\n":
+                    break
+            return buf.decode()
+
+    monkeypatch.setattr(select, "select", _select_rejects)
+    monkeypatch.setattr("sys.stdin", _PipeStdin(b"y\n", delay=0.3))
+    approver = TerminalApprover(timeout_s=0.1)
+    decision = approver.request_approval(_action(), reasoning="r", confidence=0.5)
+    assert not decision.is_approved
+    assert decision.reason == "timeout"
+
+
 def _action() -> Action:
     return Action(kind=ActionKind.KEY_PRESS, key="e", source="ai")
 

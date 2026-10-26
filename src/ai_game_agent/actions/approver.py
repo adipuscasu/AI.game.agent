@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import dataclasses
 import sys
+import threading
 import time
 from typing import Literal, Protocol, runtime_checkable
 
@@ -294,12 +295,18 @@ class TerminalApprover:
             return (line.rstrip("\n") if line else None, False)
 
         try:
-            import select  # Unix only; Windows has a no-op shim.
+            import select  # Unix: works on any fd; Windows: sockets only.
         except ImportError:  # pragma: no cover
             select = None
 
         if select is not None and timeout > 0:
-            ready, _, _ = select.select([fd], [], [], timeout)
+            try:
+                ready, _, _ = select.select([fd], [], [], timeout)
+            except OSError:
+                # Windows: ``select`` only accepts sockets and raises for
+                # pipes / console fds (WinError 10038). Fall back to a
+                # bounded threaded read — the fail-safe still applies.
+                return self._read_line_bounded(timeout)
             if not ready:
                 return (None, True)
         try:
@@ -308,6 +315,39 @@ class TerminalApprover:
             # AttributeError: stdin is None / has no readline — a fail-safe
             # rejection, never an approval.
             return (None, False)
+        return (line.rstrip("\n") if line else None, False)
+
+    def _read_line_bounded(self, timeout: float) -> tuple[str | None, bool]:
+        """Bounded read for platforms where ``select`` cannot be used.
+
+        Windows ``select`` rejects non-socket fds (pipes / console) with
+        ``OSError`` (WinError 10038), so the prompt path must not crash
+        there. Read one line on a daemon worker thread and wait for it for
+        at most ``timeout`` seconds on the main thread. A reply that only
+        arrives *after* the deadline is a **timeout** rejection (fail-safe)
+        — it is not honoured, matching the ``select`` path. EOF / interrupt
+        / no-readline are fail-safe rejections. The worker is a daemon, so
+        it never blocks process exit; the main thread is always released by
+        the deadline (bounded durations, per the safety contract).
+        """
+        done = threading.Event()
+        result: dict[str, str | None] = {}
+
+        def _do_read() -> None:
+            try:
+                line = sys.stdin.readline()
+            except (EOFError, KeyboardInterrupt, AttributeError):
+                line = None
+            result["line"] = line
+            done.set()
+
+        worker = threading.Thread(target=_do_read, daemon=True, name="approve-read")
+        worker.start()
+        if not done.wait(timeout):
+            # Deadline expired with no reply: a timeout rejection (fail-safe).
+            # The worker is left to finish (daemon); its late reply is ignored.
+            return (None, True)
+        line = result["line"]
         return (line.rstrip("\n") if line else None, False)
 
 
