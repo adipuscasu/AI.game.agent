@@ -443,6 +443,20 @@ def test_terminal_approver_eof_rejects(quiet_stdout, monkeypatch):
     assert decision.reason == "no-input-channel"
 
 
+def test_terminal_approver_none_timeout_uses_default() -> None:
+    """An explicit ``timeout_s=None`` means "use the default" — not a crash.
+
+    Regression guard: the default ASSISTED run path (``run --mode assisted``
+    with neither ``--approve-all`` nor ``--approve-timeout``) constructs
+    ``TerminalApprover(timeout_s=None)``. ``None`` is the module's existing
+    "use the instance default" sentinel (see ``request_approval``), so the
+    constructor must map it to ``DEFAULT_TIMEOUT_S`` rather than raising
+    ``TypeError`` on ``None < 0``.
+    """
+    approver = TerminalApprover(timeout_s=None)  # type: ignore[arg-type]
+    assert approver._timeout_s == TerminalApprover.DEFAULT_TIMEOUT_S
+
+
 def test_terminal_approver_keyboard_interrupt_rejects(quiet_stdout, monkeypatch):
     """A KeyboardInterrupt during the prompt is a rejection, not a crash."""
 

@@ -199,12 +199,19 @@ class TerminalApprover:
     def __init__(
         self,
         *,
-        timeout_s: float = DEFAULT_TIMEOUT_S,
+        timeout_s: float | None = DEFAULT_TIMEOUT_S,
         now_fn: time | None = None,  # type: ignore[valid-type]
     ) -> None:
-        if timeout_s < 0:
-            raise ValueError(f"timeout_s must be >= 0, got {timeout_s!r}")
-        self._timeout_s = timeout_s
+        # ``None`` is the module's "use the instance default" sentinel (the
+        # same one ``request_approval`` accepts), not an error: the default
+        # ASSISTED run path constructs the approver without a flag.
+        self._timeout_s = (
+            self.DEFAULT_TIMEOUT_S if timeout_s is None else float(timeout_s)
+        )
+        if self._timeout_s < 0:
+            raise ValueError(
+                f"timeout_s must be >= 0, got {timeout_s!r}"
+            )
         # Injectable clock for deterministic timeout tests.
         self._now = now_fn if now_fn is not None else time.monotonic
 

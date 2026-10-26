@@ -105,6 +105,37 @@ def test_run_once_observe_only(tmp_path, capsys) -> None:
     assert report["stopped_reason"] is not None
 
 
+def test_run_once_assisted_default_timeout_smoke(tmp_path, capsys) -> None:
+    """Regression: the *default* ASSISTED path must start (not crash).
+
+    ``run --mode assisted --once --backend mock`` with neither ``--approve-all``
+    nor ``--approve-timeout`` used to construct ``TerminalApprover(timeout_s=None)``
+    and die with ``TypeError: '<' not supported between 'NoneType' and 'int'``
+    before the loop ran. The mock capture emits no hostiles, so the machine
+    stays IDLE and the approver is never consulted; the contract is simply
+    that the default construction succeeds and a single tick completes.
+    """
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    rc = main(
+        [
+            "run",
+            "--once",
+            "--backend",
+            "mock",
+            "--mode",
+            "assisted",
+            "--config",
+            cfg,
+        ]
+    )
+    assert rc == 0
+    report = _stdout_report(capsys)
+    assert report["ticks"] == 1
+    # IDLE (mock frame has no hostiles) and no input attempted.
+    assert report["final_state"] == "idle"
+    assert report["actions_attempted"] == 0
+
+
 def test_run_once_autonomous_combat_actuates(tmp_path, capsys, monkeypatch) -> None:
     """§Step-7 contract: autonomous + hostile target acts (>=1 action ok).
 
