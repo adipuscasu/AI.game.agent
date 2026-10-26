@@ -720,3 +720,214 @@ def test_approval_event_detail_contract():
     assert detail["kind"] == "key_press"
     assert detail["approved"] is True
     assert detail["channel"] == "channel-x"
+
+
+# ---------------------------------------------------------------------------
+# 7) PR #6 review findings — timeout contract, zero-timeout poll, F12 cancel,
+#    full-action prompt
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_approver_timeout_contract_none_zero_positive_negative():
+    """The timeout contract is explicit: ``None`` → 30 s default, ``0`` is a
+    legal (non-blocking poll) value, positive values are accepted verbatim,
+    and negative values are rejected.
+
+    Regression guard: the CLI used to reject ``0`` at the argument level
+    ("must be a positive number"), contradicting the approver accepting it;
+    the help text said "no timeout by default" while the default was 30 s.
+    """
+    assert TerminalApprover(timeout_s=None)._timeout_s == (
+        TerminalApprover.DEFAULT_TIMEOUT_S
+    )
+    assert TerminalApprover.DEFAULT_TIMEOUT_S == 30.0
+    assert TerminalApprover(timeout_s=0)._timeout_s == 0.0
+    assert TerminalApprover(timeout_s=5.0)._timeout_s == 5.0
+    with pytest.raises(ValueError):
+        TerminalApprover(timeout_s=-1)
+
+
+def _late_reply_stdin(delay: float, reply: bytes = b"y\n"):
+    """A real-fd stdin whose reply arrives only after ``delay`` seconds.
+
+    Same shape as the existing timeout tests: a pipe with a writer thread.
+    """
+    import os
+    import time
+
+    class _PipeStdin:
+        def __init__(self) -> None:
+            self.r, self.w = os.pipe()
+
+            def _write() -> None:
+                time.sleep(delay)
+                try:
+                    os.write(self.w, reply)
+                except OSError:
+                    pass
+                finally:
+                    os.close(self.w)
+
+            threading.Thread(target=_write, daemon=True).start()
+
+        def fileno(self):
+            return self.r
+
+        def readline(self):
+            buf = b""
+            while True:
+                c = os.read(self.r, 1)
+                if not c:
+                    break
+                buf += c
+                if c == b"\n":
+                    break
+            return buf.decode()
+
+    return _PipeStdin()
+
+
+def test_terminal_approver_zero_timeout_is_non_blocking_poll(
+    quiet_stdout, monkeypatch
+):
+    """``timeout=0`` must be a non-blocking poll, not an unbounded read.
+
+    Regression guard: the old ``if select is not None and timeout > 0`` guard
+    skipped the deadline entirely for ``timeout=0`` and fell through to a
+    bare ``sys.stdin.readline()`` — an unbounded hang on a live terminal.
+    After the fix, ``0`` polls once: an unbuffered reply (arriving after
+    1 s) is NOT honoured and the request rejects with ``"timeout"``
+    promptly.
+    """
+    import time
+
+    monkeypatch.setattr("sys.stdin", _late_reply_stdin(delay=1.0))
+    approver = TerminalApprover(timeout_s=0)
+    t0 = time.monotonic()
+    decision = approver.request_approval(_action(), reasoning="r", confidence=0.5)
+    elapsed = time.monotonic() - t0
+    assert not decision.is_approved
+    assert decision.reason == "timeout"
+    assert elapsed < 0.5, (
+        f"timeout=0 blocked for {elapsed:.2f}s (expected <0.1s non-blocking poll)"
+    )
+
+
+def test_terminal_approver_zero_timeout_honours_buffered_reply(
+    quiet_stdout, monkeypatch
+):
+    """A reply already buffered on stdin is honoured by the ``0`` poll
+    (the poll only rejects when *nothing* is available)."""
+    import os
+
+    r, w = os.pipe()
+    os.write(w, b"y\n")
+    os.close(w)
+
+    class _FdStdin:
+        def fileno(self):
+            return r
+
+        def readline(self):
+            buf = b""
+            while True:
+                c = os.read(r, 1)
+                if not c:
+                    break
+                buf += c
+                if c == b"\n":
+                    break
+            return buf.decode()
+
+    monkeypatch.setattr("sys.stdin", _FdStdin())
+    approver = TerminalApprover(timeout_s=0)
+    decision = approver.request_approval(_action(), reasoning="r", confidence=0.5)
+    assert decision.is_approved, f"buffered reply ignored: {decision}"
+    assert decision.reason == "user-approved"
+
+
+def test_terminal_approver_cancel_event_interrupts_pending_wait(
+    quiet_stdout, monkeypatch
+):
+    """Setting the ``cancel_event`` during a pending wait must unblock the
+    approver promptly with an ``"interrupted"`` rejection.
+
+    Regression guard: without cancellation support the approver would sit
+    in ``select`` for the full 5 s even after F12 fired, delaying the
+    emergency-stop reaction.
+    """
+    import time
+
+    monkeypatch.setattr("sys.stdin", _late_reply_stdin(delay=5.0))
+    cancel = threading.Event()
+    approver = TerminalApprover(timeout_s=5.0, cancel_event=cancel)
+
+    result_box: dict[str, object] = {}
+
+    def _call() -> None:
+        result_box["decision"] = approver.request_approval(
+            _action(), reasoning="r", confidence=0.5
+        )
+
+    t = threading.Thread(target=_call, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    cancel.set()
+    t.join(timeout=2.0)
+    assert not t.is_alive(), "approver did not return after cancel_event was set"
+    decision = result_box.get("decision")
+    assert decision is not None
+    assert not decision.is_approved
+    assert decision.reason == "interrupted"
+
+
+def test_approval_prompt_shows_modifiers(quiet_stdout, monkeypatch):
+    """The prompt must surface modifiers: ``ctrl+shift+a`` is a different
+    action from bare ``a``, and the approver must see the difference.
+
+    Regression guard: the old prompt only listed six fields and omitted
+    ``modifiers``, ``relative``, ``clicks`` — an approver could not tell
+    which of those variants was proposed.
+    """
+    captured = io.StringIO()
+    monkeypatch.setattr("sys.stdout", captured)
+    monkeypatch.setattr("sys.stdin", io.StringIO("n\n"))
+    action = Action(
+        kind=ActionKind.KEY_PRESS, key="a", modifiers=("ctrl", "shift"), source="ai"
+    )
+    TerminalApprover(timeout_s=0.5).request_approval(
+        action, reasoning="r", confidence=0.5
+    )
+    out = captured.getvalue()
+    assert "ctrl" in out, f"modifiers missing from prompt: {out!r}"
+    assert "shift" in out, f"modifiers missing from prompt: {out!r}"
+
+
+def test_approval_prompt_shows_relative_flag_and_clicks(
+    quiet_stdout, monkeypatch
+):
+    """``relative`` mouse moves and multi-clicks differ from the defaults
+    and must be visible in the prompt."""
+    captured = io.StringIO()
+    monkeypatch.setattr("sys.stdout", captured)
+    monkeypatch.setattr("sys.stdin", io.StringIO("n\n"))
+    move = Action(
+        kind=ActionKind.MOUSE_MOVE, x=10, y=20, relative=True, source="ai"
+    )
+    TerminalApprover(timeout_s=0.5).request_approval(
+        move, reasoning="r", confidence=0.5
+    )
+    out = captured.getvalue()
+    assert "relative" in out, f"relative flag missing from prompt: {out!r}"
+
+    captured2 = io.StringIO()
+    monkeypatch.setattr("sys.stdout", captured2)
+    monkeypatch.setattr("sys.stdin", io.StringIO("n\n"))
+    click = Action(
+        kind=ActionKind.MOUSE_CLICK, x=5, y=6, button="left", clicks=3, source="ai"
+    )
+    TerminalApprover(timeout_s=0.5).request_approval(
+        click, reasoning="r", confidence=0.5
+    )
+    out2 = captured2.getvalue()
+    assert "clicks" in out2, f"clicks missing from prompt: {out2!r}"

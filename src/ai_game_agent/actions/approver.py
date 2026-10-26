@@ -17,6 +17,11 @@ Two implementations ship:
 * :class:`TerminalApprover` — the default human channel. Blocks on ``stdin``
   with a clear prompt and a timeout, and treats non-interactivity / timeout
   as a **rejection** (fail-safe: an unanswered proposal is never executed).
+  Timeout contract: ``None`` → instance default (30 s); ``0`` → non-blocking
+  poll (honours a reply already buffered, rejects immediately otherwise);
+  positive → wait that many seconds; negative → ``ValueError``. An injected
+  ``cancel_event`` (``threading.Event``), when set while a wait is pending,
+  unblocks it immediately and is classified as an ``"interrupted"`` rejection.
 * :class:`AutoApprover` — a non-blocking policy stub for tests, CI, and
   "trust the AI" runs; always approves.
 
@@ -201,6 +206,7 @@ class TerminalApprover:
         *,
         timeout_s: float | None = DEFAULT_TIMEOUT_S,
         now_fn: time | None = None,  # type: ignore[valid-type]
+        cancel_event: threading.Event | None = None,
     ) -> None:
         # ``None`` is the module's "use the instance default" sentinel (the
         # same one ``request_approval`` accepts), not an error: the default
@@ -214,6 +220,10 @@ class TerminalApprover:
             )
         # Injectable clock for deterministic timeout tests.
         self._now = now_fn if now_fn is not None else time.monotonic
+        # Optional cancellation signal (e.g. the F12 emergency stop). When
+        # set while a wait is pending, the wait is unblocked immediately and
+        # classified as an "interrupted" rejection — never an approval.
+        self._cancel_event = cancel_event
 
     def request_approval(
         self,
@@ -234,6 +244,10 @@ class TerminalApprover:
         # stdin the read raises EOFError immediately -> reject (fail-safe).
         line, timed_out = self._read_line(timeout)
         if line is None:
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                # Emergency stop (F12) interrupted the wait: classify it
+                # distinctly from a plain timeout for the audit trail.
+                return ApprovalDecision.rejected("interrupted")
             reason = "timeout" if timed_out else "no-input-channel"
             return ApprovalDecision.rejected(reason)
         reply = line
@@ -261,12 +275,28 @@ class TerminalApprover:
             "\u26a0\ufe0f  AI proposes an action (ASSISTED mode) \u2014 approve to execute:",
             f"    action: {kind}",
         ]
-        # Surface the key identifying fields for the common kinds, without
+        # Surface every field that deviates from the Action default, without
         # importing the Action contract here (the module stays dependency-free).
-        for field in ("key", "x", "y", "button", "scroll", "duration_ms"):
+        # Defaults mirror ``_DEFAULTS`` in actions/action.py: showing only the
+        # non-default values keeps the prompt concise while ensuring no
+        # meaningful parameter (modifiers, relative, clicks, ...) is hidden.
+        _FIELDS = (
+            ("key", None),
+            ("modifiers", ()),
+            ("x", None),
+            ("y", None),
+            ("relative", False),
+            ("button", "left"),
+            ("clicks", 1),
+            ("scroll", None),
+            ("duration_ms", 0),
+            ("delay_ms", 0),
+        )
+        for field, default in _FIELDS:
             value = getattr(action, field, None)
-            if value is not None:
-                lines.append(f"    {field}: {value}")
+            if value == default:
+                continue
+            lines.append(f"    {field}: {value}")
         if reasoning:
             lines.append(f"    reasoning: {reasoning}")
         if confidence is not None:
@@ -283,7 +313,13 @@ class TerminalApprover:
         deadline expired with no input (as opposed to an immediate EOF).
         ``KeyboardInterrupt`` is swallowed here so the caller can classify
         it as a rejection (the agent must not crash).
+
+        A ``timeout`` of ``0`` is a non-blocking poll (one ``select`` probe),
+        never an unbounded read. A cancellable ``cancel_event`` routes the
+        wait through :meth:`_read_line_cancellable`.
         """
+        if self._cancel_event is not None:
+            return self._read_line_cancellable(timeout)
         fd = None
         try:
             fd = sys.stdin.fileno()
@@ -306,7 +342,11 @@ class TerminalApprover:
         except ImportError:  # pragma: no cover
             select = None
 
-        if select is not None and timeout > 0:
+        if select is not None:
+            # ``select.select(fd, timeout=0)`` is a non-blocking poll: a
+            # buffered reply is honoured, an empty pipe returns immediately.
+            # (The old ``timeout > 0`` guard turned ``timeout=0`` into an
+            # unbounded ``readline`` — a hang on a live terminal.)
             try:
                 ready, _, _ = select.select([fd], [], [], timeout)
             except OSError:
@@ -321,6 +361,65 @@ class TerminalApprover:
         except (EOFError, KeyboardInterrupt, AttributeError):
             # AttributeError: stdin is None / has no readline — a fail-safe
             # rejection, never an approval.
+            return (None, False)
+        return (line.rstrip("\n") if line else None, False)
+
+    def _read_line_cancellable(
+        self, timeout: float
+    ) -> tuple[str | None, bool]:
+        """Read one line with a cancellable deadline.
+
+        Polls ``select`` in 50 ms slices, checking ``self._cancel_event``
+        before every slice, so an emergency stop (F12) unblocks the wait
+        within one slice instead of waiting for the full timeout. A
+        ``timeout`` of ``0`` performs a single non-blocking poll (a
+        buffered reply is still honoured). ``select``-unavailable platforms
+        fall back to :meth:`_read_line_bounded` (bounded, but not
+        cancellation-responsive — the fail-safe still applies).
+        """
+        fd = None
+        try:
+            fd = sys.stdin.fileno()
+        except (AttributeError, ValueError, OSError):
+            fd = None
+
+        if fd is None:
+            # No real fd (e.g. StringIO in tests): read directly.
+            if self._cancel_event.is_set():
+                return (None, True)
+            try:
+                line = sys.stdin.readline()
+            except (EOFError, KeyboardInterrupt, AttributeError):
+                return (None, False)
+            return (line.rstrip("\n") if line else None, False)
+
+        try:
+            import select
+        except ImportError:  # pragma: no cover - Windows
+            select = None
+        if select is None:
+            return self._read_line_bounded(timeout)
+
+        deadline = self._now() + timeout
+        POLL_S = 0.05
+        while True:
+            if self._cancel_event.is_set():
+                return (None, True)
+            poll = POLL_S if timeout > 0 else 0.0
+            try:
+                ready, _, _ = select.select([fd], [], [], poll)
+            except OSError:
+                # Windows: ``select`` rejects non-socket fds (WinError
+                # 10038). Bounded fallback — the fail-safe still applies.
+                return self._read_line_bounded(timeout)
+            if ready:
+                break
+            if self._now() >= deadline:
+                return (None, True)
+
+        try:
+            line = sys.stdin.readline()
+        except (EOFError, KeyboardInterrupt, AttributeError):
             return (None, False)
         return (line.rstrip("\n") if line else None, False)
 

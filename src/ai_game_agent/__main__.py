@@ -907,8 +907,9 @@ def build_parser() -> argparse.ArgumentParser:
                             "prompt")
     p_run.add_argument("--approve-timeout", type=float, default=None,
                        help="ASSISTED mode only: seconds to wait for an approval "
-                            "answer (no timeout by default; fail-safe = reject "
-                            "on timeout/EOF/no-input)")
+                            "answer (default: 30 s when omitted; 0 = non-blocking "
+                            "poll; negative values are rejected). Fail-safe = "
+                            "reject on timeout/EOF/no-input")
     p_run.add_argument("--pretty", action="store_true",
                        help="pretty-print the report JSON")
     p_run.add_argument(
@@ -1007,10 +1008,12 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
     # backend (inside ``_build_executor``), so it is filled in post-construction
     # and read lazily — no construction-order cycle.
     stop_event = threading.Event()
+    approval_cancel = threading.Event()
     _executor_holder: dict[str, Executor] = {}
 
     def _f12() -> None:
         stop_event.set()
+        approval_cancel.set()
         ex = _executor_holder.get("executor")
         if ex is not None:
             ex.trigger_emergency_stop("f12")
@@ -1037,11 +1040,17 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
             timeout_s = getattr(args, "approve_timeout", None)
             if timeout_s is not None:
                 timeout_s = float(timeout_s)
-                if not timeout_s > 0:
+                if timeout_s < 0:
                     raise ValueError(
-                        "--approve-timeout must be a positive number of seconds"
+                        "--approve-timeout must be a non-negative number of "
+                        "seconds (0 = non-blocking poll)"
                     )
-            approver = TerminalApprover(timeout_s=timeout_s)
+            # cancel_event = the F12 stop signal: a pending approval wait is
+            # interrupted promptly ("interrupted" rejection) instead of
+            # sitting out the full timeout after an emergency stop.
+            approver = TerminalApprover(
+                timeout_s=timeout_s, cancel_event=approval_cancel
+            )
 
     max_ticks = 1 if getattr(args, "once", False) else getattr(args, "max_ticks", None)
     if max_ticks is not None and int(max_ticks) < 1:
