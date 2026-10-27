@@ -352,8 +352,8 @@ class TerminalApprover:
             except OSError:
                 # Windows: ``select`` only accepts sockets and raises for
                 # pipes / console fds (WinError 10038). Fall back to a
-                # bounded threaded read — the fail-safe still applies.
-                return self._read_line_bounded(timeout)
+                # bounded fd poll — the fail-safe still applies.
+                return self._read_line_bounded(timeout, fd)
             if not ready:
                 return (None, True)
         try:
@@ -398,7 +398,7 @@ class TerminalApprover:
         except ImportError:  # pragma: no cover - Windows
             select = None
         if select is None:
-            return self._read_line_bounded(timeout)
+            return self._read_line_bounded(timeout, fd)
 
         deadline = self._now() + timeout
         POLL_S = 0.05
@@ -411,7 +411,7 @@ class TerminalApprover:
             except OSError:
                 # Windows: ``select`` rejects non-socket fds (WinError
                 # 10038). Bounded fallback — the fail-safe still applies.
-                return self._read_line_bounded(timeout)
+                return self._read_line_bounded(timeout, fd)
             if ready:
                 break
             if self._now() >= deadline:
@@ -423,38 +423,68 @@ class TerminalApprover:
             return (None, False)
         return (line.rstrip("\n") if line else None, False)
 
-    def _read_line_bounded(self, timeout: float) -> tuple[str | None, bool]:
+    def _read_line_bounded(self, timeout: float, fd: int) -> tuple[str | None, bool]:
         """Bounded read for platforms where ``select`` cannot be used.
 
         Windows ``select`` rejects non-socket fds (pipes / console) with
         ``OSError`` (WinError 10038), so the prompt path must not crash
-        there. Read one line on a daemon worker thread and wait for it for
-        at most ``timeout`` seconds on the main thread. A reply that only
-        arrives *after* the deadline is a **timeout** rejection (fail-safe)
-        — it is not honoured, matching the ``select`` path. EOF / interrupt
-        / no-readline are fail-safe rejections. The worker is a daemon, so
-        it never blocks process exit; the main thread is always released by
-        the deadline (bounded durations, per the safety contract).
+        there. The read polls the fd in non-blocking slices **on the main
+        thread** up to the deadline: a buffered reply is honoured, a reply
+        that only arrives *after* the deadline is a **timeout** rejection
+        (fail-safe — matches the ``select`` path), and nothing is left
+        behind: the main thread is always released by the deadline and no
+        blocked per-prompt worker accumulates (bounded durations, safety
+        contract). A set ``cancel_event`` unblocks the poll on the next
+        slice, so the emergency stop stays responsive on this path too.
+
+        A ``timeout`` of ``0`` is a single non-blocking probe. If the fd
+        cannot be made non-blocking (and ``select`` cannot watch it
+        either), the read degrades to an immediate ``"timeout"``
+        rejection — the fail-safe still holds (never approve, never
+        hang, never spawn a worker); only a late reply is not honoured.
         """
-        done = threading.Event()
-        result: dict[str, str | None] = {}
+        import os
 
-        def _do_read() -> None:
-            try:
-                line = sys.stdin.readline()
-            except (EOFError, KeyboardInterrupt, AttributeError):
-                line = None
-            result["line"] = line
-            done.set()
-
-        worker = threading.Thread(target=_do_read, daemon=True, name="approve-read")
-        worker.start()
-        if not done.wait(timeout):
-            # Deadline expired with no reply: a timeout rejection (fail-safe).
-            # The worker is left to finish (daemon); its late reply is ignored.
+        try:
+            os.set_blocking(fd, False)
+        except (OSError, ValueError, AttributeError, NotImplementedError):
+            # The fd cannot be polled non-blocking and ``select`` cannot
+            # watch it: the fail-safe is an immediate timeout rejection
+            # (never approve, never hang, never spawn a worker).
             return (None, True)
-        line = result["line"]
-        return (line.rstrip("\n") if line else None, False)
+
+        cancel = self._cancel_event
+        buf = b""
+        deadline = self._now() + timeout
+        try:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    return (None, True)
+                try:
+                    c = os.read(fd, 1)
+                except BlockingIOError:
+                    c = b""  # no data yet (EAGAIN) — wait until the deadline
+                except (OSError, ValueError):
+                    # fd broken / closed under us — a fail-safe rejection.
+                    return (None, False)
+                if c:
+                    buf += c
+                    if c == b"\n":
+                        break
+                    continue
+                # ``c == b""`` on a non-blocking pipe means "no data now"
+                # (or EOF with the writer closed): wait until the deadline.
+                if self._now() >= deadline:
+                    return (None, True)
+                time.sleep(min(0.01, deadline - self._now()))
+        finally:
+            try:
+                os.set_blocking(fd, True)
+            except (OSError, ValueError, AttributeError, NotImplementedError):
+                pass
+        line = buf.decode("utf-8", "replace")
+        return (line.rstrip("\n"), False)
+
 
 
 def _io_error_stub() -> type:  # pragma: no cover - defensive import shim
