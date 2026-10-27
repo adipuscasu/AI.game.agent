@@ -236,6 +236,98 @@ def test_assisted_approval_allows_ai_action():
     assert approvals[0].detail["kind"] == "key_press"
 
 
+def test_f12_interrupts_real_approver_pending_wait_in_loop(quiet_stdout, monkeypatch):
+    """F12 must interrupt the *real* ``TerminalApprover`` pending wait at the
+    loop level — not merely the executor's refusal to dispatch afterwards.
+
+    Regression guard (finding 3): the earlier loop-level test used a fake
+    blocking approver that the test released with a manual gate, so it only
+    proved the executor dropped the late approval. It never proved the real
+    approver's pending ``stdin`` wait is interrupted by the emergency-stop
+    signal and the run exits on its own. This test wires the real approver
+    with a ``cancel_event`` exactly as ``__main__`` does for F12 (the F12
+    handler sets the approver's cancel event *and* triggers the executor
+    stop), over a stdin that will never answer, and fires the stop while the
+    wait is pending — with no manual release of any kind.
+    """
+    import os
+
+    # Pipe whose write end stays open and is never written to: the prompt
+    # would otherwise wait out the full (10 s) timeout.
+    r, w = os.pipe()
+
+    class _NeverAnsweringStdin:
+        def fileno(self):
+            return r
+
+        def readline(self):  # pragma: no cover - the cancel path must return first
+            raise AssertionError("cancel path must unblock the wait before reading stdin")
+
+    monkeypatch.setattr("sys.stdin", _NeverAnsweringStdin())
+
+    cancel = threading.Event()
+    approver = TerminalApprover(timeout_s=10.0, cancel_event=cancel)
+
+    entered = threading.Event()
+    _orig = approver.request_approval
+
+    def _mark(action, **kwargs):
+        entered.set()
+        return _orig(action, **kwargs)
+
+    approver.request_approval = _mark
+
+    backend = MockBackend()
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[object] = []
+    loop = _loop(
+        mode=OperationMode.ASSISTED,
+        approver=approver,
+        backend=backend,
+        ai=ai,
+        max_ticks=10,
+        on_event=events.append,
+    )
+    executor = loop._executor
+
+    result_box: dict[str, object] = {}
+
+    def _run() -> None:
+        try:
+            result_box["report"] = loop.run()
+        except BaseException as exc:  # pragma: no cover - surface test failures
+            result_box["exc"] = exc
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    assert entered.wait(timeout=3.0), (
+        "approver never entered (loop not in the ASSISTED AI path)"
+    )
+    # The prompt is pending inside the real approver; nothing dispatched yet.
+    assert ("press", "e") not in [ev[:2] for ev in backend.events]
+    # Fire the emergency stop in the production order (__main__._f12):
+    # set the approver's cancel event, then trigger the executor stop.
+    cancel.set()
+    executor.trigger_emergency_stop("f12")
+    t.join(timeout=3.0)
+    assert not t.is_alive(), (
+        "run did not exit after F12 — the real approver's pending wait was not interrupted"
+    )
+    assert "exc" not in result_box, f"run raised: {result_box.get('exc')!r}"
+    report = result_box["report"]
+    assert executor.stopped
+    assert report.stopped_reason == "emergency_stop", f"got {report.stopped_reason!r}"
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert approvals, "expected an APPROVAL audit event"
+    assert approvals[0].detail["approved"] is False
+    assert approvals[0].detail["reason"] == "interrupted"
+    # The AI action must NOT have been dispatched (stop wins over approval).
+    assert report.actions_attempted == 0
+    assert ("press", "e") not in [ev[:2] for ev in backend.events]
+    os.close(w)
+    os.close(r)
+
+
 def test_assisted_rejection_halts_episode_and_blocks_dispatch():
     """ASSISTED + rejecting approver → machine PAUSED, nothing dispatched."""
     backend = MockBackend()
@@ -575,6 +667,65 @@ def test_terminal_approver_timeout_when_select_rejects_fd(quiet_stdout, monkeypa
     decision = approver.request_approval(_action(), reasoning="r", confidence=0.5)
     assert not decision.is_approved
     assert decision.reason == "timeout"
+
+
+def test_bounded_read_does_not_accumulate_worker_threads(quiet_stdout, monkeypatch):
+    """Repeated timed-out prompts on the select-unavailable fallback path
+    must not accumulate blocked worker threads.
+
+    The bounded read must release the main thread within the configured
+    deadline *and* leave no per-prompt worker behind: a worker blocked in
+    ``readline()`` with no reply would live (daemon, but blocked) for the
+    whole process lifetime, so N timed-out prompts must not leave N live
+    threads.
+
+    Regression guard: the bounded read used to spawn one daemon worker per
+    prompt and abandon it on timeout — an unbounded thread accumulation on
+    exactly the Windows console path this fallback exists for.
+    """
+    import os
+    import select
+
+    def _select_rejects(*args, **kwargs):
+        raise OSError(10038, "An operation was attempted on something that is not a socket")
+
+    # Write end stays open and is never written to: every prompt times out.
+    r, w = os.pipe()
+
+    class _NeverAnsweringStdin:
+        def fileno(self):
+            return r
+
+        def readline(self):  # pragma: no cover - a worker would block here forever
+            buf = b""
+            while True:
+                c = os.read(r, 1)
+                if not c:
+                    break
+                buf += c
+                if c == b"\n":
+                    break
+            return buf.decode()
+
+    monkeypatch.setattr(select, "select", _select_rejects)
+    monkeypatch.setattr("sys.stdin", _NeverAnsweringStdin())
+    approver = TerminalApprover(timeout_s=0.1)
+
+    def _approve_read_threads() -> int:
+        return sum(1 for t in threading.enumerate() if t.name == "approve-read")
+
+    before = _approve_read_threads()
+    for _ in range(5):
+        decision = approver.request_approval(_action(), reasoning="r", confidence=0.5)
+        assert not decision.is_approved
+        assert decision.reason == "timeout"
+    os.close(w)
+    os.close(r)
+    after = _approve_read_threads()
+    assert after <= before, (
+        f"bounded read accumulated worker threads: {before} -> {after} "
+        "over 5 timed-out prompts (a per-prompt worker is still blocked on readline)"
+    )
 
 
 def _action() -> Action:
@@ -931,3 +1082,42 @@ def test_approval_prompt_shows_relative_flag_and_clicks(
     )
     out2 = captured2.getvalue()
     assert "clicks" in out2, f"clicks missing from prompt: {out2!r}"
+
+
+def test_approval_prompt_shows_duration_delay_and_scroll(quiet_stdout, monkeypatch):
+    """``duration_ms`` (a 500 ms KEY_HOLD is a different action from a tap),
+    ``delay_ms`` (a delayed action vs. an immediate one), and ``scroll``
+    (a non-zero scroll amount is a different action from a click) deviate
+    from the defaults and must be visible in the prompt."""
+    captured = io.StringIO()
+    monkeypatch.setattr("sys.stdout", captured)
+    monkeypatch.setattr("sys.stdin", io.StringIO("n\n"))
+    hold = Action(kind=ActionKind.KEY_HOLD, key="w", duration_ms=500, source="ai")
+    TerminalApprover(timeout_s=0.5).request_approval(
+        hold, reasoning="r", confidence=0.5
+    )
+    out = captured.getvalue()
+    assert "duration_ms" in out, f"duration_ms missing from prompt: {out!r}"
+    assert "500" in out, f"duration value missing from prompt: {out!r}"
+
+    captured2 = io.StringIO()
+    monkeypatch.setattr("sys.stdout", captured2)
+    monkeypatch.setattr("sys.stdin", io.StringIO("n\n"))
+    delayed = Action(kind=ActionKind.KEY_PRESS, key="e", delay_ms=250, source="ai")
+    TerminalApprover(timeout_s=0.5).request_approval(
+        delayed, reasoning="r", confidence=0.5
+    )
+    out2 = captured2.getvalue()
+    assert "delay_ms" in out2, f"delay_ms missing from prompt: {out2!r}"
+    assert "250" in out2, f"delay value missing from prompt: {out2!r}"
+
+    captured3 = io.StringIO()
+    monkeypatch.setattr("sys.stdout", captured3)
+    monkeypatch.setattr("sys.stdin", io.StringIO("n\n"))
+    scrolled = Action(kind=ActionKind.MOUSE_SCROLL, scroll=3, source="ai")
+    TerminalApprover(timeout_s=0.5).request_approval(
+        scrolled, reasoning="r", confidence=0.5
+    )
+    out3 = captured3.getvalue()
+    assert "scroll" in out3, f"scroll missing from prompt: {out3!r}"
+    assert "3" in out3, f"scroll value missing from prompt: {out3!r}"
