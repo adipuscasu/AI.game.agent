@@ -28,8 +28,14 @@ Two implementations ship:
 Design notes:
 
 * **Dependency-free.** Only stdlib (``typing``, ``time``, ``sys``,
-  ``dataclasses``). Importing this module in a bare venv is always safe,
-  matching the rest of the ``actions`` package.
+  ``dataclasses``; ``msvcrt`` imported lazily, only on Windows consoles).
+  Importing this module in a bare venv is always safe, matching the rest
+  of the ``actions`` package.
+* **Console-aware.** On a Windows console (``CONIN$``) the reply is read
+  key-by-key through :class:`ConsoleInputReader` (``kbhit``/``getwch``)
+  under the same deadline/cancel slices as the fd paths, because
+  ``select`` rejects non-socket fds and a line-buffered ``os.read``
+  cannot be deadline-bounded there.
 * **Fail-safe.** Every path that cannot obtain an affirmative answer
   (EOF on stdin, ``KeyboardInterrupt``, timeout, unparsable reply) returns
   ``Rejected``. The only way an action executes is an explicit
@@ -50,7 +56,9 @@ __all__ = [
     "Approver",
     "AutoApprover",
     "ApprovalDecision",
+    "ConsoleInputReader",
     "DecisionOutcome",
+    "MsvcrtConsoleReader",
     "RejectionReason",
     "TerminalApprover",
 ]
@@ -96,6 +104,51 @@ RejectionReason = Literal[
     "interrupted",
     "unparsable-reply",
 ]
+
+
+@runtime_checkable
+class ConsoleInputReader(Protocol):
+    """One key at a time from an interactive console (Windows ``CONIN$``).
+
+    The reference implementation is :class:`MsvcrtConsoleReader`; tests
+    inject a scripted fake of this shape so the approval loop stays
+    deterministic on hosts without a desktop console.
+    """
+
+    def kbhit(self) -> bool:
+        """Whether a key is pending — a non-blocking probe, never blocks."""
+        ...
+
+    def getwch(self) -> str:
+        """The next key (call only when :meth:`kbhit` is true).
+
+        May raise ``EOFError`` (Ctrl-Z) or ``KeyboardInterrupt`` (Ctrl-C);
+        the approval loop treats both as fail-safe rejections.
+        """
+        ...
+
+
+class MsvcrtConsoleReader:
+    """A :class:`ConsoleInputReader` backed by ``msvcrt`` (Windows only).
+
+    ``msvcrt.kbhit()`` reports pending keys without blocking and
+    ``msvcrt.getwch()`` returns the next key, so a reply can be assembled
+    one key at a time under a deadline — exactly what ``select`` (which
+    rejects non-socket fds with WinError 10038) and a non-blocking
+    ``os.read`` (line-buffered ``CONIN$`` blocks until Enter) cannot do
+    on a Windows console.
+    """
+
+    def __init__(self) -> None:
+        import msvcrt  # Windows-only module: ImportError on other hosts
+
+        self._msvcrt = msvcrt
+
+    def kbhit(self) -> bool:
+        return self._msvcrt.kbhit()
+
+    def getwch(self) -> str:
+        return self._msvcrt.getwch()
 
 
 @runtime_checkable
@@ -207,6 +260,7 @@ class TerminalApprover:
         timeout_s: float | None = DEFAULT_TIMEOUT_S,
         now_fn: time | None = None,  # type: ignore[valid-type]
         cancel_event: threading.Event | None = None,
+        reader: ConsoleInputReader | None = None,
     ) -> None:
         # ``None`` is the module's "use the instance default" sentinel (the
         # same one ``request_approval`` accepts), not an error: the default
@@ -224,6 +278,10 @@ class TerminalApprover:
         # set while a wait is pending, the wait is unblocked immediately and
         # classified as an "interrupted" rejection — never an approval.
         self._cancel_event = cancel_event
+        # Optional console input reader (kbhit/getwch). An explicit
+        # injection always wins; otherwise an interactive Windows console
+        # is auto-detected at read time (see _console_reader).
+        self._reader = reader
 
     def request_approval(
         self,
@@ -316,8 +374,17 @@ class TerminalApprover:
 
         A ``timeout`` of ``0`` is a non-blocking poll (one ``select`` probe),
         never an unbounded read. A cancellable ``cancel_event`` routes the
-        wait through :meth:`_read_line_cancellable`.
+        wait through :meth:`_read_line_cancellable`. An interactive console
+        (Windows ``CONIN$``) routes through :meth:`_read_line_console`,
+        whose key-polling loop enforces the deadline and checks the cancel
+        signal itself.
         """
+        reader = self._console_reader()
+        if reader is not None:
+            # Console input is line-buffered and blocking: neither select
+            # (WinError 10038) nor a non-blocking os.read can enforce a
+            # deadline on it, so the reader's kbhit loop owns the wait.
+            return self._read_line_console(timeout, reader)
         if self._cancel_event is not None:
             return self._read_line_cancellable(timeout)
         fd = None
@@ -363,6 +430,72 @@ class TerminalApprover:
             # rejection, never an approval.
             return (None, False)
         return (line.rstrip("\n") if line else None, False)
+
+    def _console_reader(self) -> ConsoleInputReader | None:
+        """Resolve the console reader for the current ``sys.stdin``.
+
+        An explicitly injected ``reader`` always wins. Otherwise the reader
+        is used only when stdin is an interactive console (``isatty()``)
+        and ``msvcrt`` is importable (Windows): pipe / redirect fds keep
+        the existing ``select`` / ``os.read`` paths, and non-Windows hosts
+        have no ``msvcrt`` (ImportError → ``None``).
+        """
+        if self._reader is not None:
+            return self._reader
+        stdin = sys.stdin
+        if stdin is None:
+            return None
+        try:
+            if not stdin.isatty():
+                return None
+        except (AttributeError, ValueError, OSError):
+            return None
+        try:
+            return MsvcrtConsoleReader()
+        except (ImportError, OSError, ValueError):
+            # ``msvcrt`` is Windows-only; elsewhere the fd paths apply.
+            return None
+
+    def _read_line_console(
+        self, timeout: float, reader: ConsoleInputReader
+    ) -> tuple[str | None, bool]:
+        """Read one reply from an interactive console, key by key.
+
+        Polls the reader's pending-key probe in the same deadline slices as
+        :meth:`_read_line_bounded`: a reply that *completes* (Enter
+        pressed) before the deadline is honoured; a reply that does not is
+        a **timeout** rejection (fail-safe — a half-typed line is never an
+        approval, and a late ``y`` after the deadline cannot bypass it); a
+        set ``cancel_event`` unblocks the wait on the next slice, so an
+        emergency stop stays responsive. ``timeout=0`` is a single
+        non-blocking probe. No worker threads are involved (bounded
+        durations, safety contract).
+        """
+        cancel = self._cancel_event
+        buf = ""
+        deadline = self._now() + timeout
+        try:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    return (None, True)
+                if reader.kbhit():
+                    try:
+                        ch = reader.getwch()
+                    except (EOFError, KeyboardInterrupt, OSError, ValueError):
+                        # Ctrl-Z / Ctrl-C / a broken console handle: a
+                        # fail-safe rejection — never an approval, never a
+                        # crash.
+                        return (None, False)
+                    buf += ch
+                    if ch in "\r\n":
+                        break
+                    continue
+                if self._now() >= deadline:
+                    return (None, True)
+                time.sleep(min(0.01, deadline - self._now()))
+        except KeyboardInterrupt:
+            return (None, False)
+        return (buf.rstrip("\r\n"), False)
 
     def _read_line_cancellable(
         self, timeout: float
