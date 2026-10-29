@@ -1121,3 +1121,284 @@ def test_approval_prompt_shows_duration_delay_and_scroll(quiet_stdout, monkeypat
     out3 = captured3.getvalue()
     assert "scroll" in out3, f"scroll missing from prompt: {out3!r}"
     assert "3" in out3, f"scroll value missing from prompt: {out3!r}"
+
+
+# ---------------------------------------------------------------------------
+# 8) Interactive Windows console input (msvcrt kbhit/getwch path)
+#
+# On a Windows console (CONIN$) ``select`` rejects the fd (WinError 10038)
+# and the ``os.read`` bounded fallback is either refused (``set_blocking``)
+# or blocks until Enter — so neither enforces the prompt deadline and an
+# F12 cancel can be bypassed by a late ``y``. The approver must instead
+# read the console key-by-key through an injectable reader protocol
+# (``kbhit``/``getwch``), keeping the deadline, cancellation and fail-safe
+# semantics. Tests inject a scripted fake reader (deterministic, no console
+# required); the live-CONIN$ checks run only on a real Windows console.
+# ---------------------------------------------------------------------------
+
+import sys  # noqa: E402
+import time  # noqa: E402
+
+import ai_game_agent.actions.approver as _approver_mod  # noqa: E402
+
+
+class _FakeConsoleReader:
+    """Duck-typed ``ConsoleInputReader``: a scripted queue of pending keys.
+
+    Enter is modelled as ``"\\r"`` (what ``msvcrt.getwch()`` returns for
+    the Enter key). ``available_after`` hides the keys from ``kbhit()``
+    until that many seconds have passed (a human who types late);
+    ``eof`` makes ``getwch()`` raise ``EOFError`` (Ctrl-Z) and
+    ``kbdint`` makes ``kbhit()`` raise ``KeyboardInterrupt`` (Ctrl-C).
+    """
+
+    def __init__(
+        self,
+        keys: tuple[str, ...] = (),
+        *,
+        available_after: float = 0.0,
+        eof: bool = False,
+        kbdint: bool = False,
+    ) -> None:
+        self._keys = list(keys)
+        self._t0 = time.monotonic()
+        self._available_after = available_after
+        self._eof = eof
+        self._kbdint = kbdint
+        self.kbhit_calls = 0
+
+    def kbhit(self) -> bool:
+        self.kbhit_calls += 1
+        if self._kbdint:
+            raise KeyboardInterrupt
+        if (time.monotonic() - self._t0) < self._available_after:
+            return False
+        return bool(self._keys) or self._eof
+
+    def getwch(self) -> str:
+        if self._eof:
+            raise EOFError
+        return self._keys.pop(0)
+
+
+def test_console_reader_affirmative_reply_approves(quiet_stdout):
+    reader = _FakeConsoleReader(("y", "\r"))
+    approver = TerminalApprover(timeout_s=1.0, reader=reader)
+    decision = approver.request_approval(_action(), reasoning="r", confidence=0.5)
+    assert decision.is_approved, f"console 'y' must approve: {decision}"
+    assert decision.reason == "user-approved"
+
+
+def test_console_reader_word_replies(quiet_stdout):
+    approver = TerminalApprover(timeout_s=1.0, reader=_FakeConsoleReader(("yes", "\r")))
+    assert approver.request_approval(_action()).is_approved
+
+    approver = TerminalApprover(timeout_s=1.0, reader=_FakeConsoleReader(("no", "\r")))
+    decision = approver.request_approval(_action())
+    assert not decision.is_approved
+    assert decision.reason == "user-rejected"
+
+
+def test_console_reader_blank_line_rejects(quiet_stdout):
+    approver = TerminalApprover(timeout_s=1.0, reader=_FakeConsoleReader(("\r",)))
+    decision = approver.request_approval(_action())
+    assert not decision.is_approved
+    assert decision.reason == "user-rejected"
+
+
+def test_console_reader_garbage_rejects(quiet_stdout):
+    approver = TerminalApprover(
+        timeout_s=1.0, reader=_FakeConsoleReader(("m", "a", "y", "b", "e", "\r"))
+    )
+    decision = approver.request_approval(_action())
+    assert not decision.is_approved
+    assert decision.reason == "unparsable-reply"
+
+
+def test_console_reader_eof_rejects(quiet_stdout):
+    """Ctrl-Z (EOF) mid-wait is a fail-safe rejection, never an approval."""
+    approver = TerminalApprover(timeout_s=1.0, reader=_FakeConsoleReader(eof=True))
+    decision = approver.request_approval(_action())
+    assert not decision.is_approved
+    assert decision.reason == "no-input-channel"
+
+
+def test_console_reader_keyboard_interrupt_rejects(quiet_stdout):
+    """Ctrl-C (KeyboardInterrupt) mid-wait is a rejection, not a crash."""
+    approver = TerminalApprover(timeout_s=1.0, reader=_FakeConsoleReader(kbdint=True))
+    decision = approver.request_approval(_action())
+    assert not decision.is_approved
+
+
+def test_console_reader_timeout_rejects_within_deadline(quiet_stdout):
+    """No key press must time out with reason ``"timeout"`` — the deadline
+    is actually polled (several probes), not one-shot."""
+    reader = _FakeConsoleReader()
+    approver = TerminalApprover(timeout_s=0.3, reader=reader)
+    t0 = time.monotonic()
+    decision = approver.request_approval(_action())
+    elapsed = time.monotonic() - t0
+    assert not decision.is_approved
+    assert decision.reason == "timeout"
+    assert elapsed < 1.0, f"console wait ran {elapsed:.2f}s past a 0.3s deadline"
+    assert reader.kbhit_calls > 1, "deadline loop never re-polled the reader"
+
+
+def test_console_reader_cancel_interrupts_pending_wait(quiet_stdout):
+    """A set ``cancel_event`` (F12) must unblock a pending console wait
+    promptly with an ``"interrupted"`` rejection."""
+    cancel = threading.Event()
+    approver = TerminalApprover(
+        timeout_s=10.0, cancel_event=cancel, reader=_FakeConsoleReader()
+    )
+
+    result_box: dict[str, object] = {}
+
+    def _call() -> None:
+        result_box["decision"] = approver.request_approval(
+            _action(), reasoning="r", confidence=0.5
+        )
+
+    t = threading.Thread(target=_call, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    cancel.set()
+    t.join(timeout=2.0)
+    assert not t.is_alive(), "cancel_event did not unblock the console wait"
+    decision = result_box.get("decision")
+    assert decision is not None
+    assert not decision.is_approved
+    assert decision.reason == "interrupted"
+
+
+def test_console_reader_late_reply_after_deadline_is_timeout(quiet_stdout):
+    """A reply typed *after* the deadline must not be honoured (the P1
+    bypass: late ``y`` must never approve a timed-out proposal)."""
+    approver = TerminalApprover(
+        timeout_s=0.2, reader=_FakeConsoleReader(("y", "\r"), available_after=0.5)
+    )
+    decision = approver.request_approval(_action())
+    assert not decision.is_approved
+    assert decision.reason == "timeout"
+
+
+def test_console_reader_late_y_after_cancel_is_interrupted(quiet_stdout):
+    """A ``y`` typed after F12 must still lose: stop wins over approval."""
+    cancel = threading.Event()
+    approver = TerminalApprover(
+        timeout_s=10.0,
+        cancel_event=cancel,
+        reader=_FakeConsoleReader(("y", "\r"), available_after=0.5),
+    )
+
+    result_box: dict[str, object] = {}
+
+    def _call() -> None:
+        result_box["decision"] = approver.request_approval(_action())
+
+    t = threading.Thread(target=_call, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    cancel.set()
+    t.join(timeout=2.0)
+    assert not t.is_alive(), "cancel_event did not unblock the console wait"
+    decision = result_box.get("decision")
+    assert decision is not None
+    assert not decision.is_approved
+    assert decision.reason == "interrupted"
+
+
+def test_console_reader_zero_timeout_is_single_probe(quiet_stdout):
+    """``timeout=0`` on the console path is a non-blocking poll, not an
+    unbounded wait: a reply arriving at 0.3 s is not honoured."""
+    approver = TerminalApprover(
+        timeout_s=0, reader=_FakeConsoleReader(("y", "\r"), available_after=0.3)
+    )
+    t0 = time.monotonic()
+    decision = approver.request_approval(_action())
+    elapsed = time.monotonic() - t0
+    assert not decision.is_approved
+    assert decision.reason == "timeout"
+    assert elapsed < 0.5, f"timeout=0 blocked for {elapsed:.2f}s"
+
+
+def test_auto_detects_console_reader_for_tty_stdin(quiet_stdout, monkeypatch):
+    """An interactive (``isatty()``) stdin selects the console reader —
+    pinning the dispatch decision without reading a real console."""
+
+    class _TtyStdin:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr("sys.stdin", _TtyStdin())
+    sentinel = _FakeConsoleReader()
+    monkeypatch.setattr(_approver_mod, "MsvcrtConsoleReader", lambda: sentinel)
+    approver = TerminalApprover(timeout_s=0.5)
+    assert approver._console_reader() is sentinel
+
+
+def test_injected_reader_wins_over_auto_detect(quiet_stdout):
+    injected = _FakeConsoleReader(("y", "\r"))
+    approver = TerminalApprover(timeout_s=1.0, reader=injected)
+    assert approver._console_reader() is injected
+
+
+def test_no_console_reader_for_non_tty_stdin(quiet_stdout, monkeypatch):
+    """Piped / redirected stdin keeps the existing fd read paths."""
+    monkeypatch.setattr("sys.stdin", io.StringIO("y\n"))
+    approver = TerminalApprover(timeout_s=0.5)
+    assert approver._console_reader() is None
+
+
+def _drain_console() -> None:
+    """Consume stray keystrokes so the live checks start from a clean buffer."""
+    import msvcrt
+
+    while msvcrt.kbhit():
+        msvcrt.getwch()
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" or not sys.stdin.isatty(),
+    reason="needs a live Windows console (CONIN$)",
+)
+def test_live_windows_console_timeout_rejects(quiet_stdout):
+    """Real CONIN$ path: no key press → ``"timeout"`` rejection within the
+    deadline (previously this path hung or was refused outright)."""
+    _drain_console()
+    t0 = time.monotonic()
+    decision = TerminalApprover(timeout_s=0.5).request_approval(_action())
+    elapsed = time.monotonic() - t0
+    assert not decision.is_approved
+    assert decision.reason == "timeout"
+    assert elapsed < 2.0, f"live console wait exceeded deadline: {elapsed:.2f}s"
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" or not sys.stdin.isatty(),
+    reason="needs a live Windows console (CONIN$)",
+)
+def test_live_windows_console_cancel_interrupts(quiet_stdout):
+    """Real CONIN$ path: F12 (cancel_event) during the prompt unblocks the
+    wait promptly with ``"interrupted"`` — no 30 s sit-out, no late-``y``
+    bypass (previously the bounded fallback blocked on a line-buffered
+    read and ignored the cancel until Enter)."""
+    _drain_console()
+    cancel = threading.Event()
+    approver = TerminalApprover(timeout_s=30.0, cancel_event=cancel)
+
+    result_box: dict[str, object] = {}
+
+    def _call() -> None:
+        result_box["d"] = approver.request_approval(_action())
+
+    t = threading.Thread(target=_call, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    cancel.set()
+    t.join(timeout=3.0)
+    assert not t.is_alive(), "cancel did not unblock the live console wait"
+    decision = result_box.get("d")
+    assert decision is not None
+    assert not decision.is_approved
+    assert decision.reason == "interrupted"
