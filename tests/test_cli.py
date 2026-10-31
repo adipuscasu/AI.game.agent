@@ -1,4 +1,6 @@
 import json
+
+import pytest
 import logging
 from pathlib import Path
 
@@ -414,6 +416,28 @@ def test_observe_record_flags_last_one_wins():
         "no flag: record must be the None sentinel so the config default "
         "(capture.record.enabled) applies"
     )
+
+
+def test_cli_approve_timeout_rejects_non_finite_and_negative():
+    """F2 (P2): ``--approve-timeout`` must reject non-finite values (``nan``,
+    ``inf``, ``-inf``) and negatives at parse time (argparse ``SystemExit``),
+    while accepting ``0`` and a positive value. ``type=float`` alone would
+    parse ``nan``/``inf``; a downstream ``< 0`` check would miss them.
+    """
+    parser = cli.build_parser()
+
+    for bad in ("nan", "inf", "-inf", "-1", "-0.5"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["run", "--approve-timeout", bad])
+
+    # 0 and a positive value must be accepted and passed through.
+    args = parser.parse_args(["run", "--approve-timeout", "0"])
+    assert args.approve_timeout == 0.0
+    args = parser.parse_args(["run", "--approve-timeout", "5.0"])
+    assert args.approve_timeout == 5.0
+    # Omitted -> the None sentinel (instance default applies).
+    args = parser.parse_args(["run"])
+    assert args.approve_timeout is None
 
 
 def test_cli_analyze_perception_disabled_skips_optional_detectors(tmp_path, capsys):
