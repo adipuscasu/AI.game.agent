@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 import threading
 import time
@@ -696,6 +697,28 @@ def _parse_action_args(spec: str | None) -> list[Action]:
     return actions
 
 
+def _finite_non_negative_timeout(value: str) -> float:
+    """argparse ``type`` for ``--approve-timeout``.
+
+    Rejects non-finite and negative values at parse time (argparse
+    converts ``ArgumentTypeError`` into a clean usage error). ``float``
+    alone would happily parse ``nan`` / ``inf`` / ``-inf`` and a
+    downstream ``< 0`` check would miss ``nan`` and ``inf``.
+    """
+    try:
+        result = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid --approve-timeout value: {value!r}"
+        ) from exc
+    if not math.isfinite(result) or result < 0:
+        raise argparse.ArgumentTypeError(
+            f"--approve-timeout must be a finite, non-negative number of "
+            f"seconds (0 = non-blocking poll), got {value!r}"
+        )
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ai-game-agent", description=__doc__)
     sub = parser.add_subparsers(dest="command")
@@ -905,11 +928,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="ASSISTED mode only: auto-approve every AI proposal "
                             "(CI/non-interactive); default is an interactive y/N "
                             "prompt")
-    p_run.add_argument("--approve-timeout", type=float, default=None,
-                       help="ASSISTED mode only: seconds to wait for an approval "
-                            "answer (default: 30 s when omitted; 0 = non-blocking "
-                            "poll; negative values are rejected). Fail-safe = "
-                            "reject on timeout/EOF/no-input")
+    p_run.add_argument(
+        "--approve-timeout", type=_finite_non_negative_timeout, default=None,
+        help="ASSISTED mode only: seconds to wait for an approval "
+             "answer (default: 30 s when omitted; 0 = non-blocking "
+             "poll; negative or non-finite values are rejected). Fail-safe = "
+             "reject on timeout/EOF/no-input")
     p_run.add_argument("--pretty", action="store_true",
                        help="pretty-print the report JSON")
     p_run.add_argument(
@@ -1040,10 +1064,10 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
             timeout_s = getattr(args, "approve_timeout", None)
             if timeout_s is not None:
                 timeout_s = float(timeout_s)
-                if timeout_s < 0:
+                if not math.isfinite(timeout_s) or timeout_s < 0:
                     raise ValueError(
-                        "--approve-timeout must be a non-negative number of "
-                        "seconds (0 = non-blocking poll)"
+                        "--approve-timeout must be a finite, non-negative "
+                        "number of seconds (0 = non-blocking poll)"
                     )
             # cancel_event = the F12 stop signal: a pending approval wait is
             # interrupted promptly ("interrupted" rejection) instead of
