@@ -577,7 +577,11 @@ class TerminalApprover:
         there. The read polls the fd in non-blocking slices **on the main
         thread** up to the deadline: a buffered reply is honoured, a reply
         that only arrives *after* the deadline is a **timeout** rejection
-        (fail-safe — matches the ``select`` path), and nothing is left
+        (fail-safe — matches the ``select`` path). If the deadline is
+        reached mid-line, the bytes already buffered are drained (reads
+        end once the buffer is empty or a small budget is exceeded): a
+        complete buffered line is still honoured, but an ongoing stream
+        of partial-line bytes cannot extend the wait. Nothing is left
         behind: the main thread is always released by the deadline and no
         blocked per-prompt worker accumulates (bounded durations, safety
         contract). A set ``cancel_event`` unblocks the poll on the next
@@ -602,6 +606,8 @@ class TerminalApprover:
         cancel = self._cancel_event
         buf = b""
         deadline = self._now() + timeout
+        draining = False  # deadline passed: bounded drain, then reject
+        drain_budget = 65536  # a human's buffered line is far shorter
         try:
             while True:
                 if cancel is not None and cancel.is_set():
@@ -609,7 +615,7 @@ class TerminalApprover:
                 try:
                     c = os.read(fd, 1)
                 except BlockingIOError:
-                    c = b""  # no data yet (EAGAIN) — wait until the deadline
+                    c = b""  # no data (EAGAIN)
                 except (OSError, ValueError):
                     # fd broken / closed under us — a fail-safe rejection.
                     return (None, False)
@@ -617,10 +623,25 @@ class TerminalApprover:
                     buf += c
                     if c == b"\n":
                         break
+                    if draining:
+                        # Bounded drain: a live feeder keeps the pipe
+                        # buffer full, so EAGAIN alone would never end
+                        # it — cap the post-deadline reads as well.
+                        drain_budget -= 1
+                        if drain_budget <= 0:
+                            return (None, True)
+                    elif self._now() >= deadline:
+                        # Deadline reached mid-line: keep reading only
+                        # while bytes are already buffered (non-blocking
+                        # reads end once the buffer is empty), so a
+                        # complete buffered line is still honoured; a
+                        # stream of partial bytes cannot pin the main
+                        # thread (fail-safe contract).
+                        draining = True
                     continue
                 # ``c == b""`` on a non-blocking pipe means "no data now"
-                # (or EOF with the writer closed): wait until the deadline.
-                if self._now() >= deadline:
+                # (or EOF with the writer closed).
+                if draining or self._now() >= deadline:
                     return (None, True)
                 time.sleep(min(0.01, deadline - self._now()))
         finally:
