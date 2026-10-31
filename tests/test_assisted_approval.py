@@ -40,6 +40,8 @@ import datetime
 import io
 import threading
 
+import math
+
 import pytest
 
 from ai_game_agent.actions import (
@@ -873,6 +875,47 @@ def test_approval_event_detail_contract():
     assert detail["channel"] == "channel-x"
 
 
+def test_approval_event_detail_includes_action_and_reasoning():
+    """F3 (P2): the APPROVAL audit event must record the **proposed action**
+    and its **reasoning**, not just the outcome. Without the action's
+    serialized form, a reviewer cannot answer "what did the agent try to do
+    when it was approved/rejected?" from the audit trail alone.
+    """
+    backend = MockBackend()
+
+    class _ChannelApprover:
+        name = "channel-x"
+
+        def request_approval(self, action, **kwargs):
+            return ApprovalDecision.approved("yes")
+
+    ai = _FakeAI(
+        decision=AIDecision(
+            action=Action(kind=ActionKind.KEY_PRESS, key="e", source="ai"),
+            reasoning="target detected at (10,10)",
+            confidence=0.9,
+        )
+    )
+    events: list[object] = []
+    loop = _loop(
+        mode=OperationMode.ASSISTED,
+        approver=_ChannelApprover(),
+        backend=backend,
+        ai=ai,
+        max_ticks=2,
+        on_event=events.append,
+    )
+    loop.run()
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert approvals
+    detail = approvals[0].detail
+    assert "action" in detail, f"APPROVAL detail missing 'action': {detail!r}"
+    assert "reasoning" in detail, f"APPROVAL detail missing 'reasoning': {detail!r}"
+    assert detail["reasoning"] == "target detected at (10,10)"
+    action_dict = Action(kind=ActionKind.KEY_PRESS, key="e", source="ai").to_dict()
+    assert detail["action"] == action_dict
+
+
 # ---------------------------------------------------------------------------
 # 7) PR #6 review findings — timeout contract, zero-timeout poll, F12 cancel,
 #    full-action prompt
@@ -896,6 +939,31 @@ def test_terminal_approver_timeout_contract_none_zero_positive_negative():
     assert TerminalApprover(timeout_s=5.0)._timeout_s == 5.0
     with pytest.raises(ValueError):
         TerminalApprover(timeout_s=-1)
+
+
+def test_terminal_approver_timeout_rejects_non_finite(quiet_stdout):
+    """F2 (P2): ``nan`` and ``inf`` must be rejected, not just ``-inf`` and
+    ``-1``. Pre-fix, ``nan < 0`` and ``inf < 0`` are both ``False`` in Python
+    (NaN comparisons are always False, ``inf > 0``), so only ``-inf`` and
+    negative numbers were caught — a ``nan`` timeout would slip through to
+    ``deadline = now + nan`` (always NaN → the deadline check never fires →
+    the loop blocks forever on the ``sleep`` branch), and ``inf`` would
+    become an unbounded wait (defeating the "bounded durations" safety
+    contract). Both must raise ``ValueError`` at the same seam as ``-1``.
+    """
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            TerminalApprover(timeout_s=bad)
+
+
+def test_auto_approver_timeout_rejects_non_finite(quiet_stdout):
+    """F2 (P2): the same non-finite rejection applies to
+    :class:`AutoApprover`'s ``request_approval`` timeout seam (a CI/CI-like
+    path that could also pass ``nan``/``inf``)."""
+    action = _action()
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            AutoApprover().request_approval(action, timeout_s=bad)
 
 
 def _late_reply_stdin(delay: float, reply: bytes = b"y\n"):
@@ -1280,6 +1348,73 @@ def test_console_reader_late_reply_after_deadline_is_timeout(quiet_stdout):
     decision = approver.request_approval(_action())
     assert not decision.is_approved
     assert decision.reason == "timeout"
+
+
+def test_console_reader_deadline_checked_before_any_key_consumption(quiet_stdout):
+    """F1 (P1): the deadline must be evaluated **before** a pending key is
+    consumed. Regression guard for the ordering bug where ``kbhit()``/``getwch()``
+    ran before the deadline check — a ``y`` that is pending at (or past) the
+    deadline would be honoured, turning a timed-out prompt into an approval.
+
+    Deterministic: ``timeout_s=0`` makes the deadline equal to the clock at
+    the first probe, and a fixed ``now_fn`` means the clock never advances
+    (no ``time.sleep`` flakiness). The reader reports ``y`` as pending from
+    t=0 (worst case for the P1 bug). Pre-fix, ``kbhit()``/``getwch()`` run
+    before the deadline check, so the pending ``y`` is consumed and the
+    request **approves**. Post-fix, the deadline is evaluated first on the
+    very first probe (``now >= deadline``) and the request rejects with
+    ``"timeout"`` without touching the key.
+    """
+
+    class _ClockReader:
+        """Reports a pending key from t=0 — the worst case for the P1 bug."""
+
+        def __init__(self) -> None:
+            self._keys = ["y", "\r"]
+
+        def kbhit(self) -> bool:
+            return bool(self._keys)
+
+        def getwch(self) -> str:
+            return self._keys.pop(0)
+
+    reader = _ClockReader()
+    # ``timeout_s=0`` → deadline equals the (fixed) clock at the first probe,
+    # so the deadline check fires immediately. A fixed ``now_fn`` keeps the
+    # clock from ever advancing, which is what makes the pre-fix vs post-fix
+    # ordering observable (a moving clock + ``timeout>0`` would let the
+    # post-fix loop sleep instead of deciding).
+    approver = TerminalApprover(timeout_s=0, reader=reader, now_fn=lambda: 0.0)
+    decision = approver.request_approval(_action())
+    assert not decision.is_approved
+    assert decision.reason == "timeout"
+
+
+def test_console_reader_deadline_honours_pending_reply_at_first_probe(quiet_stdout):
+    """F1 companion: a reply already pending at the **first** probe (t <
+    deadline) is still honoured — the deadline check does not swallow a
+    legitimate fast reply. Pre-fix and post-fix both approve, so this pins
+    the *legitimate* path that F1's fix must not regress."""
+
+    class _ClockReader:
+        def __init__(self) -> None:
+            self._keys = ["y", "\r"]
+
+        def kbhit(self) -> bool:
+            return bool(self._keys)
+
+        def getwch(self) -> str:
+            return self._keys.pop(0)
+
+    reader = _ClockReader()
+    # Clock fixed at t=0, deadline at 1.0: the first probe is well before the
+    # deadline, so the pending reply is honoured.
+    approver = TerminalApprover(timeout_s=1.0, reader=reader, now_fn=lambda: 0.0)
+    decision = approver.request_approval(_action())
+    assert decision.is_approved, (
+        f"a pending reply at the first probe must approve, got {decision!r}"
+    )
+    assert decision.reason == "user-approved"
 
 
 def test_console_reader_late_y_after_cancel_is_interrupted(quiet_stdout):
