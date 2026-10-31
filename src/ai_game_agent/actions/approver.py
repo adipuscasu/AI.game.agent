@@ -47,6 +47,7 @@ Design notes:
 from __future__ import annotations
 
 import dataclasses
+import math
 import sys
 import threading
 import time
@@ -225,8 +226,12 @@ class AutoApprover:
         confidence: float | None = None,
         timeout_s: float | None = None,
     ) -> ApprovalDecision:
-        if timeout_s is not None and timeout_s < 0:
-            raise ValueError(f"timeout_s must be >= 0, got {timeout_s!r}")
+        if timeout_s is not None and (
+            not math.isfinite(timeout_s) or timeout_s < 0
+        ):
+            raise ValueError(
+                f"timeout_s must be a finite value >= 0, got {timeout_s!r}"
+            )
         return ApprovalDecision.approved(self._reason)
 
 
@@ -268,9 +273,9 @@ class TerminalApprover:
         self._timeout_s = (
             self.DEFAULT_TIMEOUT_S if timeout_s is None else float(timeout_s)
         )
-        if self._timeout_s < 0:
+        if not math.isfinite(self._timeout_s) or self._timeout_s < 0:
             raise ValueError(
-                f"timeout_s must be >= 0, got {timeout_s!r}"
+                f"timeout_s must be a finite value >= 0, got {timeout_s!r}"
             )
         # Injectable clock for deterministic timeout tests.
         self._now = now_fn if now_fn is not None else time.monotonic
@@ -292,8 +297,10 @@ class TerminalApprover:
         timeout_s: float | None = None,
     ) -> ApprovalDecision:
         timeout = self._timeout_s if timeout_s is None else timeout_s
-        if timeout < 0:
-            raise ValueError(f"timeout_s must be >= 0, got {timeout!r}")
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError(
+                f"timeout_s must be a finite value >= 0, got {timeout!r}"
+            )
 
         prompt = self._build_prompt(action, reasoning=reasoning, confidence=confidence)
         print(prompt, end="", flush=True)
@@ -478,6 +485,14 @@ class TerminalApprover:
             while True:
                 if cancel is not None and cancel.is_set():
                     return (None, True)
+                # Evaluate the deadline **before** consuming a pending key.
+                # A reply still pending once the deadline has passed is a
+                # timeout rejection (fail-safe): a late ``y`` typed at or past
+                # the deadline must not be honoured, and a half-typed line is
+                # never an approval. (A reply already buffered *before* the
+                # deadline is still honoured — e.g. the ``timeout_s=0`` poll.)
+                if self._now() >= deadline:
+                    return (None, True)
                 if reader.kbhit():
                     try:
                         ch = reader.getwch()
@@ -490,8 +505,6 @@ class TerminalApprover:
                     if ch in "\r\n":
                         break
                     continue
-                if self._now() >= deadline:
-                    return (None, True)
                 time.sleep(min(0.01, deadline - self._now()))
         except KeyboardInterrupt:
             return (None, False)
