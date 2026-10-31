@@ -79,10 +79,6 @@ class AIDecision:
             raise AIError(
                 f"AI decision confidence must be in [0.0, 1.0], got {self.confidence!r}"
             )
-        if not 0.0 <= self.confidence <= 1.0:
-            raise AIError(
-                f"AI decision confidence must be in [0.0, 1.0], got {self.confidence!r}"
-            )
         # from_dict() already normalizes via float(); direct construction
         # stored the value as-given, so an int confidence (1 vs 1.0) produced
         # different to_dict() output per path. Normalize here so the field

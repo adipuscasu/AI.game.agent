@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 import threading
 import time
@@ -696,6 +697,28 @@ def _parse_action_args(spec: str | None) -> list[Action]:
     return actions
 
 
+def _finite_non_negative_timeout(value: str) -> float:
+    """argparse ``type`` for ``--approve-timeout``.
+
+    Rejects non-finite and negative values at parse time (argparse
+    converts ``ArgumentTypeError`` into a clean usage error). ``float``
+    alone would happily parse ``nan`` / ``inf`` / ``-inf`` and a
+    downstream ``< 0`` check would miss ``nan`` and ``inf``.
+    """
+    try:
+        result = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid --approve-timeout value: {value!r}"
+        ) from exc
+    if not math.isfinite(result) or result < 0:
+        raise argparse.ArgumentTypeError(
+            f"--approve-timeout must be a finite, non-negative number of "
+            f"seconds (0 = non-blocking poll), got {value!r}"
+        )
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ai-game-agent", description=__doc__)
     sub = parser.add_subparsers(dest="command")
@@ -901,6 +924,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--no-ocr", action="store_true", help="disable OCR")
     p_run.add_argument("--no-objects", action="store_true",
                        help="disable color-blob object detection")
+    p_run.add_argument("--approve-all", action="store_true",
+                       help="ASSISTED mode only: auto-approve every AI proposal "
+                            "(CI/non-interactive); default is an interactive y/N "
+                            "prompt")
+    p_run.add_argument(
+        "--approve-timeout", type=_finite_non_negative_timeout, default=None,
+        help="ASSISTED mode only: seconds to wait for an approval "
+             "answer (default: 30 s when omitted; 0 = non-blocking "
+             "poll; negative or non-finite values are rejected). Fail-safe = "
+             "reject on timeout/EOF/no-input")
     p_run.add_argument("--pretty", action="store_true",
                        help="pretty-print the report JSON")
     p_run.add_argument(
@@ -999,10 +1032,12 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
     # backend (inside ``_build_executor``), so it is filled in post-construction
     # and read lazily — no construction-order cycle.
     stop_event = threading.Event()
+    approval_cancel = threading.Event()
     _executor_holder: dict[str, Executor] = {}
 
     def _f12() -> None:
         stop_event.set()
+        approval_cancel.set()
         ex = _executor_holder.get("executor")
         if ex is not None:
             ex.trigger_emergency_stop("f12")
@@ -1014,6 +1049,32 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
     # ai_enabled flag is on (opt-in). When off, the loop gets ai=None and
     # AI_ANALYSIS behaves exactly as the Phase-4 slot (watchdog -> PAUSED).
     ai_client = create_client(cfg.ai) if cfg.agent.ai_enabled else None
+    # Phase 6: the assisted-mode approval gate. Only wired in ASSISTED mode, so
+    # the other modes (and their tests) are byte-for-byte unchanged. Default is
+    # TerminalApprover (interactive y/N) for a real run; --approve-all /
+    # --approve-timeout switch it. The loop stays the single gate-owner: the
+    # approver is consulted only for AI-proposed actions in ASSISTED mode.
+    from ai_game_agent.actions.approver import AutoApprover, TerminalApprover
+
+    approver = None
+    if mode is OperationMode.ASSISTED:
+        if getattr(args, "approve_all", False):
+            approver = AutoApprover()
+        else:
+            timeout_s = getattr(args, "approve_timeout", None)
+            if timeout_s is not None:
+                timeout_s = float(timeout_s)
+                if not math.isfinite(timeout_s) or timeout_s < 0:
+                    raise ValueError(
+                        "--approve-timeout must be a finite, non-negative "
+                        "number of seconds (0 = non-blocking poll)"
+                    )
+            # cancel_event = the F12 stop signal: a pending approval wait is
+            # interrupted promptly ("interrupted" rejection) instead of
+            # sitting out the full timeout after an emergency stop.
+            approver = TerminalApprover(
+                timeout_s=timeout_s, cancel_event=approval_cancel
+            )
 
     max_ticks = 1 if getattr(args, "once", False) else getattr(args, "max_ticks", None)
     if max_ticks is not None and int(max_ticks) < 1:
@@ -1043,6 +1104,7 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         stop_event=stop_event,
         recorder=recorder,
         ai=ai_client,
+        approver=approver,
     )
     # The loop owns only the *capture* facade (start/stop); the *input* backend
     # lifecycle is the CLI's job, exactly like _act(): open before dispatch and

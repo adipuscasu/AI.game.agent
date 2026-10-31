@@ -59,6 +59,22 @@ from ai_game_agent.state import (
 __all__ = ["AgentLoop", "TickResult"]
 
 
+class _ApprovalRejected:
+    """Minimal stand-in for a rejection when the approver itself raised.
+
+    Structurally satisfies the ``is_approved``/``reason`` reads in
+    :meth:`AgentLoop._gate_ai_actions` without importing the approver
+    module into the loop (keeps the loop's dependency surface unchanged).
+    """
+
+    __slots__ = ("reason",)
+    is_approved = False
+    is_rejected = True
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class TickResult:
     """Outcome of one :meth:`AgentLoop.tick` (for ``--once`` and replay tests).
@@ -104,6 +120,7 @@ class AgentLoop:
         on_event: Callable[[LoopEvent], None] | None = None,
         recorder: Callable[[LoopEvent], None] | None = None,
         ai: object | None = None,
+        approver: object | None = None,
     ) -> None:
         if max_ticks is not None and max_ticks < 1:
             raise ValueError("max_ticks must be >= 1 or None")
@@ -124,6 +141,16 @@ class AgentLoop:
         # provider.decide(prompt) -> AIDecision. None (default) keeps
         # AI_ANALYSIS behaving exactly as today (no dispatch, watchdog fires).
         self._ai = ai
+        # Phase 6 assisted-approval channel (duck-typed Approver; None = no
+        # gating). The loop is the only object that may consult it, and only
+        # for AI-proposed actions under ASSISTED — deterministic safe actions
+        # keep executing exactly as in Phase 4. See actions.approver.
+        self._approver = approver
+        # Assisted-gate audit counters (reported on the LoopEvent APPROVAL
+        # detail; not surfaced on AgentLoopReport to keep its shape stable).
+        self._approvals_requested = 0
+        self._approvals_granted = 0
+        self._approvals_rejected = 0
         # AI episode bookkeeping: once the provider has been consulted for
         # the current AI_ANALYSIS episode, it must not be consulted again
         # while the state persists (a watchdog state that is *meant* to
@@ -213,6 +240,9 @@ class AgentLoop:
             # Not in an AI episode: the next entry into AI_ANALYSIS is a
             # fresh analysis trigger and may consult the provider again.
             self._ai_consulted = False
+        ai_proposed = False
+        reasoning = ""
+        confidence = None
         if (
             state is AgentState.AI_ANALYSIS
             and self._ai is not None
@@ -233,11 +263,18 @@ class AgentLoop:
                 return self._on_pipeline_error(exc, "ai", now)
             self._ai_consulted = True
             actions = (decision.action,)
+            ai_proposed = True
+            reasoning = decision.reasoning
+            confidence = decision.confidence
         else:
             actions = self._policy.actions(state, observation, self._mode)
         results: tuple[ActionResult, ...] = ()
         if self._mode.input_allowed and actions:
-            results = self._dispatch(actions, now)
+            if ai_proposed and self._gate_ai_actions(actions, now, reasoning, confidence) is None:
+                # Rejected: safe-halt; skip dispatch entirely (nothing runs).
+                results = ()
+            else:
+                results = self._dispatch(actions, now)
 
         zones = {h.zone: h.value for h in observation.ui_zones}
         self._emit(
@@ -304,6 +341,98 @@ class AgentLoop:
             )
             results.append(result)
         return tuple(results)
+
+    # ---- assisted-approval gate (Phase 6) ----------------------------------
+
+    def _gate_ai_actions(
+        self,
+        actions: tuple[Action, ...],
+        now: float,
+        reasoning: str = "",
+        confidence: float | None = None,
+    ) -> bool | None:
+        """Gate AI-proposed actions on human approval under ``ASSISTED``.
+
+        Returns ``True`` (proceed to dispatch), ``False`` is unused — a
+        rejection returns ``None`` and halts the episode. Deterministic
+        (non-AI) actions never reach this gate; they dispatch as in Phase 4.
+
+        Contract (fail-safe):
+          * Only consulted when ``mode is ASSISTED`` AND an approver is
+            injected. Under any other mode this is a no-op (returns ``True``),
+            so OBSERVE_ONLY / SEMI_AUTONOMOUS / AUTONOMOUS are unchanged.
+          * One approval request per batch (the AI seam emits exactly one
+            action per decision), so a human answers once for the proposal.
+          * A rejection enters ``PAUSED`` (safe halt, executor stopped) and
+            emits an ``APPROVAL`` event recording the outcome for the audit
+            trail; the batch is not dispatched.
+          * An approver that raises is classified as a rejection (the agent
+            never crashes on an "answer" — it refuses the action).
+        """
+        if self._approver is None:
+            return True
+        if self._mode is not OperationMode.ASSISTED:
+            return True
+        if not actions:
+            return True
+
+        self._approvals_requested += 1
+        action = actions[0]
+        kind = action.kind.value
+        channel = getattr(self._approver, "name", "approver")
+        try:
+            decision = self._approver.request_approval(
+                action,
+                reasoning=reasoning,
+                confidence=confidence,
+            )
+        except Exception as exc:  # noqa: BLE001 - an errored approver = reject
+            decision = _ApprovalRejected(
+                reason=f"approver-error: {type(exc).__name__}: {exc}"
+            )
+
+        approved = getattr(decision, "is_approved", False)
+        reason = getattr(decision, "reason", "")
+        if approved:
+            self._approvals_granted += 1
+        else:
+            self._approvals_rejected += 1
+
+        self._emit(
+            self._event(
+                event=EventType.APPROVAL,
+                ts=now,
+                state_before=self._machine.state,
+                state_after=self._machine.state,
+                reason="approved" if approved else f"rejected: {reason}",
+                detail={
+                    "kind": kind,
+                    "approved": approved,
+                    "reason": reason,
+                    "channel": channel,
+                    "confidence": confidence,
+                    # F3 (P2): record the *proposed action* (JSON-serializable
+                    # via to_dict()) and the model's *reasoning* so a reviewer
+                    # can answer "what did the agent try to do, and why?" from
+                    # the audit trail alone — not just the outcome.
+                    "action": action.to_dict(),
+                    "reasoning": reasoning,
+                },
+            )
+        )
+        if approved:
+            return True
+
+        # Rejection: safe-halt. Enter PAUSED so the run() loop exits on the
+        # same terminal-ish state it already knows, the executor is released,
+        # and the next tick is not re-dispatched. This is a *forced* move
+        # (machine.enter), not an observation-driven decide().
+        self._machine.enter(
+            AgentState.PAUSED,
+            reason="assisted approval rejected; safe pause",
+            now=now,
+        )
+        return None
 
     # ---- pipeline failure handling -----------------------------------------
 

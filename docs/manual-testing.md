@@ -557,3 +557,49 @@ uv run pytest tests/test_agent_loop.py tests/test_agent_loop_safety.py tests/tes
 # And the whole suite must stay green (CI must not need a desktop or a live game):
 uv run pytest -q
 ```
+
+---
+
+## 6. Windows quirks
+
+Two Windows-only symptoms you may see that are **not** project bugs:
+
+### 6.1 `pytest-current` PermissionError after an otherwise-green run
+
+A `pytest runfinished` hook calls `cleanup_dead_symlinks` on the basetemp;
+on Windows, unlinking the `pytest-current` symlink can fail with
+`PermissionError: [WinError 5] Access is denied` if the temp dir is locked
+(antivirus, OneDrive, another pytest instance, or a previous run's leftover).
+This is a pytest/OS issue, not an `AI.game.agent` defect.
+
+```powershell
+# Remove the stale temp dir and re-run
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Temp\pytest-of-$env:USERNAME"
+uv run pytest -q
+```
+
+`--basetemp` does **not** fix this — the same cleanup path runs on whatever
+basetemp you choose. It only relocates where the failure can occur.
+
+### 6.2 `select.select` raises `OSError [WinError 10038]` on pipe fds
+
+`test_terminal_approver_timeout_rejects` exercises the assisted-approval
+prompt, which reads one line from stdin with a timeout. On Linux/macOS that
+uses `select.select`, which works on any fd. On Windows `select` only accepts
+sockets — pipes and console fds raise `OSError [WinError 10038]`. The
+production path (an ASSISTED-mode prompt on a real Windows console) would hit
+the same error.
+
+This is fixed in **`8e7233c`** (already on `feature/phase-6`): `approver.py`
+catches the `OSError` and falls back to `_read_line_bounded`, which reads on a
+daemon worker thread and times out on the main thread. If you see this failure,
+your clone is behind — pull the branch and re-run:
+
+```powershell
+git pull --ff-only origin feature/phase-6
+uv run pytest tests/test_assisted_approval.py -v -k "timeout or select_rejects"
+```
+
+The regression guard is `test_terminal_approver_timeout_when_select_rejects_fd`,
+which pins the Windows behaviour from the Linux CI host by making
+`select.select` raise the same `OSError`.

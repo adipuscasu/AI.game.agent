@@ -726,6 +726,8 @@ When modifying this repository, an AI coding agent should:
 
 The coding agent should treat AI-generated code as untrusted until validated by tests and review.
 
+**Rule: never end a turn with verification incomplete.** If you end a turn with verification outstanding (tests not run, suite not green, diff not reviewed, regression not proven), the next turn starts by finishing that verification and reporting the actual results — not by asking for approval, permission, or anything else. Verification is part of the work, not a question.
+
 ---
 
 # Definition of Done

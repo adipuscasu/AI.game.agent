@@ -291,13 +291,32 @@ class DeterministicPolicy:
                 f"{zone.bbox.width}, {zone.bbox.height})"
             )
         lines.append(
-            "Suggested action options: key_press, key_hold, mouse_move, mouse_click, "
-            "mouse_scroll, delay."
+            "Respond with a single JSON object. No prose, no markdown, no commentary."
+        )
+        lines.append("Exact required shape:")
+        lines.append(
+            '  {"action": {"kind": "key_press", "key": "q", "delay_ms": 120}, '
+            '"reasoning": "<short reason>", "confidence": 0.9}'
+        )
+        lines.append("Rules:")
+        lines.append(
+            '  - "action" is an OBJECT with a "kind" plus only the fields for '
+            "that kind."
         )
         lines.append(
-            'Return a JSON object: {"action": "<kind>", "key": "<optional>", '
-            '"x": <int>, "y": <int>, "confidence": <0-1>}'
+            '  - "reasoning" and "confidence" belong at the top level, NOT inside "action".'
         )
+        lines.append("  - confidence is a number in [0.0, 1.0].")
+        lines.append("Supported kinds and their fields:")
+        lines.append("  - key_press: key, modifiers, delay_ms")
+        lines.append("  - key_hold: key, modifiers, duration_ms, delay_ms")
+        lines.append("  - mouse_move: x, y, relative, delay_ms")
+        lines.append("  - mouse_click: x, y, button, clicks, delay_ms")
+        lines.append("  - mouse_down: button, delay_ms")
+        lines.append("  - mouse_up: button, delay_ms")
+        lines.append("  - mouse_scroll: scroll, delay_ms")
+        lines.append("  - delay: duration_ms, delay_ms")
+        lines.append("Return exactly one decision object.")
         return "\n".join(lines)
 
     def transition_signals(self, observation: Observation) -> dict[str, object]:
