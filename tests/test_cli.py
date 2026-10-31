@@ -1,8 +1,8 @@
 import json
-
-import pytest
 import logging
 from pathlib import Path
+
+import pytest
 
 import ai_game_agent.__main__ as cli
 from ai_game_agent.__main__ import main

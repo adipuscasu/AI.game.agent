@@ -40,8 +40,6 @@ import datetime
 import io
 import threading
 
-import math
-
 import pytest
 
 from ai_game_agent.actions import (
