@@ -411,6 +411,12 @@ class AgentLoop:
                     "reason": reason,
                     "channel": channel,
                     "confidence": confidence,
+                    # F3 (P2): record the *proposed action* (JSON-serializable
+                    # via to_dict()) and the model's *reasoning* so a reviewer
+                    # can answer "what did the agent try to do, and why?" from
+                    # the audit trail alone — not just the outcome.
+                    "action": action.to_dict(),
+                    "reasoning": reasoning,
                 },
             )
         )
