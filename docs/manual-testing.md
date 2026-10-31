@@ -591,9 +591,16 @@ production path (an ASSISTED-mode prompt on a real Windows console) would hit
 the same error.
 
 This is fixed in **`8e7233c`** (already on `feature/phase-6`): `approver.py`
-catches the `OSError` and falls back to `_read_line_bounded`, which reads on a
-daemon worker thread and times out on the main thread. If you see this failure,
-your clone is behind — pull the branch and re-run:
+catches the `OSError` and falls back to `_read_line_bounded`, which reads the
+fd in bounded non-blocking slices **on the main thread** — no per-prompt worker
+thread is spawned. It enforces the same fail-safe contract as the `select`
+path: a line already buffered and completed within the deadline is honoured; a
+reply that arrives only after the deadline is a timeout rejection; and a stream
+of partial-line bytes cannot pin the main thread — once the deadline is reached
+mid-line, post-deadline draining is bounded (a small budget) before the request
+rejects. (This is the file-descriptor fallback; an interactive Windows console
+instead uses the key-by-key console reader.) If you see this failure, your
+clone is behind — pull the branch and re-run:
 
 ```powershell
 git pull --ff-only origin feature/phase-6

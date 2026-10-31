@@ -122,10 +122,16 @@ same as "no".
 The `_read_line` helper catches `AttributeError` as well, so a `None` stdin
 or a detached session (no `readline`) is a clean rejection, **not** a crash —
 that is exactly the fail-safe scenario the rule names. The timeout path uses
-`select.select` on a real file descriptor; `timeout_s=None` means "wait
-forever" (a human may take their time) while `timeout_s <= 0` is rejected
-with `ValueError` at the call site (so `0` can never silently mean "no
-timeout").
+`select.select` on a real file descriptor (with a bounded non-blocking fallback
+for fds `select` rejects, and the key-by-key console reader for an interactive
+Windows console). `timeout_s=None` falls back to the approver's configured
+default — `TerminalApprover.DEFAULT_TIMEOUT_S`, currently 30 s — rather than
+waiting forever; `timeout_s=0` is a valid **non-blocking poll** (a single
+immediate probe that honours an already-buffered reply and otherwise rejects);
+negative or non-finite values are rejected with `ValueError` at the call site.
+The deadline and cancellation behaviour stay fail-safe: a late reply never
+approves a timed-out proposal, and a set cancel signal (e.g. the F12 emergency
+stop) wins over a pending approval.
 
 ### 3.5 `APPROVAL` is an audit event, not a state
 
