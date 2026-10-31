@@ -1098,6 +1098,182 @@ def test_terminal_approver_cancel_event_interrupts_pending_wait(
     assert decision.reason == "interrupted"
 
 
+def _straddling_stdin(first: bytes, first_at: float, second: bytes, second_at: float):
+    """Real-fd stdin pipe: write ``first`` at ``first_at`` s, then ``second``
+    at ``second_at`` s, holding the write end open. ``readline`` works on this
+    object (the old select->readline() path would demonstrably approve a
+    straddling reply), so it isolates the fd reader's deadline enforcement
+    from the read mechanism.
+    """
+    import os
+    import time
+
+    class _StraddleStdin:
+        def __init__(self) -> None:
+            self.r, self.w = os.pipe()
+
+            def _write() -> None:
+                time.sleep(first_at)
+                try:
+                    os.write(self.w, first)
+                    time.sleep(max(0.0, second_at - first_at))
+                    os.write(self.w, second)
+                except OSError:
+                    pass
+                finally:
+                    os.close(self.w)
+
+            threading.Thread(target=_write, daemon=True).start()
+
+        def fileno(self):
+            return self.r
+
+        def readline(self):  # the old path blocks here until the late \\n
+            buf = b""
+            while True:
+                c = os.read(self.r, 1)
+                if not c:
+                    break
+                buf += c
+                if c == b"\n":
+                    break
+            return buf.decode()
+
+    return _StraddleStdin()
+
+
+def test_fd_straddling_newline_after_deadline_is_timeout(quiet_stdout, monkeypatch):
+    """A reply whose *newline* lands after the deadline is not approved, even
+    if its first byte arrived early.
+
+    ``y`` at ~0.05 s, ``\\n`` at ~0.30 s, deadline 0.10 s. The old
+    select->readline() hand-off approved it (readline() blocked until the
+    late newline). The raw-fd reader must time out instead: a line is
+    honoured only if its terminating newline is consumed within the window.
+    """
+    monkeypatch.setattr(
+        "sys.stdin", _straddling_stdin(b"y", first_at=0.05, second=b"\n", second_at=0.30)
+    )
+    decision = TerminalApprover(timeout_s=0.1).request_approval(
+        _action(), reasoning="r", confidence=0.5
+    )
+    assert not decision.is_approved
+    assert decision.reason == "timeout"
+
+
+def test_fd_lone_byte_without_newline_does_not_hang(quiet_stdout, monkeypatch):
+    """A lone ``y`` with no newline and an open writer must not hang.
+
+    The old readline() path blocked forever (or hit the guarded fake). The
+    raw-fd reader must return a ``timeout`` in ~``timeout_s`` and never call
+    ``readline`` -- the guarded fake raises if it is.
+    """
+    import os
+    import time
+
+    r, w = os.pipe()
+
+    def _write() -> None:
+        time.sleep(0.05)
+        try:
+            os.write(w, b"y")  # no newline; keep w open
+        except OSError:
+            pass
+
+    threading.Thread(target=_write, daemon=True).start()
+
+    class _NoReadline:
+        def fileno(self):
+            return r
+
+        def readline(self):  # pragma: no cover
+            raise AssertionError("readline() must not be used on the fd path")
+
+    monkeypatch.setattr("sys.stdin", _NoReadline())
+
+    started = time.monotonic()
+    decision = TerminalApprover(timeout_s=0.3).request_approval(
+        _action(), reasoning="r", confidence=0.5
+    )
+    elapsed = time.monotonic() - started
+    os.close(r)
+    os.close(w)
+
+    assert elapsed < 2.0, f"approver hung: took {elapsed:.2f}s"
+    assert not decision.is_approved
+    assert decision.reason == "timeout"
+
+
+def test_fd_reply_split_across_poll_slices_is_approved(quiet_stdout, monkeypatch):
+    """A reply whose bytes arrive in separate poll slices is approved, not lost.
+
+    ``y`` at ~0.05 s and ``\\n`` ~0.08 s later, deadline 0.30 s — both
+    within the window. Each ``os.read`` sees only its own byte, so the
+    reader must carry the partial line across poll slices. The old
+    per-slice buffer discarded the ``y`` and read the lone ``\\n`` as a
+    blank line, misclassifying a valid approval as ``user-rejected``.
+    """
+    import os
+
+    r, w = os.pipe()
+
+    def _write() -> None:
+        time.sleep(0.05)
+        try:
+            os.write(w, b"y")
+            time.sleep(0.08)
+            os.write(w, b"\n")
+        except OSError:
+            pass
+        finally:
+            os.close(w)
+
+    threading.Thread(target=_write, daemon=True).start()
+
+    class _SplitStdin:
+        def fileno(self):
+            return r
+
+        def readline(self):  # pragma: no cover
+            raise AssertionError("readline() must not be used on the fd path")
+
+    monkeypatch.setattr("sys.stdin", _SplitStdin())
+    decision = TerminalApprover(timeout_s=0.3).request_approval(
+        _action(), reasoning="r", confidence=0.5
+    )
+    assert decision.is_approved, f"split reply lost: {decision}"
+    assert decision.reason == "user-approved"
+    os.close(r)
+
+
+def test_fd_eof_is_no_input_channel(quiet_stdout, monkeypatch):
+    """A stdin whose writer has closed (real-fd EOF) is ``no-input-channel``,
+    not ``timeout``: there is no channel left to answer, and the request
+    must not wait out the deadline on a dead pipe.
+    """
+    import os
+    import time
+
+    r, w = os.pipe()
+    os.close(w)  # immediate EOF on the read end, no data
+
+    class _EofStdin:
+        def fileno(self):
+            return r
+
+    monkeypatch.setattr("sys.stdin", _EofStdin())
+
+    started = time.monotonic()
+    decision = TerminalApprover(timeout_s=0.5).request_approval(
+        _action(), reasoning="r", confidence=0.5
+    )
+    elapsed = time.monotonic() - started
+    assert not decision.is_approved
+    assert decision.reason == "no-input-channel", f"got {decision.reason!r}"
+    assert elapsed < 0.4, f"EOF should return promptly, took {elapsed:.2f}s"
+    os.close(r)
+
+
 def test_approval_prompt_shows_modifiers(quiet_stdout, monkeypatch):
     """The prompt must surface modifiers: ``ctrl+shift+a`` is a different
     action from bare ``a``, and the approver must see the difference.

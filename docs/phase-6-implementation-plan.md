@@ -122,12 +122,17 @@ same as "no".
 The `_read_line` helper catches `AttributeError` as well, so a `None` stdin
 or a detached session (no `readline`) is a clean rejection, **not** a crash —
 that is exactly the fail-safe scenario the rule names. The timeout path uses
-`select.select` on a real file descriptor (with a bounded non-blocking fallback
-for fds `select` rejects, and the key-by-key console reader for an interactive
-Windows console). `timeout_s=None` falls back to the approver's configured
-default — `TerminalApprover.DEFAULT_TIMEOUT_S`, currently 30 s — rather than
-waiting forever; `timeout_s=0` is a valid **non-blocking poll** (a single
-immediate probe that honours an already-buffered reply and otherwise rejects);
+a **deadline-strict non-blocking read** (`_read_line_fd`) on a real file
+descriptor: the fd is driven non-blocking and read byte-by-byte with
+`os.read` — never `readline` (so a lone byte cannot hang), and no `select` or
+worker thread is involved (so the Windows `select` socket-only limitation and
+thread accumulation never apply). A reply is honoured only if its newline is
+consumed within the window, and the cancel signal is checked each poll slice.
+An interactive Windows console instead uses the key-by-key console reader.
+`timeout_s=None` falls back to the approver's configured
+`TerminalApprover.DEFAULT_TIMEOUT_S`, currently 30 s, rather than waiting
+forever; `timeout_s=0` is a valid **non-blocking poll** (a single bounded
+probe that honours an already-buffered reply and otherwise rejects);
 negative or non-finite values are rejected with `ValueError` at the call site.
 The deadline and cancellation behaviour stay fail-safe: a late reply never
 approves a timed-out proposal, and a set cancel signal (e.g. the F12 emergency

@@ -581,32 +581,36 @@ uv run pytest -q
 `--basetemp` does **not** fix this — the same cleanup path runs on whatever
 basetemp you choose. It only relocates where the failure can occur.
 
-### 6.2 `select.select` raises `OSError [WinError 10038]` on pipe fds
+### 6.2 The fd read is deadline-strict and never uses `select`
 
 `test_terminal_approver_timeout_rejects` exercises the assisted-approval
-prompt, which reads one line from stdin with a timeout. On Linux/macOS that
-uses `select.select`, which works on any fd. On Windows `select` only accepts
-sockets — pipes and console fds raise `OSError [WinError 10038]`. The
-production path (an ASSISTED-mode prompt on a real Windows console) would hit
-the same error.
+prompt, which reads one line from stdin with a timeout. (Historically the fd
+path used `select.select`, which on Windows only accepts sockets — pipes and
+console fds raised `OSError [WinError 10038]`. That limitation is gone: the
+fd read no longer calls `select` at all, so it is cross-platform by
+construction.)
 
-This is fixed in **`8e7233c`** (already on `feature/phase-6`): `approver.py`
-catches the `OSError` and falls back to `_read_line_bounded`, which reads the
-fd in bounded non-blocking slices **on the main thread** — no per-prompt worker
-thread is spawned. It enforces the same fail-safe contract as the `select`
-path: a line already buffered and completed within the deadline is honoured; a
-reply that arrives only after the deadline is a timeout rejection; and a stream
-of partial-line bytes cannot pin the main thread — once the deadline is reached
-mid-line, post-deadline draining is bounded (a small budget) before the request
-rejects. (This is the file-descriptor fallback; an interactive Windows console
-instead uses the key-by-key console reader.) If you see this failure, your
-clone is behind — pull the branch and re-run:
+The fd path now routes through `_read_line_fd`, a **deadline-strict
+non-blocking read**: the fd is driven non-blocking and read byte-by-byte with
+`os.read` (never `readline`, so a lone byte cannot hang; no worker threads
+are spawned). A reply is honoured **only** if its terminating newline is
+consumed within the allowed window — a line that completes after the deadline
+is a timeout rejection (fail-safe: a late `y` cannot bypass the deadline). A
+cancel signal (the F12 emergency stop) is checked before every ~10 ms poll
+slice and again at the acceptance boundary, so it stays responsive on this
+path. (An interactive Windows console still uses the key-by-key console
+reader instead, because a line-buffered read cannot be deadline-bounded
+there.)
 
-```powershell
-git pull --ff-only origin feature/phase-6
-uv run pytest tests/test_assisted_approval.py -v -k "timeout or select_rejects"
-```
+The regression guards are:
 
-The regression guard is `test_terminal_approver_timeout_when_select_rejects_fd`,
-which pins the Windows behaviour from the Linux CI host by making
-`select.select` raise the same `OSError`.
+* `test_fd_straddling_newline_after_deadline_is_timeout` — a reply whose
+  first byte arrives early but whose newline lands after the deadline is a
+  **timeout**, not an approval (pins the deadline-strict rule).
+* `test_fd_lone_byte_without_newline_does_not_hang` — a lone `y` with no
+  newline and an open writer must return a timeout promptly and must never
+  call `readline` (pins the no-hang, no-`readline` contract).
+* `test_terminal_approver_timeout_when_select_rejects_fd` — kept from the
+  `select` era; it now passes trivially because the fd path never calls
+  `select`, and it still pins that a `select`-rejecting fd times out rather
+  than crashes.

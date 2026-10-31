@@ -27,15 +27,15 @@ Two implementations ship:
 
 Design notes:
 
-* **Dependency-free.** Only stdlib (``typing``, ``time``, ``sys``,
-  ``dataclasses``; ``msvcrt`` imported lazily, only on Windows consoles).
-  Importing this module in a bare venv is always safe, matching the rest
-  of the ``actions`` package.
+* **Dependency-free.** Only stdlib (``os``, ``sys``, ``typing``, ``time``,
+  ``dataclasses``, ``threading``, ``math``; ``msvcrt`` imported lazily, only
+  on Windows consoles). Importing this module in a bare venv is always
+  safe, matching the rest of the ``actions`` package.
 * **Console-aware.** On a Windows console (``CONIN$``) the reply is read
-  key-by-key through :class:`ConsoleInputReader` (``kbhit``/``getwch``)
-  under the same deadline/cancel slices as the fd paths, because
-  ``select`` rejects non-socket fds and a line-buffered ``os.read``
-  cannot be deadline-bounded there.
+  key-by-key through :class:`ConsoleInputReader` (``kbhit``/``getwch``),
+  because a line-buffered read cannot be deadline-bounded there; the fd
+  paths use a deadline-strict non-blocking read (``select`` is not used
+  at all, so the WinError 10038 socket-only limitation never applies).
 * **Fail-safe.** Every path that cannot obtain an affirmative answer
   (EOF on stdin, ``KeyboardInterrupt``, timeout, unparsable reply) returns
   ``Rejected``. The only way an action executes is an explicit
@@ -379,21 +379,20 @@ class TerminalApprover:
         ``KeyboardInterrupt`` is swallowed here so the caller can classify
         it as a rejection (the agent must not crash).
 
-        A ``timeout`` of ``0`` is a non-blocking poll (one ``select`` probe),
-        never an unbounded read. A cancellable ``cancel_event`` routes the
-        wait through :meth:`_read_line_cancellable`. An interactive console
-        (Windows ``CONIN$``) routes through :meth:`_read_line_console`,
-        whose key-polling loop enforces the deadline and checks the cancel
-        signal itself.
+        A ``timeout`` of ``0`` is a single bounded non-blocking poll (a
+        fully buffered reply is still honoured), never an unbounded read.
+        The fd path routes through :meth:`_read_line_fd`, a deadline-strict
+        non-blocking read that never calls ``readline`` and never spawns a
+        worker thread. An interactive console (Windows ``CONIN$``) routes
+        through :meth:`_read_line_console`, whose key-polling loop enforces
+        the deadline and checks the cancel signal itself.
         """
         reader = self._console_reader()
         if reader is not None:
-            # Console input is line-buffered and blocking: neither select
-            # (WinError 10038) nor a non-blocking os.read can enforce a
-            # deadline on it, so the reader's kbhit loop owns the wait.
+            # Console input is line-buffered and blocking: a raw read cannot
+            # be deadline-bounded there, so the reader's kbhit loop owns
+            # the wait.
             return self._read_line_console(timeout, reader)
-        if self._cancel_event is not None:
-            return self._read_line_cancellable(timeout)
         fd = None
         try:
             fd = sys.stdin.fileno()
@@ -403,6 +402,8 @@ class TerminalApprover:
         if fd is None:
             # Not a real file descriptor (e.g. a StringIO in tests): read
             # directly, no timeout (tests either pre-buffer or EOF).
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                return (None, True)
             try:
                 line = sys.stdin.readline()
             except (EOFError, KeyboardInterrupt, AttributeError):
@@ -410,33 +411,7 @@ class TerminalApprover:
                 # session) — a fail-safe rejection, never an approval.
                 return (None, False)
             return (line.rstrip("\n") if line else None, False)
-
-        try:
-            import select  # Unix: works on any fd; Windows: sockets only.
-        except ImportError:  # pragma: no cover
-            select = None
-
-        if select is not None:
-            # ``select.select(fd, timeout=0)`` is a non-blocking poll: a
-            # buffered reply is honoured, an empty pipe returns immediately.
-            # (The old ``timeout > 0`` guard turned ``timeout=0`` into an
-            # unbounded ``readline`` — a hang on a live terminal.)
-            try:
-                ready, _, _ = select.select([fd], [], [], timeout)
-            except OSError:
-                # Windows: ``select`` only accepts sockets and raises for
-                # pipes / console fds (WinError 10038). Fall back to a
-                # bounded fd poll — the fail-safe still applies.
-                return self._read_line_bounded(timeout, fd)
-            if not ready:
-                return (None, True)
-        try:
-            line = sys.stdin.readline()
-        except (EOFError, KeyboardInterrupt, AttributeError):
-            # AttributeError: stdin is None / has no readline — a fail-safe
-            # rejection, never an approval.
-            return (None, False)
-        return (line.rstrip("\n") if line else None, False)
+        return self._read_line_fd(timeout, fd)
 
     def _console_reader(self) -> ConsoleInputReader | None:
         """Resolve the console reader for the current ``sys.stdin``.
@@ -469,7 +444,7 @@ class TerminalApprover:
         """Read one reply from an interactive console, key by key.
 
         Polls the reader's pending-key probe in the same deadline slices as
-        :meth:`_read_line_bounded`: a reply that *completes* (Enter
+        :meth:`_read_line_fd`: a reply that *completes* (Enter
         pressed) before the deadline is honoured; a reply that does not is
         a **timeout** rejection (fail-safe — a half-typed line is never an
         approval, and a late ``y`` after the deadline cannot bypass it); a
@@ -510,149 +485,129 @@ class TerminalApprover:
             return (None, False)
         return (buf.rstrip("\r\n"), False)
 
-    def _read_line_cancellable(
-        self, timeout: float
+    def _read_line_fd(
+        self, timeout: float, fd: int
     ) -> tuple[str | None, bool]:
-        """Read one line with a cancellable deadline.
+        """Read one reply from a real fd; deadline-strict and cancel-responsive.
 
-        Polls ``select`` in 50 ms slices, checking ``self._cancel_event``
-        before every slice, so an emergency stop (F12) unblocks the wait
-        within one slice instead of waiting for the full timeout. A
-        ``timeout`` of ``0`` performs a single non-blocking poll (a
-        buffered reply is still honoured). ``select``-unavailable platforms
-        fall back to :meth:`_read_line_bounded` (bounded, but not
-        cancellation-responsive — the fail-safe still applies).
-        """
-        fd = None
-        try:
-            fd = sys.stdin.fileno()
-        except (AttributeError, ValueError, OSError):
-            fd = None
+        The fd is driven non-blocking and read byte-by-byte with ``os.read``
+        (never ``readline``, so a lone byte cannot hang; no worker threads).
+        The partial line is carried across poll slices, so a reply whose
+        bytes arrive in more than one slice is still reassembled.
+        A reply is honoured **only** if its terminating newline is consumed
+        within the allowed window — a line that completes after the deadline
+        is a timeout rejection (fail-safe: a late ``y`` cannot bypass the
+        deadline).
 
-        if fd is None:
-            # No real fd (e.g. StringIO in tests): read directly.
-            if self._cancel_event.is_set():
-                return (None, True)
-            try:
-                line = sys.stdin.readline()
-            except (EOFError, KeyboardInterrupt, AttributeError):
-                return (None, False)
-            return (line.rstrip("\n") if line else None, False)
+        * ``timeout <= 0``: a single bounded non-blocking poll — a line
+          already fully buffered (through its newline) is honoured; an
+          incomplete line, an EAGAIN read, or EOF is a timeout / no-channel
+          rejection. Never blocks and never spins.
+        * ``timeout > 0``: re-polls in ~10 ms slices until the deadline, and
+          a set ``cancel_event`` unblocks the wait on the next slice (and at
+          the acceptance boundary) — classified by the caller as
+          ``"interrupted"``.
+        * EOF (the writer closed the stream) returns promptly as a
+          no-channel rejection: no more data can ever arrive, so waiting
+          out the deadline is pointless.
 
-        try:
-            import select
-        except ImportError:  # pragma: no cover - Windows
-            select = None
-        if select is None:
-            return self._read_line_bounded(timeout, fd)
-
-        deadline = self._now() + timeout
-        POLL_S = 0.05
-        while True:
-            if self._cancel_event.is_set():
-                return (None, True)
-            poll = POLL_S if timeout > 0 else 0.0
-            try:
-                ready, _, _ = select.select([fd], [], [], poll)
-            except OSError:
-                # Windows: ``select`` rejects non-socket fds (WinError
-                # 10038). Bounded fallback — the fail-safe still applies.
-                return self._read_line_bounded(timeout, fd)
-            if ready:
-                break
-            if self._now() >= deadline:
-                return (None, True)
-
-        try:
-            line = sys.stdin.readline()
-        except (EOFError, KeyboardInterrupt, AttributeError):
-            return (None, False)
-        return (line.rstrip("\n") if line else None, False)
-
-    def _read_line_bounded(self, timeout: float, fd: int) -> tuple[str | None, bool]:
-        """Bounded read for platforms where ``select`` cannot be used.
-
-        Windows ``select`` rejects non-socket fds (pipes / console) with
-        ``OSError`` (WinError 10038), so the prompt path must not crash
-        there. The read polls the fd in non-blocking slices **on the main
-        thread** up to the deadline: a buffered reply is honoured, a reply
-        that only arrives *after* the deadline is a **timeout** rejection
-        (fail-safe — matches the ``select`` path). If the deadline is
-        reached mid-line, the bytes already buffered are drained (reads
-        end once the buffer is empty or a small budget is exceeded): a
-        complete buffered line is still honoured, but an ongoing stream
-        of partial-line bytes cannot extend the wait. Nothing is left
-        behind: the main thread is always released by the deadline and no
-        blocked per-prompt worker accumulates (bounded durations, safety
-        contract). A set ``cancel_event`` unblocks the poll on the next
-        slice, so the emergency stop stays responsive on this path too.
-
-        A ``timeout`` of ``0`` is a single non-blocking probe. If the fd
-        cannot be made non-blocking (and ``select`` cannot watch it
-        either), the read degrades to an immediate ``"timeout"``
-        rejection — the fail-safe still holds (never approve, never
-        hang, never spawn a worker); only a late reply is not honoured.
+        Reads are non-blocking, so an "empty" read on a live pipe means
+        "not yet" and is re-polled; the deadline bounds the wait. The fd's
+        blocking mode is captured and restored; a restore failure is
+        swallowed (fail-closed) so it can never mask the result.
         """
         import os
 
+        def _blocking_mode(fd: int) -> bool | None:
+            try:
+                return os.get_blocking(fd)
+            except (OSError, ValueError, AttributeError, NotImplementedError):
+                return None
+
+        prev = _blocking_mode(fd)
+        if prev is None:
+            # The fd cannot even be probed: no usable channel — the caller
+            # classifies this as a rejection (fail-safe).
+            return (None, False)
         try:
             os.set_blocking(fd, False)
         except (OSError, ValueError, AttributeError, NotImplementedError):
-            # The fd cannot be polled non-blocking and ``select`` cannot
-            # watch it: the fail-safe is an immediate timeout rejection
-            # (never approve, never hang, never spawn a worker).
-            return (None, True)
+            return (None, False)
 
         cancel = self._cancel_event
-        buf = b""
-        deadline = self._now() + timeout
-        draining = False  # deadline passed: bounded drain, then reject
-        drain_budget = 65536  # a human's buffered line is far shorter
-        try:
+        now = self._now
+
+        def _cancelled() -> bool:
+            return cancel is not None and cancel.is_set()
+
+        def _read_until_newline(
+            partial: bytearray,
+        ) -> tuple[bytes | None, str]:
+            """Consume available bytes into ``partial`` until a newline.
+
+            Returns ``(line, "line")`` once a full line (through its
+            ``\\n``) is assembled — ``line`` holds the bytes and
+            ``partial`` is reset; ``(None, "eof")`` when the writer closed
+            the stream before a newline; ``(None, "incomplete")`` when no
+            more data is available yet (EAGAIN, or an empty read on a live
+            pipe) — ``partial`` keeps the bytes consumed so far and is
+            carried into the next slice; ``(None, "error")`` on a hard fd
+            error.
+            """
             while True:
-                if cancel is not None and cancel.is_set():
-                    return (None, True)
                 try:
-                    c = os.read(fd, 1)
+                    b = os.read(fd, 1)
                 except BlockingIOError:
-                    c = b""  # no data (EAGAIN)
+                    return None, "incomplete"
                 except (OSError, ValueError):
-                    # fd broken / closed under us — a fail-safe rejection.
-                    return (None, False)
-                if c:
-                    buf += c
-                    if c == b"\n":
-                        break
-                    if draining:
-                        # Bounded drain: a live feeder keeps the pipe
-                        # buffer full, so EAGAIN alone would never end
-                        # it — cap the post-deadline reads as well.
-                        drain_budget -= 1
-                        if drain_budget <= 0:
-                            return (None, True)
-                    elif self._now() >= deadline:
-                        # Deadline reached mid-line: keep reading only
-                        # while bytes are already buffered (non-blocking
-                        # reads end once the buffer is empty), so a
-                        # complete buffered line is still honoured; a
-                        # stream of partial bytes cannot pin the main
-                        # thread (fail-safe contract).
-                        draining = True
-                    continue
-                # ``c == b""`` on a non-blocking pipe means "no data now"
-                # (or EOF with the writer closed).
-                if draining or self._now() >= deadline:
+                    return None, "error"
+                if not b:
+                    return None, "eof"
+                partial.extend(b)
+                if b == b"\n":
+                    line = bytes(partial)
+                    del partial[:]
+                    return line, "line"
+
+        def _done(line: bytes) -> tuple[str | None, bool]:
+            return (line.decode("utf-8", "replace").rstrip("\n"), False)
+
+        try:
+            partial = bytearray()
+            if timeout <= 0:
+                line, status = _read_until_newline(partial)
+                if status == "line" and line is not None:
+                    return _done(line)
+                if status == "eof":
+                    return (None, False)  # dead channel, not a timeout
+                return (None, True)  # incomplete -> timeout (single poll)
+
+            deadline = now() + timeout
+            while True:
+                if _cancelled():
                     return (None, True)
-                time.sleep(min(0.01, deadline - self._now()))
+                line, status = _read_until_newline(partial)
+                if status == "error":
+                    return (None, False)
+                if status == "eof":
+                    # Stream exhausted: no more data can arrive, so fail fast
+                    # with a no-channel rejection (the caller classifies it
+                    # as ``"no-input-channel"``) instead of waiting out the
+                    # deadline on a dead pipe.
+                    return (None, False)
+                if line is not None:
+                    # Acceptance boundary: a line that completed at or past
+                    # the deadline, or after a cancel, is a timeout — never
+                    # an approval (fail-safe; the cancel event wins).
+                    if now() < deadline and not _cancelled():
+                        return _done(line)
+                    return (None, True)
+                remaining = deadline - now()
+                if remaining <= 0:
+                    return (None, True)
+                time.sleep(min(0.01, remaining))
         finally:
             try:
-                os.set_blocking(fd, True)
+                os.set_blocking(fd, prev)
             except (OSError, ValueError, AttributeError, NotImplementedError):
-                pass
-        line = buf.decode("utf-8", "replace")
-        return (line.rstrip("\n"), False)
-
-
-
-def _io_error_stub() -> type:  # pragma: no cover - defensive import shim
-    return IOError
+                pass  # fail-closed: a restore failure must not mask the result
