@@ -36,6 +36,7 @@ contract rather than a planned one.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import io
 import threading
@@ -1393,18 +1394,24 @@ def test_fd_continuous_stream_timeout_positive_is_bounded(quiet_stdout, monkeypa
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
 def _buffered_reply_fd(reply: bytes = b"y\n"):
-    """A real-fd stdin pipe whose reply is *already* fully buffered.
+    """Context manager yielding a real-fd stdin pipe whose reply is *already*
+    fully buffered.
 
-    The writer emits the complete line (through its ``\\n``) and closes the
-    write end *before* the approver polls, so a ``timeout=0`` single poll or
-    a ``timeout>0`` acceptance boundary both find the reply present. This is
-    exactly the Finding 3 scenario: the decision to approve or interrupt is
+    The writer emits the complete line (through its ``\\n``) and the write
+    end is closed *before* the approver polls, so a ``timeout=0`` single poll
+    or a ``timeout>0`` acceptance boundary both find the reply present. This
+    is exactly the Finding 3 scenario: the decision to approve or interrupt is
     made purely on the cancel signal, with no timing dependency (no late
     ``y`` races, no ``time.sleep``).
 
     The reader must use the raw fd (``readline`` is guarded to fail loudly
     if the fd path regresses back onto the line-buffered read).
+
+    Ownership is unambiguous: the write end is closed at setup (the reply is
+    already buffered on the read end), and both ends are guaranteed closed on
+    every exit path — success or exception — by the ``finally`` below.
     """
     import os
 
@@ -1419,7 +1426,10 @@ def _buffered_reply_fd(reply: bytes = b"y\n"):
         def readline(self):  # pragma: no cover - the fd path reads the raw fd
             raise AssertionError("readline() must not be used on the fd path")
 
-    return _FdStdin()
+    try:
+        yield _FdStdin()
+    finally:
+        os.close(r)  # the read end must not leak until process exit
 
 
 def test_fd_timeout_zero_buffered_y_with_cancel_set_is_interrupted(
@@ -1437,14 +1447,15 @@ def test_fd_timeout_zero_buffered_y_with_cancel_set_is_interrupted(
     Deterministic: the reply is pre-buffered on a real pipe and the cancel
     signal is set *before* the commit — no timing involved.
     """
-    monkeypatch.setattr("sys.stdin", _buffered_reply_fd(b"y\n"))
-    cancel = threading.Event()
-    cancel.set()  # emergency stop already requested before the decision commit
-    decision = TerminalApprover(timeout_s=0, cancel_event=cancel).request_approval(
-        _action(), reasoning="r", confidence=0.5
-    )
-    assert not decision.is_approved
-    assert decision.reason == "interrupted", f"got {decision.reason!r}"
+    with _buffered_reply_fd(b"y\n") as fake_stdin:
+        monkeypatch.setattr("sys.stdin", fake_stdin)
+        cancel = threading.Event()
+        cancel.set()  # emergency stop already requested before the decision commit
+        decision = TerminalApprover(
+            timeout_s=0, cancel_event=cancel
+        ).request_approval(_action(), reasoning="r", confidence=0.5)
+        assert not decision.is_approved
+        assert decision.reason == "interrupted", f"got {decision.reason!r}"
 
 
 def test_fd_timeout_zero_buffered_y_without_cancel_is_approved(
@@ -1453,12 +1464,13 @@ def test_fd_timeout_zero_buffered_y_without_cancel_is_approved(
     """Finding 3 companion: with cancellation *clear*, a buffered ``y`` under
     ``timeout=0`` is still honoured (the cancel check must not swallow a
     legitimate fast reply). Pins the legitimate path the fix must not break."""
-    monkeypatch.setattr("sys.stdin", _buffered_reply_fd(b"y\n"))
-    decision = TerminalApprover(
-        timeout_s=0, cancel_event=threading.Event()  # clear, not set
-    ).request_approval(_action(), reasoning="r", confidence=0.5)
-    assert decision.is_approved, f"buffered reply ignored: {decision!r}"
-    assert decision.reason == "user-approved"
+    with _buffered_reply_fd(b"y\n") as fake_stdin:
+        monkeypatch.setattr("sys.stdin", fake_stdin)
+        decision = TerminalApprover(
+            timeout_s=0, cancel_event=threading.Event()  # clear, not set
+        ).request_approval(_action(), reasoning="r", confidence=0.5)
+        assert decision.is_approved, f"buffered reply ignored: {decision!r}"
+        assert decision.reason == "user-approved"
 
 
 def test_fd_timeout_positive_buffered_y_with_cancel_set_is_interrupted(
@@ -1472,14 +1484,15 @@ def test_fd_timeout_positive_buffered_y_with_cancel_set_is_interrupted(
     Deterministic: the buffered reply is present from t=0, and the cancel
     signal is checked before any read, so no scheduling margin is needed.
     """
-    monkeypatch.setattr("sys.stdin", _buffered_reply_fd(b"y\n"))
-    cancel = threading.Event()
-    cancel.set()
-    decision = TerminalApprover(timeout_s=1.0, cancel_event=cancel).request_approval(
-        _action(), reasoning="r", confidence=0.5
-    )
-    assert not decision.is_approved
-    assert decision.reason == "interrupted", f"got {decision.reason!r}"
+    with _buffered_reply_fd(b"y\n") as fake_stdin:
+        monkeypatch.setattr("sys.stdin", fake_stdin)
+        cancel = threading.Event()
+        cancel.set()
+        decision = TerminalApprover(
+            timeout_s=1.0, cancel_event=cancel
+        ).request_approval(_action(), reasoning="r", confidence=0.5)
+        assert not decision.is_approved
+        assert decision.reason == "interrupted", f"got {decision.reason!r}"
 
 
 def test_console_timeout_zero_buffered_y_with_cancel_set_is_interrupted(

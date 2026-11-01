@@ -234,26 +234,21 @@ distinct from the "Finding 3" used in the `1bbbb76` commit message for the
 timeout=0 cancel-commit fix.)
 
 - **Console `timeout=0` does not probe as documented** (Low — a real doc/impl
-  discrepancy, not merely weak tests).
-  `TerminalApprover._read_line_console` sets `deadline = now() + timeout` and,
-  with `timeout=0`, hits `if self._now() >= deadline: return (None, True)` on
-  the *first* slice — **before** `reader.kbhit()` runs. So a pending key is
-  never probed and a `timeout=0` console poll always rejects as `timeout`,
-  contradicting the docstring's "`timeout=0` is a single non-blocking probe"
-  and diverging from the fd path (which honours a fully-buffered reply on the
-  `timeout=0` poll). The two new console `timeout=0` cancel tests also
-  short-circuit at the *initial* cancellation check (line ~461), so they pin
-  "cancel wins" but do not exercise the buffered-reply acceptance boundary.
-  Fix = either honour a pending key on the `timeout=0` slice (match the fd
-  path) **or** correct the docstring; add a test that drives a pending `kbhit()`
-  reply at `timeout=0`. Do in a separate commit; do not mix into the accepted
-  fix.
+  discrepancy). **RESOLVED.** The console reader now honours a reply already
+  pending at the `timeout=0` slice, matching the fd path's single
+  non-blocking probe; a pending `kbhit()` reply approves when cancellation is
+  clear and rejects as `"interrupted"` when a stop is set. Regression-pinned by
+  `test_console_timeout_zero_pending_reply_without_cancel_is_approved` (the
+  companion `test_fd_timeout_zero_buffered_y_without_cancel_is_approved` covers
+  the fd seam). No code change needed here to mark this — the implementation
+  and the test are already in the tree.
 - **`_buffered_reply_fd` test helper leaks the read fd** (Low — test hygiene).
-  `tests/test_assisted_approval.py::_buffered_reply_fd` closes the write end
-  but never the read end, so the three fd regression tests that use it leave
-  the read descriptor open until process exit. Harmless for the current suite;
-  fix with a `try/finally` or fixture teardown when next touching that test.
-  Optional.
+  **RESOLVED.** `tests/test_assisted_approval.py::_buffered_reply_fd` is now a
+  `contextlib.contextmanager`: the write end is closed at setup and the read
+  end is closed in a `finally`, so both descriptors are released on every exit
+  path (success or exception). The three fd regression tests adopt the
+  `with _buffered_reply_fd(...) as fake_stdin:` form; the helper's API and the
+  tests' assertions are unchanged.
 - **TOCTOU at the acceptance boundary** (Informational — not a regression).
   Both fd acceptance paths check cancellation and then return the line; a stop
   could in theory land in between. Same as the pre-existing `timeout>0` path.
