@@ -114,6 +114,7 @@ RejectionReason = Literal[
     "timeout",
     "interrupted",
     "unparsable-reply",
+    "duplicate-request-id",
 ]
 
 
@@ -839,7 +840,10 @@ class QueueApprover:
         Settlement precedence is cancel → deadline → response (see the class
         docstring), so the returned decision is always the one that won the
         settle race. The method never raises for a "no"; it only raises
-        ``ValueError`` on a misconfigured ``timeout_s``.
+        ``ValueError`` on a misconfigured ``timeout_s``. A failure of the
+        injected clock (``now_fn``) *after* registration propagates, but the
+        request's slot is always removed first, so it cannot linger in
+        :meth:`pending` or be resolved by a later :meth:`respond`.
         """
         timeout = self._default_timeout if timeout_s is None else float(timeout_s)
         if not math.isfinite(timeout) or timeout < 0:
@@ -857,34 +861,43 @@ class QueueApprover:
             # defensive refusal of a misconfigured request, and a refusal is
             # the only safe outcome (never an approval, never an overwrite).
             if request_id in self._slots:
-                return ApprovalDecision.rejected("no-input-channel")
+                return ApprovalDecision.rejected("duplicate-request-id")
             self._slots[request_id] = slot
-            while not slot.settled:
-                # Precedence re-checked each slice so the first of {cancel,
-                # deadline} to become true settles the slot; a valid response
-                # settles from the other thread via respond().
-                if self._cancel_event is not None and self._cancel_event.is_set():
-                    self._settle(slot, ApprovalDecision.rejected("interrupted"))
-                    break
-                if self._now() >= slot.deadline:
-                    self._settle(slot, ApprovalDecision.rejected("timeout"))
-                    break
-                remaining = slot.deadline - self._now()
-                self._cv.wait(timeout=max(0.0, min(self._SLICE_S, remaining)))
-            # Single-use cleanup: the slot is now settled and the waiter is
-            # the only thread that ever removes it (``respond()`` never does),
-            # so this runs exactly once. The ``is slot`` guard is defensive
-            # against a same-id collision, which the check above now refuses,
-            # so we never delete another request's slot. Dropping the entry
-            # keeps the store bounded and makes a replayed id an unresolvable
-            # no-op (the fail-safe direction).
-            if self._slots.get(request_id) is slot:
-                del self._slots[request_id]
-            return (
-                slot.decision
-                if slot.decision is not None
-                else ApprovalDecision.rejected("timeout")
-            )
+            try:
+                while not slot.settled:
+                    # Precedence re-checked each slice so the first of {cancel,
+                    # deadline} to become true settles the slot; a valid response
+                    # settles from the other thread via respond().
+                    if self._cancel_event is not None and self._cancel_event.is_set():
+                        self._settle(slot, ApprovalDecision.rejected("interrupted"))
+                        break
+                    if self._now() >= slot.deadline:
+                        self._settle(slot, ApprovalDecision.rejected("timeout"))
+                        break
+                    remaining = slot.deadline - self._now()
+                    self._cv.wait(timeout=max(0.0, min(self._SLICE_S, remaining)))
+                # Single-use cleanup: the slot is now settled and the waiter is
+                # the only thread that ever removes it (``respond()`` never does),
+                # so this runs exactly once. The ``is slot`` guard is defensive
+                # against a same-id collision, which the check above now refuses,
+                # so we never delete another request's slot. Dropping the entry
+                # keeps the store bounded and makes a replayed id an unresolvable
+                # no-op (the fail-safe direction).
+                if self._slots.get(request_id) is slot:
+                    del self._slots[request_id]
+                return (
+                    slot.decision
+                    if slot.decision is not None
+                    else ApprovalDecision.rejected("timeout")
+                )
+            except Exception:
+                # The injected clock (or a settle step) raised *after* the slot
+                # was registered. Remove *this* slot — and only this one (the
+                # ``is slot`` guard) — so it cannot linger in ``pending()`` or be
+                # resolved by a later ``respond()``; then propagate the failure.
+                if self._slots.get(request_id) is slot:
+                    del self._slots[request_id]
+                raise
 
     def respond(self, request_id: str, decision: ApprovalDecision) -> bool:
         """Settle a specific outstanding request from the human/remote side.

@@ -53,6 +53,7 @@ import threading
 import time
 from typing import Any
 
+import pytest
 import test_assisted_approval as tai  # self-contained fakes + loop factory
 
 from ai_game_agent.actions import (
@@ -564,6 +565,13 @@ def test_duplicate_injected_id_cannot_overwrite_an_outstanding_request():
         assert box2.get("d") is not None and not box2["d"].is_approved, (
             "second request must be a fail-safe rejection, not an approval"
         )
+        # The rejection reason must describe the *actual* failure — a duplicate
+        # correlation id — and must not be mislabeled as a missing input
+        # channel. (Finding #1: the audit trail must be able to tell a
+        # misconfigured/malicious id factory apart from "no stdin".)
+        assert box2["d"].reason == "duplicate-request-id", (
+            f"duplicate id was rejected with the wrong reason: {box2['d'].reason!r}"
+        )
         # Approve the *first*; the second must not be approved by it.
         assert approver.respond("same-id", ApprovalDecision.approved("ok")) is True
     finally:
@@ -580,6 +588,73 @@ def test_valid_uuid_ids_never_collide():
     approver = QueueApprover(timeout_s=30.0)
     ids = {str(approver._id_factory()) for _ in range(200)}
     assert len(ids) == 200, "uuid4 factory must yield unique ids"
+
+
+def test_assisted_queue_duplicate_id_records_correct_audit_reason():
+    """When the injected ``id_factory`` yields an id that is already
+    outstanding, the ASSISTED gate must (a) force a safe halt, dispatch
+    nothing, and (b) record the *semantically correct* rejection reason in
+    the ``APPROVAL`` audit event — not ``no-input-channel``.
+
+    This is the audit-level half of Finding #1: the loop records the
+    approver's ``reason`` verbatim into the event detail, so if the approver
+    mislabels the failure the audit trail is wrong too.
+    """
+
+    def factory() -> str:
+        return "dup-id"
+
+    backend = MockBackend()
+    ai = tai._FakeAI(decision=_ai_decision())
+    approver = QueueApprover(timeout_s=10.0, id_factory=factory)
+    events: list[object] = []
+    loop = tai._loop(
+        mode=OperationMode.ASSISTED,
+        approver=approver,
+        backend=backend,
+        ai=ai,
+        max_ticks=3,
+        on_event=events.append,
+    )
+
+    # Pre-register an outstanding request under "dup-id" so the gate's own
+    # ``request_approval`` (which reuses the same fixed factory) hits the
+    # collision guard. Deterministic: we wait for the first to be outstanding
+    # before running the loop, so the gate always sees a duplicate.
+    holder: dict[str, Any] = {}
+    t = threading.Thread(
+        target=lambda: holder.update(
+            d=approver.request_approval(
+                _action(), reasoning="first", timeout_s=10.0
+            )
+        ),
+        daemon=True,
+    )
+    t.start()
+    try:
+        p = _wait_pending(approver, want_id="dup-id", timeout=5.0)
+        assert p is not None, "pre-registered request did not become outstanding"
+        report = loop.run()
+    finally:
+        # Settle the pre-registered request so its worker exits cleanly, then
+        # join (no leaked thread, no lingering outstanding slot).
+        approver.respond("dup-id", ApprovalDecision.approved("ok"))
+        t.join(timeout=3.0)
+
+    assert report.actions_ok == 0, "a duplicate-id request must not dispatch"
+    assert report.actions_attempted == 0, "a duplicate-id request was dispatched"
+    assert loop._machine.state is AgentState.PAUSED, "duplicate id must force a safe halt"
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert approvals, "expected an APPROVAL audit event on the duplicate rejection"
+    ev = approvals[0]
+    assert ev.detail["approved"] is False
+    assert ev.detail["channel"] == "queue"
+    # The reason the loop recorded must be the accurate one, not no-input-channel.
+    assert ev.detail["reason"] == "duplicate-request-id", (
+        f"audit recorded wrong rejection reason: {ev.detail['reason']!r}"
+    )
+    assert "no-input-channel" not in ev.detail["reason"]
+    assert approver.pending() == ()
 
 
 # ---------------------------------------------------------------------------
@@ -937,3 +1012,49 @@ def test_settled_slots_are_removed_no_unbounded_growth():
     assert len(approver._slots) == 0, (
         f"settled slots not removed (unbounded growth): {len(approver._slots)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 11) Exception safety: an injected clock that raises after registration must
+#     not leak the slot into pending() (audit Finding #2)
+# ---------------------------------------------------------------------------
+
+
+def test_clock_raising_after_registration_does_not_leak_slot():
+    """Finding #2: if the injected ``now_fn`` raises *after* the request has
+    been registered in ``_slots`` (but before the request is settled),
+    ``request_approval`` must not exit with the slot still outstanding.
+
+    The clock is allowed to fail on the *first* call (the deadline computation,
+    which happens before registration) — that is a pre-registration failure with
+    nothing to clean up. The contract under test is the post-registration path:
+    the slot is registered, a later clock call inside the wait loop raises, and
+    the exception propagates. On that path the slot must be removed from the
+    store so it is neither visible via ``pending()`` nor resolvable via a
+    later ``respond()`` — otherwise it lingers outstanding indefinitely.
+    """
+    calls = {"n": 0}
+
+    def raising_now() -> float:
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            # First call (deadline, pre-registration) succeeded; every call
+            # from inside the wait loop raises — the post-registration path.
+            raise RuntimeError("injected clock failed")
+        return 0.0
+
+    approver = QueueApprover(timeout_s=30.0, now_fn=raising_now)
+    with pytest.raises(RuntimeError, match="injected clock failed"):
+        approver.request_approval(_action(), timeout_s=30.0)
+
+    # The post-registration cleanup must have run: the slot is gone, so the
+    # request is neither outstanding nor resolvable.
+    assert approver.pending() == (), (
+        f"slot leaked into pending() after the clock raised: "
+        f"{[p.request_id for p in approver.pending()]!r}"
+    )
+    assert len(approver._slots) == 0, (
+        f"slot leaked into the internal store: {list(approver._slots)!r}"
+    )
+    # And a late response for the leaked id is a no-op (nothing to settle).
+    assert approver.respond("any-id", ApprovalDecision.approved("ok")) is False
