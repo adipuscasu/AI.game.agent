@@ -222,3 +222,42 @@ The approver is built **only** when `mode is ASSISTED`; `--approve-all` and
 - Multi-action batches in one AI decision: the current gate approves or
   rejects the whole AI action batch as one decision (one prompt); per-action
   approval is a possible refinement.
+
+## 8. Follow-ups from the `1bbbb76` final review (deferred, non-blocking)
+
+The Phase 6 approval-input fix (`1bbbb76`) passed final review (**PASS WITH
+CAVEATS**; CI green: 777 passed / 2 skipped). Two low findings were
+*deliberately not* folded into that commit — they are pre-existing / orthogonal,
+and the reviewer's call was to keep the liveness + cancellation fix clean. They
+are recorded here so they are not lost. (These are the *final-review* findings;
+distinct from the "Finding 3" used in the `1bbbb76` commit message for the
+timeout=0 cancel-commit fix.)
+
+- **Console `timeout=0` does not probe as documented** (Low — a real doc/impl
+  discrepancy, not merely weak tests).
+  `TerminalApprover._read_line_console` sets `deadline = now() + timeout` and,
+  with `timeout=0`, hits `if self._now() >= deadline: return (None, True)` on
+  the *first* slice — **before** `reader.kbhit()` runs. So a pending key is
+  never probed and a `timeout=0` console poll always rejects as `timeout`,
+  contradicting the docstring's "`timeout=0` is a single non-blocking probe"
+  and diverging from the fd path (which honours a fully-buffered reply on the
+  `timeout=0` poll). The two new console `timeout=0` cancel tests also
+  short-circuit at the *initial* cancellation check (line ~461), so they pin
+  "cancel wins" but do not exercise the buffered-reply acceptance boundary.
+  Fix = either honour a pending key on the `timeout=0` slice (match the fd
+  path) **or** correct the docstring; add a test that drives a pending `kbhit()`
+  reply at `timeout=0`. Do in a separate commit; do not mix into the accepted
+  fix.
+- **`_buffered_reply_fd` test helper leaks the read fd** (Low — test hygiene).
+  `tests/test_assisted_approval.py::_buffered_reply_fd` closes the write end
+  but never the read end, so the three fd regression tests that use it leave
+  the read descriptor open until process exit. Harmless for the current suite;
+  fix with a `try/finally` or fixture teardown when next touching that test.
+  Optional.
+- **TOCTOU at the acceptance boundary** (Informational — not a regression).
+  Both fd acceptance paths check cancellation and then return the line; a stop
+  could in theory land in between. Same as the pre-existing `timeout>0` path.
+  The independent F12 executor emergency-stop is the operational safeguard. Do
+  **not** expand the commit to add locking / a new synchronization protocol;
+  design it separately only if an absolute "cancellation always wins" guarantee
+  is ever required.

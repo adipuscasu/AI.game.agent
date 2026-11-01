@@ -454,6 +454,46 @@ class TerminalApprover:
         durations, safety contract).
         """
         cancel = self._cancel_event
+
+        if timeout <= 0:
+            # A genuine non-blocking probe — the documented contract, and the
+            # behaviour the fd path already honours on its ``timeout<=0``
+            # poll (see :meth:`_read_line_fd`). It never blocks or sleeps, so
+            # ``timeout=0`` stays a single-shot probe: a reply already
+            # available is consumed and honoured; a pending key that is not
+            # yet available is a single non-blocking timeout. Cancellation
+            # already signalled wins (the acceptance boundary), so a pending
+            # stop classifies as ``"interrupted"`` rather than a timeout.
+            if cancel is not None and cancel.is_set():
+                return (None, True)
+            try:
+                buf = ""
+                while True:
+                    if cancel is not None and cancel.is_set():
+                        return (None, True)
+                    if not reader.kbhit():
+                        # A key (or the terminating Enter) is not yet
+                        # buffered. A non-blocking probe must never block on
+                        # ``getwch()`` waiting for it, and a half-typed line is
+                        # never an approval — so this is a single-shot timeout,
+                        # not a wait.
+                        return (None, True)
+                    ch = reader.getwch()
+                    buf += ch
+                    if ch in "\r\n":
+                        break
+            except (EOFError, KeyboardInterrupt, OSError, ValueError):
+                # Ctrl-Z / Ctrl-C / a broken console handle: a fail-safe
+                # rejection — never an approval, never a crash.
+                return (None, False)
+            # Acceptance boundary: a cancel that landed while the reply was
+            # being consumed wins (fail-safe; never commit a buffered approval
+            # after a stop). Mirrors the fd ``timeout<=0`` boundary.
+            if cancel is not None and cancel.is_set():
+                return (None, True)
+            return (buf.rstrip("\r\n"), False)
+
+        # timeout > 0: bounded wait, re-polling in ~10 ms slices.
         buf = ""
         deadline = self._now() + timeout
         try:

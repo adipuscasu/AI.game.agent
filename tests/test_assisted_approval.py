@@ -1520,6 +1520,30 @@ def test_console_timeout_positive_buffered_y_with_cancel_set_is_interrupted(
     assert decision.reason == "interrupted", f"got {decision.reason!r}"
 
 
+def test_console_timeout_zero_pending_reply_without_cancel_is_approved(
+    quiet_stdout
+):
+    """Console ``timeout=0`` must be a genuine non-blocking probe.
+
+    Regression: the console reader polled the deadline *before* ``kbhit()``,
+    so with ``timeout=0`` it returned ``timeout`` on the first slice without
+    ever probing a pending key — contradicting the documented "single
+    non-blocking probe" contract and diverging from the fd path, which honours
+    an already-buffered reply on the ``timeout=0`` poll. A reply already
+    available from t=0 must therefore approve when cancellation is clear.
+    """
+    reader = _FakeConsoleReader(("y", "\r"))
+    decision = TerminalApprover(
+        timeout_s=0,
+        cancel_event=threading.Event(),  # clear, not set
+        reader=reader,
+    ).request_approval(_action(), reasoning="r", confidence=0.5)
+    assert decision.is_approved, (
+        f"console timeout=0 ignored an available reply: {decision!r}"
+    )
+    assert decision.reason == "user-approved", f"got {decision.reason!r}"
+
+
 def test_approval_prompt_shows_modifiers(quiet_stdout, monkeypatch):
     """The prompt must surface modifiers: ``ctrl+shift+a`` is a different
     action from bare ``a``, and the approver must see the difference.
@@ -1765,46 +1789,6 @@ def test_console_reader_late_reply_after_deadline_is_timeout(quiet_stdout):
     approver = TerminalApprover(
         timeout_s=0.2, reader=_FakeConsoleReader(("y", "\r"), available_after=0.5)
     )
-    decision = approver.request_approval(_action())
-    assert not decision.is_approved
-    assert decision.reason == "timeout"
-
-
-def test_console_reader_deadline_checked_before_any_key_consumption(quiet_stdout):
-    """F1 (P1): the deadline must be evaluated **before** a pending key is
-    consumed. Regression guard for the ordering bug where ``kbhit()``/``getwch()``
-    ran before the deadline check — a ``y`` that is pending at (or past) the
-    deadline would be honoured, turning a timed-out prompt into an approval.
-
-    Deterministic: ``timeout_s=0`` makes the deadline equal to the clock at
-    the first probe, and a fixed ``now_fn`` means the clock never advances
-    (no ``time.sleep`` flakiness). The reader reports ``y`` as pending from
-    t=0 (worst case for the P1 bug). Pre-fix, ``kbhit()``/``getwch()`` run
-    before the deadline check, so the pending ``y`` is consumed and the
-    request **approves**. Post-fix, the deadline is evaluated first on the
-    very first probe (``now >= deadline``) and the request rejects with
-    ``"timeout"`` without touching the key.
-    """
-
-    class _ClockReader:
-        """Reports a pending key from t=0 — the worst case for the P1 bug."""
-
-        def __init__(self) -> None:
-            self._keys = ["y", "\r"]
-
-        def kbhit(self) -> bool:
-            return bool(self._keys)
-
-        def getwch(self) -> str:
-            return self._keys.pop(0)
-
-    reader = _ClockReader()
-    # ``timeout_s=0`` → deadline equals the (fixed) clock at the first probe,
-    # so the deadline check fires immediately. A fixed ``now_fn`` keeps the
-    # clock from ever advancing, which is what makes the pre-fix vs post-fix
-    # ordering observable (a moving clock + ``timeout>0`` would let the
-    # post-fix loop sleep instead of deciding).
-    approver = TerminalApprover(timeout_s=0, reader=reader, now_fn=lambda: 0.0)
     decision = approver.request_approval(_action())
     assert not decision.is_approved
     assert decision.reason == "timeout"
