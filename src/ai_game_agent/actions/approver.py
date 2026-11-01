@@ -24,6 +24,13 @@ Two implementations ship:
   unblocks it immediately and is classified as an ``"interrupted"`` rejection.
 * :class:`AutoApprover` — a non-blocking policy stub for tests, CI, and
   "trust the AI" runs; always approves.
+* :class:`QueueApprover` — a transport-agnostic channel for remote/web
+  approval (Phase 6). ``request_approval`` blocks until the request is
+  settled; the human/remote side settles it from another thread via
+  :meth:`QueueApprover.respond`, and may poll outstanding requests with
+  :meth:`QueueApprover.pending`. The loop still programs against the
+  :class:`Approver` protocol only, so a future web handler is a thin adapter
+  over ``pending()`` / ``respond()``.
 
 Design notes:
 
@@ -51,6 +58,7 @@ import math
 import sys
 import threading
 import time
+import uuid
 from typing import Literal, Protocol, runtime_checkable
 
 __all__ = [
@@ -60,6 +68,8 @@ __all__ = [
     "ConsoleInputReader",
     "DecisionOutcome",
     "MsvcrtConsoleReader",
+    "PendingRequest",
+    "QueueApprover",
     "RejectionReason",
     "TerminalApprover",
 ]
@@ -678,3 +688,277 @@ class TerminalApprover:
                 os.set_blocking(fd, prev)
             except (OSError, ValueError, AttributeError, NotImplementedError):
                 pass  # fail-closed: a restore failure must not mask the result
+
+
+class _Slot:
+    """Internal mutable state for one approval request (not part of the API).
+
+    Lives in :attr:`QueueApprover._slots` keyed by request id; the public
+    read-only projection of an unsettled slot is a :class:`PendingRequest`.
+    """
+
+    __slots__ = (
+        "request_id",
+        "action",
+        "reasoning",
+        "confidence",
+        "deadline",
+        "decision",
+        "settled",
+    )
+
+    def __init__(
+        self,
+        request_id: str,
+        action: object,
+        reasoning: str,
+        confidence: float | None,
+        deadline: float,
+    ) -> None:
+        self.request_id = request_id
+        self.action = action
+        self.reasoning = reasoning
+        self.confidence = confidence
+        self.deadline = deadline
+        self.decision: ApprovalDecision | None = None
+        self.settled = False
+
+
+@dataclasses.dataclass(frozen=True)
+class PendingRequest:
+    """Immutable snapshot of one *outstanding* approval request.
+
+    Carries the *request* data (the proposed action plus the model's
+    reasoning and confidence) — deliberately separate from the eventual
+    decision, which is produced only once the human settles the request via
+    :meth:`QueueApprover.respond`. Because it is a frozen dataclass, a remote
+    client may hand the snapshot to its own machinery without the approver
+    being able to mutate it behind the client's back; and because
+    :class:`~ai_game_agent.actions.action.Action` itself is frozen, holding
+    it directly is safe.
+    """
+
+    request_id: str
+    action: object
+    reasoning: str
+    confidence: float | None
+
+
+class QueueApprover:
+    """Transport-agnostic :class:`Approver` for remote/web approval (Phase 6).
+
+    Contract (matching the :class:`Approver` protocol the loop programs
+    against):
+
+    * :meth:`request_approval` **blocks** until the request is settled and
+      returns an :class:`ApprovalDecision`. It never raises for a "no".
+    * :meth:`respond` — the human/remote side submits an outcome for a
+      specific request from another thread. A valid decision settles the
+      request; an unknown / replayed / malformed decision — or one that loses
+      the settle race to a cancel or a deadline — is a **no-op** that returns
+      ``False`` (it never produces a decision and never approves).
+    * :meth:`pending` — an immutable :class:`tuple` of
+      :class:`PendingRequest` snapshots of the *outstanding* (unsettled)
+      requests, for a client to display and poll. Reading it never settles
+      anything.
+
+    Settlement precedence (checked in this order, under the lock, on both the
+    waiting and responding sides — first-settle-wins, then immutable):
+
+    1. A set ``cancel_event`` (the F12 emergency stop) → ``"interrupted"``.
+       It is authoritative: it wins even over a valid approved response, so a
+       responder cannot bypass an emergency stop via a scheduling race.
+    2. Deadline expiry → ``"timeout"``. A late response cannot approve a
+       timed-out request.
+    3. A valid affirmative/negative ``ApprovalDecision`` → settles as that
+       decision; the waiter is woken immediately via the condition variable.
+
+    Fail-safe rule (the repo invariant, shared by every approver): a valid,
+    explicitly affirmative decision is the **only** path to execution.
+
+    Request-ID / replay trade-off: ids are per-approver and opaque
+    (``uuid4`` by default). A settled slot is removed from the pending set
+    and is no longer resolvable, so a replayed or forged id is a no-op — it
+    cannot re-approve, override, or resolve *another* request. The trade-off
+    is that there is no server-side session/lease state: the id alone is the
+    whole credential, which is exactly why ids are unguessable and single
+    use. A concrete web client (out of scope) would additionally carry auth.
+
+    The :class:`Approver` protocol does not define ``respond()`` /
+    ``pending()``; they are extensions on this concrete class for the
+    human/remote side. The loop never calls them — it only ever calls
+    ``request_approval``.
+    """
+
+    name: str = "queue"
+
+    #: Default per-call timeout, mirroring :class:`TerminalApprover`.
+    DEFAULT_TIMEOUT_S: float = 30.0
+
+    #: Wait-slice duration. Small enough to keep a set ``cancel_event``
+    #: responsive; large enough to avoid busy-spinning. The condition
+    #: variable wakes the waiter immediately on a response, so this slice is
+    #: only the cadence for the cancel / deadline re-check.
+    _SLICE_S: float = 0.05
+
+    def __init__(
+        self,
+        *,
+        timeout_s: float | None = None,
+        cancel_event: threading.Event | None = None,
+        id_factory: object | None = None,
+        now_fn: object | None = None,
+    ) -> None:
+        self._default_timeout = (
+            self.DEFAULT_TIMEOUT_S if timeout_s is None else float(timeout_s)
+        )
+        if not math.isfinite(self._default_timeout) or self._default_timeout < 0:
+            raise ValueError(
+                f"timeout_s must be a finite value >= 0, got {timeout_s!r}"
+            )
+        self._cancel_event = cancel_event
+        self._id_factory = (
+            id_factory if id_factory is not None else (lambda: uuid.uuid4().hex)
+        )
+        self._now = now_fn if now_fn is not None else time.monotonic
+        self._cv = threading.Condition(threading.Lock())
+        self._slots: dict[str, _Slot] = {}
+
+    def request_approval(
+        self,
+        action: object,
+        *,
+        reasoning: str = "",
+        confidence: float | None = None,
+        timeout_s: float | None = None,
+    ) -> ApprovalDecision:
+        """Register an approval request and block until it is settled.
+
+        Settling happens by one of: a valid :meth:`respond` (response), a set
+        ``cancel_event`` (``"interrupted"``), or the deadline (``"timeout"``).
+        Settlement precedence is cancel → deadline → response (see the class
+        docstring), so the returned decision is always the one that won the
+        settle race. The method never raises for a "no"; it only raises
+        ``ValueError`` on a misconfigured ``timeout_s``.
+        """
+        timeout = self._default_timeout if timeout_s is None else float(timeout_s)
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError(
+                f"timeout_s must be a finite value >= 0, got {timeout_s!r}"
+            )
+        request_id = str(self._id_factory())
+        deadline = self._now() + timeout
+        slot = _Slot(request_id, action, reasoning, confidence, deadline)
+        with self._cv:
+            # Fail-safe: a duplicate id from the injected factory cannot
+            # overwrite an outstanding request — it would let a later
+            # ``respond()`` settle the *wrong* slot and corrupt it. A
+            # well-behaved factory (``uuid4``) never collides, so this is a
+            # defensive refusal of a misconfigured request, and a refusal is
+            # the only safe outcome (never an approval, never an overwrite).
+            if request_id in self._slots:
+                return ApprovalDecision.rejected("no-input-channel")
+            self._slots[request_id] = slot
+            while not slot.settled:
+                # Precedence re-checked each slice so the first of {cancel,
+                # deadline} to become true settles the slot; a valid response
+                # settles from the other thread via respond().
+                if self._cancel_event is not None and self._cancel_event.is_set():
+                    self._settle(slot, ApprovalDecision.rejected("interrupted"))
+                    break
+                if self._now() >= slot.deadline:
+                    self._settle(slot, ApprovalDecision.rejected("timeout"))
+                    break
+                remaining = slot.deadline - self._now()
+                self._cv.wait(timeout=max(0.0, min(self._SLICE_S, remaining)))
+            # Single-use cleanup: the slot is now settled and the waiter is
+            # the only thread that ever removes it (``respond()`` never does),
+            # so this runs exactly once. The ``is slot`` guard is defensive
+            # against a same-id collision, which the check above now refuses,
+            # so we never delete another request's slot. Dropping the entry
+            # keeps the store bounded and makes a replayed id an unresolvable
+            # no-op (the fail-safe direction).
+            if self._slots.get(request_id) is slot:
+                del self._slots[request_id]
+            return (
+                slot.decision
+                if slot.decision is not None
+                else ApprovalDecision.rejected("timeout")
+            )
+
+    def respond(self, request_id: str, decision: ApprovalDecision) -> bool:
+        """Settle a specific outstanding request from the human/remote side.
+
+        Returns ``True`` only when *this* call settled the request with the
+        given decision. Returns ``False`` (a no-op, never an approval) when:
+
+        * the id is unknown, already settled (replay), or was not issued;
+        * the decision is malformed (not an ``ApprovalDecision`` with a
+          closed-vocabulary outcome and a string reason);
+        * the settle race was lost to a set ``cancel_event`` (which settles
+          the slot as ``"interrupted"``) or to an expired deadline (which
+          settles it as ``"timeout"``).
+
+        A late response can never approve: the deadline is validated under the
+        same lock that settles, so even a response arriving after the deadline
+        — while the waiter has not yet woken — settles as ``"timeout"``.
+        """
+        with self._cv:
+            slot = self._slots.get(request_id)
+            if slot is None or slot.settled:
+                return False
+            if not self._valid_decision(decision):
+                return False
+            # Precedence (identical to the waiter's): cancel, then deadline,
+            # then accept. A set cancel is authoritative over a valid response.
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                self._settle(slot, ApprovalDecision.rejected("interrupted"))
+                self._cv.notify()
+                return False
+            if self._now() >= slot.deadline:
+                self._settle(slot, ApprovalDecision.rejected("timeout"))
+                return False
+            self._settle(slot, decision)
+            self._cv.notify()
+            return True
+
+    def pending(self) -> tuple[PendingRequest, ...]:
+        """Return an immutable snapshot of the outstanding (unsettled) requests.
+
+        A read-only projection for a client to display/poll; it never settles
+        or removes anything. Settled requests are excluded, so the snapshot
+        shrinks as requests are answered. Each element is a frozen
+        :class:`PendingRequest` carrying the request data (action, reasoning,
+        confidence) — separate from the eventual decision.
+        """
+        with self._cv:
+            return tuple(
+                PendingRequest(
+                    request_id=s.request_id,
+                    action=s.action,
+                    reasoning=s.reasoning,
+                    confidence=s.confidence,
+                )
+                for s in self._slots.values()
+                if not s.settled
+            )
+
+    # ---- internals ---------------------------------------------------------
+
+    def _settle(self, slot: _Slot, decision: ApprovalDecision) -> None:
+        """Record a slot's final decision and mark it settled (caller holds the lock)."""
+        slot.decision = decision
+        slot.settled = True
+
+    @staticmethod
+    def _valid_decision(decision: object) -> bool:
+        """A decision is usable only if it is a well-formed ``ApprovalDecision``.
+
+        Closed-vocabulary outcome plus a string reason; anything else is a
+        malformed payload that must not settle (and must not approve).
+        """
+        if not isinstance(decision, ApprovalDecision):
+            return False
+        if decision.outcome not in ("approved", "rejected"):
+            return False
+        return isinstance(decision.reason, str)

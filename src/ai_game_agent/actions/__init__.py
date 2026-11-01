@@ -23,6 +23,8 @@ from ai_game_agent.actions.approver import (
     ApprovalDecision,
     Approver,
     AutoApprover,
+    PendingRequest,
+    QueueApprover,
     TerminalApprover,
 )
 from ai_game_agent.actions.base import (
@@ -66,6 +68,8 @@ __all__ = [
     "Approver",
     "ApprovalDecision",
     "AutoApprover",
+    "PendingRequest",
+    "QueueApprover",
     "TerminalApprover",
     "create_backend",
     "validate_action",
