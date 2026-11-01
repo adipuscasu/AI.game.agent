@@ -1274,6 +1274,252 @@ def test_fd_eof_is_no_input_channel(quiet_stdout, monkeypatch):
     os.close(r)
 
 
+def test_fd_continuous_stream_timeout_zero_is_bounded(quiet_stdout, monkeypatch):
+    """timeout=0 on a *continuously* readable stream must stay bounded.
+
+    Regression guard for the ``_read_until_newline`` liveness defect:
+    the helper's ``while True`` loop read one byte at a time with no
+    deadline or byte budget, so a producer that keeps supplying bytes
+    without a newline could monopolize the reader, bypass the
+    ``timeout=0`` "single poll" contract, and grow the partial buffer
+    without bound.  With a bounded budget the poll must return promptly
+    as a timeout rejection (no approval — no newline was seen) and the
+    reader must be released.
+    """
+    import os
+    import time
+
+    r, w = os.pipe()
+
+    def _pump() -> None:
+        # Keep the pipe buffer full of newline-free bytes so every
+        # os.read succeeds and an unbounded loop would never return.
+        chunk = b"x" * 65536
+        try:
+            while True:
+                try:
+                    os.write(w, chunk)
+                except OSError:
+                    break
+        finally:
+            os.close(w)
+
+    t = threading.Thread(target=_pump, daemon=True)
+    t.start()
+
+    class _StreamStdin:
+        def fileno(self):
+            return r
+
+        def readline(self):  # pragma: no cover - fd path must be taken
+            raise AssertionError("fd path must handle the continuous stream")
+
+    monkeypatch.setattr("sys.stdin", _StreamStdin())
+
+    started = time.monotonic()
+    decision = TerminalApprover(timeout_s=0).request_approval(
+        _action(), reasoning="r", confidence=0.5
+    )
+    elapsed = time.monotonic() - started
+    os.close(r)
+    assert not decision.is_approved
+    assert decision.reason == "timeout", f"got {decision.reason!r}"
+    assert elapsed < 1.0, f"timeout=0 poll was not bounded: {elapsed:.2f}s"
+
+
+def test_fd_continuous_stream_timeout_positive_is_bounded(quiet_stdout, monkeypatch):
+    """timeout>0 on a *continuously* readable stream must respect the deadline.
+
+    Regression guard: the same unbounded helper also defeated the
+    ``timeout > 0`` path, because the caller only checked the deadline
+    *after* the helper returned — and a continuous stream made the
+    helper never return.  The deadline must therefore be enforced
+    inside the read loop as well, so the wait ends within the deadline
+    (plus a small scheduling margin) with a timeout rejection.
+    """
+    import os
+    import time
+
+    r, w = os.pipe()
+
+    def _pump() -> None:
+        chunk = b"x" * 65536
+        try:
+            while True:
+                try:
+                    os.write(w, chunk)
+                except OSError:
+                    break
+        finally:
+            os.close(w)
+
+    t = threading.Thread(target=_pump, daemon=True)
+    t.start()
+
+    class _StreamStdin:
+        def fileno(self):
+            return r
+
+        def readline(self):  # pragma: no cover - fd path must be taken
+            raise AssertionError("fd path must handle the continuous stream")
+
+    monkeypatch.setattr("sys.stdin", _StreamStdin())
+
+    started = time.monotonic()
+    decision = TerminalApprover(timeout_s=0.1).request_approval(
+        _action(), reasoning="r", confidence=0.5
+    )
+    elapsed = time.monotonic() - started
+    os.close(r)
+    assert not decision.is_approved
+    assert decision.reason == "timeout", f"got {decision.reason!r}"
+    # Deadline 0.1 s; allow generous scheduling/pipe-buffer margin but
+    # not the unbounded spin the defect allowed.
+    assert elapsed < 1.5, f"continuous stream defeated the deadline: {elapsed:.2f}s"
+
+
+# ---------------------------------------------------------------------------
+# 7b) Finding 3 — TerminalApprover cancellation consistency at the
+#     approval-acceptance boundary.
+#
+# The contract: a cancellation already signalled (F12 ``cancel_event`` set)
+# must result in an ``"interrupted"`` rejection, *never* an approval — on
+# both the ``timeout=0`` single poll and the ``timeout>0`` wait, and on
+# both the fd and the console reader. The ``timeout>0`` and console paths
+# already check the cancel signal at their acceptance boundary; Finding 3 is
+# that the ``timeout=0`` poll used to commit a buffered reply without the
+# check, so a stop that fired before the commit could be overridden by a
+# ``y`` already sitting in the pipe.
+# ---------------------------------------------------------------------------
+
+
+def _buffered_reply_fd(reply: bytes = b"y\n"):
+    """A real-fd stdin pipe whose reply is *already* fully buffered.
+
+    The writer emits the complete line (through its ``\\n``) and closes the
+    write end *before* the approver polls, so a ``timeout=0`` single poll or
+    a ``timeout>0`` acceptance boundary both find the reply present. This is
+    exactly the Finding 3 scenario: the decision to approve or interrupt is
+    made purely on the cancel signal, with no timing dependency (no late
+    ``y`` races, no ``time.sleep``).
+
+    The reader must use the raw fd (``readline`` is guarded to fail loudly
+    if the fd path regresses back onto the line-buffered read).
+    """
+    import os
+
+    r, w = os.pipe()
+    os.write(w, reply)  # fully buffered on the read end
+    os.close(w)  # writer done; buffered bytes remain readable on r
+
+    class _FdStdin:
+        def fileno(self):
+            return r
+
+        def readline(self):  # pragma: no cover - the fd path reads the raw fd
+            raise AssertionError("readline() must not be used on the fd path")
+
+    return _FdStdin()
+
+
+def test_fd_timeout_zero_buffered_y_with_cancel_set_is_interrupted(
+    quiet_stdout, monkeypatch
+):
+    """Finding 3 (core): ``timeout=0`` must not commit a buffered approval
+    once cancellation has already been requested.
+
+    Regression guard: the ``timeout=0`` single poll used to hand a fully
+    buffered ``y`` straight to the decision without checking ``cancel_event``,
+    so a proposal could be *approved* even though the F12 stop had already
+    fired. The poll's acceptance boundary must check the cancel signal first
+    and return an ``"interrupted"`` rejection (never an approval).
+
+    Deterministic: the reply is pre-buffered on a real pipe and the cancel
+    signal is set *before* the commit — no timing involved.
+    """
+    monkeypatch.setattr("sys.stdin", _buffered_reply_fd(b"y\n"))
+    cancel = threading.Event()
+    cancel.set()  # emergency stop already requested before the decision commit
+    decision = TerminalApprover(timeout_s=0, cancel_event=cancel).request_approval(
+        _action(), reasoning="r", confidence=0.5
+    )
+    assert not decision.is_approved
+    assert decision.reason == "interrupted", f"got {decision.reason!r}"
+
+
+def test_fd_timeout_zero_buffered_y_without_cancel_is_approved(
+    quiet_stdout, monkeypatch
+):
+    """Finding 3 companion: with cancellation *clear*, a buffered ``y`` under
+    ``timeout=0`` is still honoured (the cancel check must not swallow a
+    legitimate fast reply). Pins the legitimate path the fix must not break."""
+    monkeypatch.setattr("sys.stdin", _buffered_reply_fd(b"y\n"))
+    decision = TerminalApprover(
+        timeout_s=0, cancel_event=threading.Event()  # clear, not set
+    ).request_approval(_action(), reasoning="r", confidence=0.5)
+    assert decision.is_approved, f"buffered reply ignored: {decision!r}"
+    assert decision.reason == "user-approved"
+
+
+def test_fd_timeout_positive_buffered_y_with_cancel_set_is_interrupted(
+    quiet_stdout, monkeypatch
+):
+    """Finding 3: the ``timeout>0`` path already checks cancellation at the
+    acceptance boundary — pin that a buffered ``y`` with a *set* cancel signal
+    still rejects as ``"interrupted"`` (stop wins over approval). This is the
+    consistent contract the ``timeout=0`` fix must match, on the same fd seam.
+
+    Deterministic: the buffered reply is present from t=0, and the cancel
+    signal is checked before any read, so no scheduling margin is needed.
+    """
+    monkeypatch.setattr("sys.stdin", _buffered_reply_fd(b"y\n"))
+    cancel = threading.Event()
+    cancel.set()
+    decision = TerminalApprover(timeout_s=1.0, cancel_event=cancel).request_approval(
+        _action(), reasoning="r", confidence=0.5
+    )
+    assert not decision.is_approved
+    assert decision.reason == "interrupted", f"got {decision.reason!r}"
+
+
+def test_console_timeout_zero_buffered_y_with_cancel_set_is_interrupted(
+    quiet_stdout
+):
+    """Finding 3 (console path): a ``timeout=0`` poll that finds a fully
+    buffered ``y`` must still lose when cancellation is already set — the
+    console path checks ``cancel_event`` before returning a completed line.
+
+    Deterministic: a scripted reader reports the key as pending from t=0;
+    the cancel signal is set before the first slice, so the wait unblocks on
+    the very first probe (no ``time.sleep`` flakiness).
+    """
+    reader = _FakeConsoleReader(("y", "\r"))
+    cancel = threading.Event()
+    cancel.set()
+    decision = TerminalApprover(
+        timeout_s=0, cancel_event=cancel, reader=reader
+    ).request_approval(_action(), reasoning="r", confidence=0.5)
+    assert not decision.is_approved
+    assert decision.reason == "interrupted", f"got {decision.reason!r}"
+
+
+def test_console_timeout_positive_buffered_y_with_cancel_set_is_interrupted(
+    quiet_stdout
+):
+    """Finding 3 (console path): the ``timeout>0`` loop already checks
+    ``cancel_event`` each slice — pin that a pending ``y`` with cancellation
+    set still rejects as ``"interrupted"`` (stop wins over approval), keeping
+    the two timeout branches and both reader seams consistent."""
+    reader = _FakeConsoleReader(("y", "\r"))
+    cancel = threading.Event()
+    cancel.set()
+    decision = TerminalApprover(
+        timeout_s=1.0, cancel_event=cancel, reader=reader
+    ).request_approval(_action(), reasoning="r", confidence=0.5)
+    assert not decision.is_approved
+    assert decision.reason == "interrupted", f"got {decision.reason!r}"
+
+
 def test_approval_prompt_shows_modifiers(quiet_stdout, monkeypatch):
     """The prompt must surface modifiers: ``ctrl+shift+a`` is a different
     action from bare ``a``, and the approver must see the difference.

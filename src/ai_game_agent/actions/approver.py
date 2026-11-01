@@ -537,24 +537,43 @@ class TerminalApprover:
         cancel = self._cancel_event
         now = self._now
 
+        # Hard cap on how much of a not-yet-complete line we are willing to
+        # buffer. A real approval reply is tiny; this bounds the partial
+        # buffer's memory growth so a continuous, newline-free stream cannot
+        # balloon it (and cannot spin the reader past the deadline).
+        max_partial = 64 * 1024
+
         def _cancelled() -> bool:
             return cancel is not None and cancel.is_set()
 
         def _read_until_newline(
             partial: bytearray,
+            deadline: float | None = None,
         ) -> tuple[bytes | None, str]:
             """Consume available bytes into ``partial`` until a newline.
+
+            Bounded two ways: ``deadline`` (when given) stops the loop once
+            the approval deadline is reached, and ``max_partial`` caps the
+            bytes buffered, so a continuously-readable stream can neither
+            monopolize the reader nor grow the buffer without bound. With
+            neither bound active (``deadline`` is ``None``) the loop is
+            still bounded by the byte cap plus ``BlockingIOError``/EOF on an
+            idle pipe.
 
             Returns ``(line, "line")`` once a full line (through its
             ``\\n``) is assembled — ``line`` holds the bytes and
             ``partial`` is reset; ``(None, "eof")`` when the writer closed
             the stream before a newline; ``(None, "incomplete")`` when no
-            more data is available yet (EAGAIN, or an empty read on a live
-            pipe) — ``partial`` keeps the bytes consumed so far and is
-            carried into the next slice; ``(None, "error")`` on a hard fd
-            error.
+            more data is available yet (EAGAIN), the deadline was reached,
+            or the byte cap was hit — ``partial`` keeps the bytes consumed
+            so far and is carried into the next slice; ``(None, "error")``
+            on a hard fd error.
             """
             while True:
+                if deadline is not None and now() >= deadline:
+                    return None, "incomplete"
+                if len(partial) >= max_partial:
+                    return None, "incomplete"
                 try:
                     b = os.read(fd, 1)
                 except BlockingIOError:
@@ -577,7 +596,15 @@ class TerminalApprover:
             if timeout <= 0:
                 line, status = _read_until_newline(partial)
                 if status == "line" and line is not None:
-                    return _done(line)
+                    # Acceptance boundary (Finding 3): a cancel already
+                    # signalled wins — never commit a buffered approval after
+                    # a stop. Mirrors the ``timeout > 0`` boundary above, so
+                    # both branches classify the same way: return ``(None, True)``
+                    # and let the caller classify a set ``cancel_event`` as an
+                    # ``"interrupted"`` rejection (the fail-safe direction).
+                    if not _cancelled():
+                        return _done(line)
+                    return (None, True)
                 if status == "eof":
                     return (None, False)  # dead channel, not a timeout
                 return (None, True)  # incomplete -> timeout (single poll)
@@ -586,7 +613,7 @@ class TerminalApprover:
             while True:
                 if _cancelled():
                     return (None, True)
-                line, status = _read_until_newline(partial)
+                line, status = _read_until_newline(partial, deadline)
                 if status == "error":
                     return (None, False)
                 if status == "eof":
