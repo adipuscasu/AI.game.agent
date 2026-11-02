@@ -1482,15 +1482,31 @@ def _buffered_reply_fd(reply: bytes = b"y\n"):
     The reader must use the raw fd (``readline`` is guarded to fail loudly
     if the fd path regresses back onto the line-buffered read).
 
-    Ownership is unambiguous: the write end is closed at setup (the reply is
-    already buffered on the read end), and both ends are guaranteed closed on
-    every exit path — success or exception — by the ``finally`` below.
+    Ownership is unambiguous: both ends are guaranteed closed on every exit
+    path — success or exception — as soon as ``os.pipe()`` succeeds, including
+    a failure of ``os.write`` in setup (see the regression test below). The
+    original setup exception is re-raised unmasked: close errors during
+    cleanup cannot replace it.
     """
     import os
 
     r, w = os.pipe()
-    os.write(w, reply)  # fully buffered on the read end
-    os.close(w)  # writer done; buffered bytes remain readable on r
+    try:
+        os.write(w, reply)  # fully buffered on the read end
+    except BaseException:
+        # A setup failure must not leak either descriptor; re-raise the
+        # original exception (close errors below must not mask it).
+        with contextlib.suppress(OSError):
+            os.close(r)
+        with contextlib.suppress(OSError):
+            os.close(w)
+        raise
+    try:
+        os.close(w)  # writer done; buffered bytes remain readable on r
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(r)
+        raise
 
     class _FdStdin:
         def fileno(self):
@@ -1503,6 +1519,58 @@ def _buffered_reply_fd(reply: bytes = b"y\n"):
         yield _FdStdin()
     finally:
         os.close(r)  # the read end must not leak until process exit
+
+
+def test_buffered_reply_fd_closes_descriptors_on_setup_failure(
+    monkeypatch,
+):
+    """Regression: if ``os.write`` raises *after* ``os.pipe()`` succeeded
+    (a setup failure), the helper must close **both** descriptors and let the
+    original setup exception propagate unmasked.
+
+    Before the fix, ``_buffered_reply_fd`` ran ``os.write(w, reply)`` and
+    ``os.close(w)`` *before* entering its ``try/finally``. A write failure
+    therefore skipped the ``finally`` entirely and leaked both ``r`` and ``w``
+    (and the happy-path close of ``w`` was also the only thing releasing the
+    write end, so it leaked too). This test injects a write failure and pins:
+
+    * both descriptors are closed (``os.fstat`` -> ``EBADF`` on a leaked fd
+      would succeed instead), and
+    * the *original* setup exception survives — a close error during cleanup
+      must not replace it.
+    """
+    import errno
+    import os
+
+    seen_fds: list[int] = []
+
+    real_pipe = os.pipe
+
+    def tracking_pipe():
+        r, w = real_pipe()
+        seen_fds.extend((r, w))
+        return r, w
+
+    def failing_write(fd: int, data: bytes) -> int:  # noqa: ARG001
+        raise OSError(errno.EBADF, "injected setup failure")
+
+    monkeypatch.setattr(os, "pipe", tracking_pipe)
+    monkeypatch.setattr(os, "write", failing_write)
+
+    with pytest.raises(OSError, match="injected setup failure") as excinfo:
+        with _buffered_reply_fd(b"y\n"):
+            pass  # pragma: no cover - setup raised, body never entered
+
+    assert isinstance(excinfo.value, OSError)
+    assert "injected setup failure" in str(excinfo.value)
+    assert excinfo.value.errno == errno.EBADF
+
+    # Both descriptors must be closed: a still-open (leaked) fd would be
+    # stat-able, a closed one raises EBADF.
+    for fd in seen_fds:
+        with pytest.raises(OSError) as err:
+            os.fstat(fd)
+        assert err.value.errno == errno.EBADF, f"fd {fd} leaked (not closed)"
 
 
 def test_fd_timeout_zero_buffered_y_with_cancel_set_is_interrupted(
