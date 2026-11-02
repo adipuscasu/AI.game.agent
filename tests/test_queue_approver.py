@@ -1058,3 +1058,70 @@ def test_clock_raising_after_registration_does_not_leak_slot():
     )
     # And a late response for the leaked id is a no-op (nothing to settle).
     assert approver.respond("any-id", ApprovalDecision.approved("ok")) is False
+
+def test_concurrent_notify_all_wakes_correct_waiter():
+    """P2 (review #3): with two concurrent ``request_approval`` waiters
+    outstanding, ``respond()`` must wake the *correct* waiter (the one whose
+    request was just settled) — not an arbitrary one. With ``notify`` (not
+    ``notify_all``) the wrong waiter could be woken first, re-check, find its
+    slot unsettled, and go back to sleep, while the just-settled waiter is
+    still sleeping (delayed by one full slice). ``notify_all`` wakes every
+    waiter so the settled one returns immediately.
+
+    This test settles the *second* request (started last) while the first is
+    still waiting, asserts the second prompt returns promptly with the correct
+    decision, and that the first is still outstanding (not accidentally
+    settled by the wrong-wake).
+    """
+    approver = QueueApprover(timeout_s=30.0)
+    box1: dict[str, Any] = {}
+    box2: dict[str, Any] = {}
+    t1 = threading.Thread(
+        target=lambda: box1.update(
+            d=approver.request_approval(_action(), reasoning="first", timeout_s=30.0)
+        ),
+        daemon=True,
+    )
+    t2 = threading.Thread(
+        target=lambda: box2.update(
+            d=approver.request_approval(_action(), reasoning="second", timeout_s=30.0)
+        ),
+        daemon=True,
+    )
+    t1.start()
+    t2.start()
+    try:
+        ids = _wait_outstanding(approver, 2)
+        assert ids is not None, "expected two outstanding requests"
+        # Identify which id belongs to the "second" request (started last).
+        p_first = next(p for p in approver.pending() if p.reasoning == "first")
+        p_second = next(p for p in approver.pending() if p.reasoning == "second")
+        # Settle the *second* (later-registered) request while the first is
+        # still waiting. With ``notify`` (bug) the wrong waiter could be woken
+        # and the second prompt would be delayed by one slice; with
+        # ``notify_all`` (fix) the second prompt returns immediately.
+        t0 = time.monotonic()
+        assert approver.respond(p_second.request_id, ApprovalDecision.approved("ok2")) is True
+        # Bound the wait: the correct waiter must be woken promptly (well under
+        # the 30 s timeout, and well under several slices). 5.0 s is generous
+        # enough to avoid CI flakiness while catching a real hang.
+        t2.join(timeout=5.0)
+        elapsed = time.monotonic() - t0
+        assert not t2.is_alive(), f"second prompt did not return (hung); elapsed {elapsed:.2f}s"
+        assert box2.get("d") is not None and box2["d"].is_approved, (
+            f"second decision wrong: {box2.get('d')!r}"
+        )
+        assert box2["d"].reason == "ok2"
+        # The first request must still be outstanding (not accidentally settled
+        # by waking the wrong waiter).
+        assert p_first.request_id in _outstanding_ids(approver), (
+            "first request was accidentally settled — wrong waiter was woken"
+        )
+        # Settle the first now.
+        assert approver.respond(p_first.request_id, ApprovalDecision.rejected("no1")) is True
+    finally:
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+    assert box1.get("d") is not None and not box1["d"].is_approved
+    assert box1["d"].reason == "no1"
+    assert approver.pending() == ()

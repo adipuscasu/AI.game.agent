@@ -81,11 +81,12 @@ class Approver(Protocol):
   assisted run.
 - `AutoApprover` — always approves. For CI / non-interactive runs
   (`--approve-all`).
-- (A future `QueueApprover` for remote/web approval slots in here without
-  touching the loop.)
+- `QueueApprover` — transport-agnostic queue for remote/web approval;
+  implemented and shipped. The loop is unchanged; a web client is a thin
+  adapter over :meth:`QueueApprover.pending` and :meth:`QueueApprover.respond`.
 
 The loop depends on the *protocol*, not a concrete class — so the
-interactive, automated, and (later) remote channels are all the same
+interactive, automated, and remote channels are all the same
 `approver` argument, and the loop's logic is written once.
 
 ### 3.3 Rejection is a **safe halt**, not "try again"
@@ -214,8 +215,9 @@ The approver is built **only** when `mode is ASSISTED`; `--approve-all` and
 
 ## 7. Out of scope (still to do)
 
-- A non-terminal `Approver` (remote/web approval) — the protocol is
-  ready for it; the implementation is not written.
+- The web/remote client UI for `QueueApprover` (poll `pending()`, call
+  `respond()`). The `Approver` protocol and the `QueueApprover` transport
+  are both implemented; only the client layer remains.
 - Persisting the audit `APPROVAL` events to the `--record` jsonl is already
   free (the recorder hook writes every emitted `LoopEvent`); only the
   reader side is a UX task.

@@ -417,6 +417,16 @@ class AgentLoop:
                     # the audit trail alone — not just the outcome.
                     "action": action.to_dict(),
                     "reasoning": reasoning,
+                    # P2 (review #2): record the cumulative assisted-gate
+                    # counters on each APPROVAL event, as the phase-6 plan
+                    # (docs/phase-6-implementation-plan.md §2) promises, so an
+                    # audit reader can reconstruct the running totals without
+                    # holding the loop instance. Additive keys — the existing
+                    # detail shape (kind/approved/reason/channel/...) is
+                    # unchanged for existing consumers.
+                    "approvals_requested": self._approvals_requested,
+                    "approvals_granted": self._approvals_granted,
+                    "approvals_rejected": self._approvals_rejected,
                 },
             )
         )

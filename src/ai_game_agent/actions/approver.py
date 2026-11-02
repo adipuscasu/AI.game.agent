@@ -374,11 +374,39 @@ class TerminalApprover:
                 continue
             lines.append(f"    {field}: {value}")
         if reasoning:
-            lines.append(f"    reasoning: {reasoning}")
+            lines.append(f"    reasoning: {self._sanitize_for_prompt(reasoning)}")
         if confidence is not None:
             lines.append(f"    confidence: {confidence:.2f}")
         lines.append("    approve this action? [y/N] ")
         return "\n".join(lines)
+
+    # Maximum length of the *sanitized* reasoning shown in the prompt. Bounds
+    # a model's unbounded output so it cannot flood the terminal; the raw
+    # value is untouched, only its presentation is capped.
+    _PROMPT_REASONING_MAX = 800
+
+    @classmethod
+    def _sanitize_for_prompt(cls, text: str) -> str:
+        """Neutralize untrusted text at the terminal-presentation boundary.
+
+        The model's reasoning is untrusted and would otherwise be printed
+        verbatim into the approval prompt — the human's security boundary
+        between an AI proposal and real input. A raw ESC opens any ANSI CSI /
+        OSC sequence, a CR returns the cursor to column 0 (letting following
+        text overwrite the prompt), a newline opens a fresh line, and other
+        control characters can be interpreted by the terminal. We therefore
+        replace every non-printable control character (C0 ``0x00-0x1f`` and
+        DEL ``0x7f``) with a visible ``\\xNN`` escape: the payload stays
+        visible for audit but can no longer drive the terminal. The input is
+        never mutated — only a new, safe string is returned.
+        """
+        out = [
+            ch if ch.isprintable() else f"\\x{ord(ch):02x}" for ch in text
+        ]
+        s = "".join(out)
+        if len(s) > cls._PROMPT_REASONING_MAX:
+            s = s[: cls._PROMPT_REASONING_MAX] + "…"
+        return s
 
     def _read_line(self, timeout: float) -> tuple[str | None, bool]:
         """Read one line from ``sys.stdin`` with a soft timeout.
@@ -531,7 +559,16 @@ class TerminalApprover:
                     if ch in "\r\n":
                         break
                     continue
-                time.sleep(min(0.01, deadline - self._now()))
+                # Clamp the sleep non-negative: a clock jump that lands the
+                # deadline behind ``now`` (a fast injected clock or a real
+                # scheduling hiccup between the deadline check above and this
+                # line) would otherwise make ``deadline - now`` negative and
+                # ``time.sleep`` raise ``ValueError`` — aborting the approval
+                # prompt at the security boundary instead of falling through
+                # to the next probe (where the deadline check times it out,
+                # the fail-safe). The deadline was already checked above, so
+                # a zero sleep is safe: the loop re-evaluates and exits.
+                time.sleep(min(0.01, max(0.0, deadline - self._now())))
         except KeyboardInterrupt:
             return (None, False)
         return (buf.rstrip("\r\n"), False)
@@ -810,6 +847,26 @@ class QueueApprover:
         id_factory: object | None = None,
         now_fn: object | None = None,
     ) -> None:
+        """Configure the approver.
+
+        Args:
+            timeout_s: Per-call default timeout (seconds). ``None`` uses
+                :attr:`DEFAULT_TIMEOUT_S`. Must be finite and >= 0.
+            cancel_event: A ``threading.Event`` that, when set, unblocks a
+                pending wait and settles the request as ``"interrupted"``
+                (the F12 emergency stop). ``None`` disables cancellation.
+            id_factory: A zero-argument callable returning a unique,
+                unguessable correlation id per request. The default is
+                ``uuid.uuid4().hex``. A misconfigured factory that can
+                return the *same* id twice while both requests are
+                outstanding will have the second registration refused as a
+                fail-safe rejection (``"duplicate-request-id"``) — it cannot
+                overwrite the first slot and corrupt it. The factory is
+                responsible for uniqueness; this class does not deduplicate.
+            now_fn: A zero-argument callable returning the current time in
+                seconds (a monotonic clock by default). Injectable for
+                deterministic tests.
+        """
         self._default_timeout = (
             self.DEFAULT_TIMEOUT_S if timeout_s is None else float(timeout_s)
         )
@@ -924,15 +981,27 @@ class QueueApprover:
                 return False
             # Precedence (identical to the waiter's): cancel, then deadline,
             # then accept. A set cancel is authoritative over a valid response.
+            # ``notify_all`` (not ``notify``) so the *correct* waiter is woken
+            # promptly: with multiple concurrent requests outstanding, ``notify``
+            # wakes an *arbitrary* waiter, which may be the one belonging to a
+            # different request (still pending) and so go back to sleep, leaving
+            # the just-settled request's waiter to the next poll slice. Wake
+            # every waiter; the settled one returns immediately and the others
+            # re-check and keep waiting. (Review #3.)
             if self._cancel_event is not None and self._cancel_event.is_set():
                 self._settle(slot, ApprovalDecision.rejected("interrupted"))
-                self._cv.notify()
+                self._cv.notify_all()
                 return False
             if self._now() >= slot.deadline:
+                # Deadline expiry also settles: the waiter must be woken too,
+                # otherwise it sleeps a full extra slice before noticing the
+                # settle (Review #3 — this branch previously settled without
+                # notifying at all).
                 self._settle(slot, ApprovalDecision.rejected("timeout"))
+                self._cv.notify_all()
                 return False
             self._settle(slot, decision)
-            self._cv.notify()
+            self._cv.notify_all()
             return True
 
     def pending(self) -> tuple[PendingRequest, ...]:

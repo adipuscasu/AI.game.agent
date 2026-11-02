@@ -915,6 +915,79 @@ def test_approval_event_detail_includes_action_and_reasoning():
     assert detail["action"] == action_dict
 
 
+def test_approval_event_detail_carries_audit_counters():
+    """P2 (review #2): the phase-6 plan (``docs/phase-6-implementation-plan.md``
+    §2) states the approval counters are *recorded on each APPROVAL event*.
+    The event detail must therefore carry the cumulative
+    ``approvals_requested / approvals_granted / approvals_rejected`` so the
+    audit trail reflects the running totals — not just the per-event outcome.
+    """
+    backend = MockBackend()
+
+    class _ChannelApprover:
+        name = "channel-x"
+
+        def request_approval(self, action, **kwargs):
+            return ApprovalDecision.approved("yes")
+
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[object] = []
+    loop = _loop(
+        mode=OperationMode.ASSISTED,
+        approver=_ChannelApprover(),
+        backend=backend,
+        ai=ai,
+        max_ticks=1,
+        on_event=events.append,
+    )
+    loop.run()
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert approvals
+    detail = approvals[0].detail
+    for key in ("approvals_requested", "approvals_granted", "approvals_rejected"):
+        assert key in detail, f"APPROVAL detail missing counter {key!r}: {detail}"
+    assert detail["approvals_requested"] == 1
+    assert detail["approvals_granted"] == 1
+    assert detail["approvals_rejected"] == 0
+
+
+def test_approval_counters_track_successive_decisions():
+    """P2 (review #2): approve → reject → approve must increment the counters
+    monotonically so an audit reader can reconstruct the running totals from
+    the event stream (1/1/0, 2/1/1, 3/2/1). Drives the gate directly (rather
+    than ``run()``) so the three decisions are each consulted; a real run
+    halts on the first rejection, which would prevent the third from firing.
+    """
+    approver = _ScriptedApprover(
+        (
+            ApprovalDecision.approved("ok"),
+            ApprovalDecision.rejected("nope"),
+            ApprovalDecision.approved("ok"),
+        )
+    )
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[object] = []
+    loop = _loop(
+        mode=OperationMode.ASSISTED,
+        approver=approver,
+        ai=ai,
+        on_event=events.append,
+    )
+    actions = (_action(),)
+    # Drive the gate three times: approve, reject, approve.
+    assert loop._gate_ai_actions(actions, now=0.0) is True
+    assert loop._gate_ai_actions(actions, now=0.0) is None  # rejection halts
+    assert loop._gate_ai_actions(actions, now=0.0) is True
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert len(approvals) == 3, f"expected 3 APPROVAL events, got {len(approvals)}"
+    expected = [(1, 1, 0), (2, 1, 1), (3, 2, 1)]
+    for ev, (req, granted, rejected) in zip(approvals, expected, strict=True):
+        assert (ev.detail["approvals_requested"],
+                ev.detail["approvals_granted"],
+                ev.detail["approvals_rejected"]) == (req, granted, rejected), (
+            f"counter mismatch at event {ev.seq}: {ev.detail}")
+
+
 # ---------------------------------------------------------------------------
 # 7) PR #6 review findings — timeout contract, zero-timeout poll, F12 cancel,
 #    full-action prompt
@@ -1649,6 +1722,90 @@ def test_approval_prompt_shows_duration_delay_and_scroll(quiet_stdout, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# 7b) Terminal injection hardening (Review P1, most important outstanding)
+#
+# The model's ``reasoning`` is untrusted and is printed into the approval
+# prompt — the human's security boundary between an AI proposal and actual
+# input execution. It must not be able to overwrite/obscure the prompt via
+# ANSI control sequences, carriage returns, newlines, or any other
+# non-printable control character, and it must stay bounded. The original
+# reasoning value is never mutated; only its presentation is sanitized.
+# ---------------------------------------------------------------------------
+
+
+def _rendered_prompt(monkeypatch, reasoning: str) -> str:
+    """Render one approval prompt to a captured stdout and return it."""
+    captured = io.StringIO()
+    monkeypatch.setattr("sys.stdout", captured)
+    monkeypatch.setattr("sys.stdin", io.StringIO("n\n"))
+    action = Action(kind=ActionKind.KEY_PRESS, key="a", source="ai")
+    TerminalApprover(timeout_s=0.5).request_approval(
+        action, reasoning=reasoning, confidence=0.5
+    )
+    return captured.getvalue()
+
+
+def test_prompt_escapes_ansi_escapes_in_reasoning(quiet_stdout, monkeypatch):
+    """A raw ESC (the start of any ANSI CSI/OSC sequence) must never reach the
+    terminal; it is replaced by a visible ``\\x1b`` escape. The payload text
+    stays visible (transparency) but inert."""
+    out = _rendered_prompt(
+        monkeypatch, "\x1b[2J\x1b[HFAKE APPROVE \x1b[31mnow\x1b[0m"
+    )
+    assert "\x1b" not in out, f"raw ESC reached the terminal: {out!r}"
+    assert "\\x1b" in out, f"ESC must be visibly escaped: {out!r}"
+    assert "FAKE APPROVE" in out, "payload text should stay visible, just inert"
+
+
+def test_prompt_escapes_carriage_return_in_reasoning(quiet_stdout, monkeypatch):
+    """A raw CR would move the cursor to column 0 and let following text
+    overwrite the prompt; it must be escaped, not emitted."""
+    out = _rendered_prompt(monkeypatch, "REAL\r\nOVERWRITE APPROVAL")
+    assert "\r" not in out, f"raw CR reached the terminal: {out!r}"
+    assert "\\x0d" in out, f"CR must be visibly escaped: {out!r}"
+
+
+def test_prompt_escapes_newline_in_reasoning(quiet_stdout, monkeypatch):
+    """A raw newline in the reasoning must not open a new prompt line; it is
+    escaped so the reasoning stays on a single visual line."""
+    out = _rendered_prompt(monkeypatch, "line one\nline two")
+    assert "\\x0a" in out, f"newline must be visibly escaped: {out!r}"
+    reasoning_line = [ln for ln in out.split("\n") if "reasoning:" in ln][0]
+    assert "line one" in reasoning_line and "line two" in reasoning_line, (
+        f"reasoning split across lines: {reasoning_line!r}"
+    )
+
+
+def test_prompt_truncates_overlong_reasoning(quiet_stdout, monkeypatch):
+    """An overlong reasoning is bounded so it cannot flood the terminal.
+    Truncation must not strip the escaping applied to control chars."""
+    evil = ("x\x1b") * 5000
+    out = _rendered_prompt(monkeypatch, evil)
+    reasoning_line = [ln for ln in out.split("\n") if "reasoning:" in ln][0]
+    assert len(reasoning_line) < 2000, (
+        f"reasoning not bounded: {len(reasoning_line)} chars"
+    )
+    assert "\x1b" not in out, f"raw ESC leaked past truncation: {out!r}"
+
+
+def test_prompt_sanitization_does_not_mutate_reasoning(quiet_stdout, monkeypatch):
+    """Sanitizing is presentation-only: the caller's reasoning value is
+    unchanged after the approver returns."""
+    evil = "\x1b[31m\r\nkeep"
+    captured = io.StringIO()
+    monkeypatch.setattr("sys.stdout", captured)
+    monkeypatch.setattr("sys.stdin", io.StringIO("n\n"))
+    reasoning = evil
+    decision = TerminalApprover(timeout_s=0.5).request_approval(
+        Action(kind=ActionKind.KEY_PRESS, key="a", source="ai"),
+        reasoning=reasoning,
+        confidence=0.5,
+    )
+    assert reasoning == evil, "the approver must not mutate the reasoning value"
+    assert decision.is_approved is False
+
+
+# ---------------------------------------------------------------------------
 # 8) Interactive Windows console input (msvcrt kbhit/getwch path)
 #
 # On a Windows console (CONIN$) ``select`` rejects the fd (WinError 10038)
@@ -1954,3 +2111,51 @@ def test_live_windows_console_cancel_interrupts(quiet_stdout):
     assert decision is not None
     assert not decision.is_approved
     assert decision.reason == "interrupted"
+
+def test_console_reader_survives_clock_jump_past_deadline(quiet_stdout):
+    """P2 (review #2): if the clock advances *past* the deadline between the
+    top-of-loop deadline check and the ``time.sleep`` at the bottom of the
+    same iteration, ``deadline - now`` is negative and the unclamped
+    ``time.sleep`` raises ``ValueError`` — aborting the approval prompt at
+    the security boundary instead of letting the loop continue (and
+    eventually time out, the fail-safe). The ``max(0.0, ...)`` clamp guards
+    exactly this window.
+
+    The jump happens inside ``kbhit`` (which returns False, so the loop
+    falls through to the sleep line) — the only sequence that puts the
+    clock past the deadline *after* the top-of-loop check but *before* the
+    sleep. Pre-fix the sleep raises; post-fix it clamps to zero and the
+    loop continues to the next probe, where the deadline check fires
+    (a timeout — the fail-safe; the pending reply is never an approval).
+    """
+    state = {"now": 0.5}
+
+    def clock() -> float:
+        return state["now"]
+
+    class _Reader:
+        """First ``kbhit``: jump the clock past the deadline, return False
+        (force the sleep path). Subsequent ``kbhit``: keep returning False
+        so the deadline check fires on the next probe."""
+
+        def __init__(self) -> None:
+            self._jumped = False
+
+        def kbhit(self) -> bool:
+            if not self._jumped:
+                self._jumped = True
+                state["now"] = 5.0  # jump past the deadline (1.0)
+            return False
+
+        def getwch(self) -> str:
+            return "y"  # never reached on the failure path
+
+    reader = _Reader()
+    approver = TerminalApprover(timeout_s=1.0, reader=reader, now_fn=clock)
+    decision = approver.request_approval(_action())
+    # Pre-fix: the unclamped sleep raises ValueError — the test errors.
+    # Post-fix: the sleep clamps to zero, the loop continues, and the
+    # deadline check fires on the next probe (a timeout rejection, never
+    # an approval, never a crash).
+    assert not decision.is_approved
+    assert decision.reason == "timeout"
