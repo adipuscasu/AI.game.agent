@@ -113,7 +113,7 @@ same as "no".
 
 | Input | Outcome |
 | --- | --- |
-| `y` / `yes` / `approve` / `ok` / `go` (case-insensitive) | **approved** |
+| `y` / `yes` / `approve` / `ok` / `go` / `1` (case-insensitive) | **approved** |
 | `n` / `no` / `reject` / blank | rejected (`user-rejected`) |
 | any other text (e.g. `maybe`) | rejected (`unparsable-reply`) |
 | EOF / no stdin | rejected (`no-input-channel`) |

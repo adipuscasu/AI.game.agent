@@ -259,8 +259,8 @@ class TerminalApprover:
     * ``KeyboardInterrupt`` is a **rejection** (the user is bailing).
     * Blank / unparsable replies are **rejections** (ambiguous = no).
 
-    Only an explicit affirmative (``y`` / ``yes`` / ``approve`` / ``ok``,
-    case-insensitive) approves.
+    Only an explicit affirmative (``y`` / ``yes`` / ``approve`` / ``ok`` /
+    ``go`` / ``1``, case-insensitive) approves.
     """
 
     name: str = "terminal"
