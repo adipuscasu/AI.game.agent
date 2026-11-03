@@ -411,6 +411,64 @@ def test_ai_prompt_returns_string():
     assert len(prompt) > 0
 
 
+def _first_json_object(text: str) -> str | None:
+    """Return the first top-level ``{...}`` object in *text* (brace-matched)."""
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def test_ai_prompt_advertised_example_is_schema_valid():
+    """The prompt's JSON example must be valid AND validator-accepted.
+
+    The prompt is the only place the model learns the wire format, and the
+    validator (:meth:`AIDecision.from_dict`) is the only place the payload is
+    checked. If the advertised example is a placeholder, a flat
+    ``"action": "<kind>"`` string, or any shape ``from_dict`` rejects, every
+    real AI decision dies with ``AI failed`` and the agent bounces to
+    RECOVERY. The advertised example must therefore round-trip cleanly:
+    parse as JSON, pass ``AIDecision.from_dict`` with no error.
+    """
+    import json
+
+    p = DeterministicPolicy(ai_enabled=True)
+    obs = _obs(zones=(_zone(ZONE_TARGET_HOSTILE),))
+    prompt = p.ai_prompt(AgentState.AI_ANALYSIS, obs)
+
+    raw = _first_json_object(prompt)
+    assert raw is not None, "ai_prompt must advertise a JSON example payload"
+    example = json.loads(raw)  # placeholders like <int> make this fail
+
+    from ai_game_agent.ai import AIDecision
+
+    decision = AIDecision.from_dict(example)  # the real rejection site
+    assert decision.action is not None
+
+
+def test_ai_prompt_advertises_all_action_kinds():
+    """The prompt must name every supported action kind.
+
+    The model can only propose what it is told exists; a kind the prompt
+    never mentions is unreachable from the AI path.
+    """
+    from ai_game_agent.actions import ActionKind
+
+    p = DeterministicPolicy(ai_enabled=True)
+    obs = _obs(zones=(_zone(ZONE_TARGET_HOSTILE),))
+    prompt = p.ai_prompt(AgentState.AI_ANALYSIS, obs)
+    for kind in ActionKind:
+        assert kind.value in prompt, f"ai_prompt does not advertise kind {kind.value!r}"
+
+
 def test_ai_enabled_defaults_false():
     p = DeterministicPolicy()
     assert p.ai_enabled is False

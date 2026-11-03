@@ -557,3 +557,60 @@ uv run pytest tests/test_agent_loop.py tests/test_agent_loop_safety.py tests/tes
 # And the whole suite must stay green (CI must not need a desktop or a live game):
 uv run pytest -q
 ```
+
+---
+
+## 6. Windows quirks
+
+Two Windows-only symptoms you may see that are **not** project bugs:
+
+### 6.1 `pytest-current` PermissionError after an otherwise-green run
+
+A `pytest runfinished` hook calls `cleanup_dead_symlinks` on the basetemp;
+on Windows, unlinking the `pytest-current` symlink can fail with
+`PermissionError: [WinError 5] Access is denied` if the temp dir is locked
+(antivirus, OneDrive, another pytest instance, or a previous run's leftover).
+This is a pytest/OS issue, not an `AI.game.agent` defect.
+
+```powershell
+# Remove the stale temp dir and re-run
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Temp\pytest-of-$env:USERNAME"
+uv run pytest -q
+```
+
+`--basetemp` does **not** fix this — the same cleanup path runs on whatever
+basetemp you choose. It only relocates where the failure can occur.
+
+### 6.2 The fd read is deadline-strict and never uses `select`
+
+`test_terminal_approver_timeout_rejects` exercises the assisted-approval
+prompt, which reads one line from stdin with a timeout. (Historically the fd
+path used `select.select`, which on Windows only accepts sockets — pipes and
+console fds raised `OSError [WinError 10038]`. That limitation is gone: the
+fd read no longer calls `select` at all, so it is cross-platform by
+construction.)
+
+The fd path now routes through `_read_line_fd`, a **deadline-strict
+non-blocking read**: the fd is driven non-blocking and read byte-by-byte with
+`os.read` (never `readline`, so a lone byte cannot hang; no worker threads
+are spawned). A reply is honoured **only** if its terminating newline is
+consumed within the allowed window — a line that completes after the deadline
+is a timeout rejection (fail-safe: a late `y` cannot bypass the deadline). A
+cancel signal (the F12 emergency stop) is checked before every ~10 ms poll
+slice and again at the acceptance boundary, so it stays responsive on this
+path. (An interactive Windows console still uses the key-by-key console
+reader instead, because a line-buffered read cannot be deadline-bounded
+there.)
+
+The regression guards are:
+
+* `test_fd_straddling_newline_after_deadline_is_timeout` — a reply whose
+  first byte arrives early but whose newline lands after the deadline is a
+  **timeout**, not an approval (pins the deadline-strict rule).
+* `test_fd_lone_byte_without_newline_does_not_hang` — a lone `y` with no
+  newline and an open writer must return a timeout promptly and must never
+  call `readline` (pins the no-hang, no-`readline` contract).
+* `test_terminal_approver_timeout_when_select_rejects_fd` — kept from the
+  `select` era; it now passes trivially because the fd path never calls
+  `select`, and it still pins that a `select`-rejecting fd times out rather
+  than crashes.

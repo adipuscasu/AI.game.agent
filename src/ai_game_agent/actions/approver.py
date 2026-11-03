@@ -1,0 +1,1046 @@
+"""Assisted-approval mechanism (Phase 6).
+
+AGENTS.md §13 ("Human-in-the-Loop Mode") and the high-level plan's
+Phase 6 target are the same flow::
+
+    Observe -> Analyze -> Suggest action -> Human approval -> Execute
+
+The :class:`Approver` protocol is that "human approval" step, abstracted
+from the transport so the loop never imports ``input()`` or a terminal
+library. The loop (the only object that dispatches actions) consults the
+approver **before** executing an AI-proposed action when running under
+``ASSISTED``; a rejection halts the episode safely (see
+:mod:`ai_game_agent.agent.loop`).
+
+Two implementations ship:
+
+* :class:`TerminalApprover` — the default human channel. Blocks on ``stdin``
+  with a clear prompt and a timeout, and treats non-interactivity / timeout
+  as a **rejection** (fail-safe: an unanswered proposal is never executed).
+  Timeout contract: ``None`` → instance default (30 s); ``0`` → non-blocking
+  poll (honours a reply already buffered, rejects immediately otherwise);
+  positive → wait that many seconds; negative → ``ValueError``. An injected
+  ``cancel_event`` (``threading.Event``), when set while a wait is pending,
+  unblocks it immediately and is classified as an ``"interrupted"`` rejection.
+* :class:`AutoApprover` — a non-blocking policy stub for tests, CI, and
+  "trust the AI" runs; always approves.
+* :class:`QueueApprover` — a transport-agnostic channel for remote/web
+  approval (Phase 6). ``request_approval`` blocks until the request is
+  settled; the human/remote side settles it from another thread via
+  :meth:`QueueApprover.respond`, and may poll outstanding requests with
+  :meth:`QueueApprover.pending`. The loop still programs against the
+  :class:`Approver` protocol only, so a future web handler is a thin adapter
+  over ``pending()`` / ``respond()``.
+
+Design notes:
+
+* **Dependency-free.** Only stdlib (``os``, ``sys``, ``typing``, ``time``,
+  ``dataclasses``, ``threading``, ``math``; ``msvcrt`` imported lazily, only
+  on Windows consoles). Importing this module in a bare venv is always
+  safe, matching the rest of the ``actions`` package.
+* **Console-aware.** On a Windows console (``CONIN$``) the reply is read
+  key-by-key through :class:`ConsoleInputReader` (``kbhit``/``getwch``),
+  because a line-buffered read cannot be deadline-bounded there; the fd
+  paths use a deadline-strict non-blocking read (``select`` is not used
+  at all, so the WinError 10038 socket-only limitation never applies).
+* **Fail-safe.** Every path that cannot obtain an affirmative answer
+  (EOF on stdin, ``KeyboardInterrupt``, timeout, unparsable reply) returns
+  ``Rejected``. The only way an action executes is an explicit
+  affirmative answer — never an ambiguous one.
+* **No I/O on import.** The terminal read happens inside
+  :meth:`TerminalApprover.request_approval`, not at module load.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import math
+import sys
+import threading
+import time
+import uuid
+from typing import Literal, Protocol, runtime_checkable
+
+__all__ = [
+    "Approver",
+    "AutoApprover",
+    "ApprovalDecision",
+    "ConsoleInputReader",
+    "DecisionOutcome",
+    "MsvcrtConsoleReader",
+    "PendingRequest",
+    "QueueApprover",
+    "RejectionReason",
+    "TerminalApprover",
+]
+
+#: The two outcomes a single approval request can have.
+DecisionOutcome = Literal["approved", "rejected"]
+
+
+@dataclasses.dataclass(frozen=True)
+class ApprovalDecision:
+    """The outcome of one approval request.
+
+    ``outcome`` is the closed vocabulary the loop programs against;
+    ``reason`` carries a human/audit-trail explanation (e.g. ``"timeout"``,
+    ``"no-input-channel"``, ``"user-rejected"``).
+    """
+
+    outcome: DecisionOutcome
+    reason: str = ""
+
+    @classmethod
+    def approved(cls, reason: str = "approved") -> ApprovalDecision:
+        return cls(outcome="approved", reason=reason)
+
+    @classmethod
+    def rejected(cls, reason: str = "rejected") -> ApprovalDecision:
+        return cls(outcome="rejected", reason=reason)
+
+    @property
+    def is_approved(self) -> bool:
+        return self.outcome == "approved"
+
+    @property
+    def is_rejected(self) -> bool:
+        return self.outcome == "rejected"
+
+
+#: Machine-readable reason tags for rejections (audit-friendly).
+RejectionReason = Literal[
+    "user-rejected",
+    "no-input-channel",
+    "timeout",
+    "interrupted",
+    "unparsable-reply",
+    "duplicate-request-id",
+]
+
+
+@runtime_checkable
+class ConsoleInputReader(Protocol):
+    """One key at a time from an interactive console (Windows ``CONIN$``).
+
+    The reference implementation is :class:`MsvcrtConsoleReader`; tests
+    inject a scripted fake of this shape so the approval loop stays
+    deterministic on hosts without a desktop console.
+    """
+
+    def kbhit(self) -> bool:
+        """Whether a key is pending — a non-blocking probe, never blocks."""
+        ...
+
+    def getwch(self) -> str:
+        """The next key (call only when :meth:`kbhit` is true).
+
+        May raise ``EOFError`` (Ctrl-Z) or ``KeyboardInterrupt`` (Ctrl-C);
+        the approval loop treats both as fail-safe rejections.
+        """
+        ...
+
+
+class MsvcrtConsoleReader:
+    """A :class:`ConsoleInputReader` backed by ``msvcrt`` (Windows only).
+
+    ``msvcrt.kbhit()`` reports pending keys without blocking and
+    ``msvcrt.getwch()`` returns the next key, so a reply can be assembled
+    one key at a time under a deadline — exactly what ``select`` (which
+    rejects non-socket fds with WinError 10038) and a non-blocking
+    ``os.read`` (line-buffered ``CONIN$`` blocks until Enter) cannot do
+    on a Windows console.
+    """
+
+    def __init__(self) -> None:
+        import msvcrt  # Windows-only module: ImportError on other hosts
+
+        self._msvcrt = msvcrt
+
+    def kbhit(self) -> bool:
+        return self._msvcrt.kbhit()
+
+    def getwch(self) -> str:
+        return self._msvcrt.getwch()
+
+
+@runtime_checkable
+class Approver(Protocol):
+    """Human-in-the-loop approval channel (Phase 6).
+
+    The loop calls :meth:`request_approval` exactly once per AI-proposed
+    action when running under ``ASSISTED``. Implementations must be
+    thread-confined (one approval in flight) and must **never raise** for a
+    "no" — they return :meth:`ApprovalDecision.rejected`. A raised exception
+    is reserved for genuine misconfiguration.
+
+    Contract:
+        * An affirmative answer returns :meth:`ApprovalDecision.approved`.
+        * Anything else — a "no", a blank line, EOF, a timeout, a
+          ``KeyboardInterrupt``, an unparsable reply — returns
+          :meth:`ApprovalDecision.rejected` with a :data:`RejectionReason`.
+        * ``request_approval`` blocks for at most ``timeout_s`` seconds
+          (the implementation owns the clock; tests inject ``now_fn``).
+    """
+
+    #: Human-readable channel name (e.g. ``"terminal"``, ``"auto"``) for
+    #: the approval event's audit detail.
+    name: str
+
+    def request_approval(
+        self,
+        action: object,
+        *,
+        reasoning: str = "",
+        confidence: float | None = None,
+        timeout_s: float | None = None,
+    ) -> ApprovalDecision:
+        """Ask the human to approve one proposed action.
+
+        Args:
+            action: The :class:`~ai_game_agent.actions.action.Action` being
+                proposed. Typed as ``object`` so this module stays
+                dependency-free; the loop passes an ``Action``.
+            reasoning: The model's rationale (from ``AIDecision.reasoning``),
+                surfaced in the prompt.
+            confidence: Model-reported confidence in ``[0, 1]`` (optional),
+                surfaced in the prompt.
+            timeout_s: Per-call timeout override. ``None`` falls back to the
+                implementation default.
+
+        Returns:
+            An :class:`ApprovalDecision`.
+
+        Raises:
+            ValueError: If the caller passes a negative ``timeout_s``.
+        """
+        ...
+
+
+class AutoApprover:
+    """A non-interactive approver that always approves.
+
+    Use in tests, CI, and explicit "trust the AI" runs. It is the reference
+    implementation of the protocol and the cheapest way to exercise the
+    assisted gate without a human.
+    """
+
+    name: str = "auto"
+
+    def __init__(self, reason: str = "auto-approved (AutoApprover)") -> None:
+        self._reason = reason
+
+    def request_approval(
+        self,
+        action: object,
+        *,
+        reasoning: str = "",
+        confidence: float | None = None,
+        timeout_s: float | None = None,
+    ) -> ApprovalDecision:
+        if timeout_s is not None and (
+            not math.isfinite(timeout_s) or timeout_s < 0
+        ):
+            raise ValueError(
+                f"timeout_s must be a finite value >= 0, got {timeout_s!r}"
+            )
+        return ApprovalDecision.approved(self._reason)
+
+
+class TerminalApprover:
+    """The default human channel: block on ``stdin`` for a y/N answer.
+
+    Fail-safe by construction:
+
+    * A non-interactive stdin (``EOFError`` / ``input`` immediately
+      raises) is a **rejection**, not an error — an agent running
+      headless must never act on an unacknowledged proposal.
+    * A timeout (the prompt is shown, then we wait up to ``timeout_s``)
+      is a **rejection**.
+    * ``KeyboardInterrupt`` is a **rejection** (the user is bailing).
+    * Blank / unparsable replies are **rejections** (ambiguous = no).
+
+    Only an explicit affirmative (``y`` / ``yes`` / ``approve`` / ``ok`` /
+    ``go`` / ``1``, case-insensitive) approves.
+    """
+
+    name: str = "terminal"
+
+    #: Default per-call timeout. The plan's [Execute]/[Reject]/[Pause]
+    #: implies a human is watching; a generous default avoids a hung
+    #: prompt swallowing a CI run, while still giving a human time to answer.
+    DEFAULT_TIMEOUT_S: float = 30.0
+
+    def __init__(
+        self,
+        *,
+        timeout_s: float | None = DEFAULT_TIMEOUT_S,
+        now_fn: time | None = None,  # type: ignore[valid-type]
+        cancel_event: threading.Event | None = None,
+        reader: ConsoleInputReader | None = None,
+    ) -> None:
+        # ``None`` is the module's "use the instance default" sentinel (the
+        # same one ``request_approval`` accepts), not an error: the default
+        # ASSISTED run path constructs the approver without a flag.
+        self._timeout_s = (
+            self.DEFAULT_TIMEOUT_S if timeout_s is None else float(timeout_s)
+        )
+        if not math.isfinite(self._timeout_s) or self._timeout_s < 0:
+            raise ValueError(
+                f"timeout_s must be a finite value >= 0, got {timeout_s!r}"
+            )
+        # Injectable clock for deterministic timeout tests.
+        self._now = now_fn if now_fn is not None else time.monotonic
+        # Optional cancellation signal (e.g. the F12 emergency stop). When
+        # set while a wait is pending, the wait is unblocked immediately and
+        # classified as an "interrupted" rejection — never an approval.
+        self._cancel_event = cancel_event
+        # Optional console input reader (kbhit/getwch). An explicit
+        # injection always wins; otherwise an interactive Windows console
+        # is auto-detected at read time (see _console_reader).
+        self._reader = reader
+
+    def request_approval(
+        self,
+        action: object,
+        *,
+        reasoning: str = "",
+        confidence: float | None = None,
+        timeout_s: float | None = None,
+    ) -> ApprovalDecision:
+        timeout = self._timeout_s if timeout_s is None else timeout_s
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError(
+                f"timeout_s must be a finite value >= 0, got {timeout!r}"
+            )
+
+        prompt = self._build_prompt(action, reasoning=reasoning, confidence=confidence)
+        print(prompt, end="", flush=True)
+
+        # Read one line from stdin with a soft timeout. On non-interactive
+        # stdin the read raises EOFError immediately -> reject (fail-safe).
+        line, timed_out = self._read_line(timeout)
+        if line is None:
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                # Emergency stop (F12) interrupted the wait: classify it
+                # distinctly from a plain timeout for the audit trail.
+                return ApprovalDecision.rejected("interrupted")
+            reason = "timeout" if timed_out else "no-input-channel"
+            return ApprovalDecision.rejected(reason)
+        reply = line
+
+        normalized = reply.strip().lower()
+        if normalized in {"y", "yes", "approve", "ok", "go", "1"}:
+            return ApprovalDecision.approved("user-approved")
+        if normalized in {"n", "no", "reject", "0", ""}:
+            return ApprovalDecision.rejected("user-rejected")
+        return ApprovalDecision.rejected("unparsable-reply")
+
+    # ---- internals ---------------------------------------------------------
+
+    def _build_prompt(
+        self,
+        action: object,
+        *,
+        reasoning: str,
+        confidence: float | None,
+    ) -> str:
+        """Render the proposal in a compact, one-glance-able form."""
+        kind = getattr(action, "kind", None)
+        kind = getattr(kind, "value", kind) if kind is not None else "<action>"
+        lines = [
+            "\u26a0\ufe0f  AI proposes an action (ASSISTED mode) \u2014 approve to execute:",
+            f"    action: {kind}",
+        ]
+        # Surface every field that deviates from the Action default, without
+        # importing the Action contract here (the module stays dependency-free).
+        # Defaults mirror ``_DEFAULTS`` in actions/action.py: showing only the
+        # non-default values keeps the prompt concise while ensuring no
+        # meaningful parameter (modifiers, relative, clicks, ...) is hidden.
+        _FIELDS = (
+            ("key", None),
+            ("modifiers", ()),
+            ("x", None),
+            ("y", None),
+            ("relative", False),
+            ("button", "left"),
+            ("clicks", 1),
+            ("scroll", None),
+            ("duration_ms", 0),
+            ("delay_ms", 0),
+        )
+        for field, default in _FIELDS:
+            value = getattr(action, field, None)
+            if value == default:
+                continue
+            lines.append(f"    {field}: {value}")
+        if reasoning:
+            lines.append(f"    reasoning: {self._sanitize_for_prompt(reasoning)}")
+        if confidence is not None:
+            lines.append(f"    confidence: {confidence:.2f}")
+        lines.append("    approve this action? [y/N] ")
+        return "\n".join(lines)
+
+    # Maximum length of the *sanitized* reasoning shown in the prompt. Bounds
+    # a model's unbounded output so it cannot flood the terminal; the raw
+    # value is untouched, only its presentation is capped.
+    _PROMPT_REASONING_MAX = 800
+
+    @classmethod
+    def _sanitize_for_prompt(cls, text: str) -> str:
+        """Neutralize untrusted text at the terminal-presentation boundary.
+
+        The model's reasoning is untrusted and would otherwise be printed
+        verbatim into the approval prompt — the human's security boundary
+        between an AI proposal and real input. A raw ESC opens any ANSI CSI /
+        OSC sequence, a CR returns the cursor to column 0 (letting following
+        text overwrite the prompt), a newline opens a fresh line, and other
+        control characters can be interpreted by the terminal. We therefore
+        replace every non-printable control character (C0 ``0x00-0x1f`` and
+        DEL ``0x7f``) with a visible ``\\xNN`` escape: the payload stays
+        visible for audit but can no longer drive the terminal. The input is
+        never mutated — only a new, safe string is returned.
+        """
+        out = [
+            ch if ch.isprintable() else f"\\x{ord(ch):02x}" for ch in text
+        ]
+        s = "".join(out)
+        if len(s) > cls._PROMPT_REASONING_MAX:
+            s = s[: cls._PROMPT_REASONING_MAX] + "…"
+        return s
+
+    def _read_line(self, timeout: float) -> tuple[str | None, bool]:
+        """Read one line from ``sys.stdin`` with a soft timeout.
+
+        Returns ``(line, timed_out)``: ``line`` is the reply without a
+        trailing newline, or ``None`` when no line is available (EOF,
+        timeout, or interrupt); ``timed_out`` is ``True`` only when the
+        deadline expired with no input (as opposed to an immediate EOF).
+        ``KeyboardInterrupt`` is swallowed here so the caller can classify
+        it as a rejection (the agent must not crash).
+
+        A ``timeout`` of ``0`` is a single bounded non-blocking poll (a
+        fully buffered reply is still honoured), never an unbounded read.
+        The fd path routes through :meth:`_read_line_fd`, a deadline-strict
+        non-blocking read that never calls ``readline`` and never spawns a
+        worker thread. An interactive console (Windows ``CONIN$``) routes
+        through :meth:`_read_line_console`, whose key-polling loop enforces
+        the deadline and checks the cancel signal itself.
+        """
+        reader = self._console_reader()
+        if reader is not None:
+            # Console input is line-buffered and blocking: a raw read cannot
+            # be deadline-bounded there, so the reader's kbhit loop owns
+            # the wait.
+            return self._read_line_console(timeout, reader)
+        fd = None
+        try:
+            fd = sys.stdin.fileno()
+        except (AttributeError, ValueError, OSError):
+            fd = None
+
+        if fd is None:
+            # Not a real file descriptor (e.g. a StringIO in tests): read
+            # directly, no timeout (tests either pre-buffer or EOF).
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                return (None, True)
+            try:
+                line = sys.stdin.readline()
+            except (EOFError, KeyboardInterrupt, AttributeError):
+                # AttributeError: stdin is None or has no readline (detached
+                # session) — a fail-safe rejection, never an approval.
+                return (None, False)
+            return (line.rstrip("\n") if line else None, False)
+        return self._read_line_fd(timeout, fd)
+
+    def _console_reader(self) -> ConsoleInputReader | None:
+        """Resolve the console reader for the current ``sys.stdin``.
+
+        An explicitly injected ``reader`` always wins. Otherwise the reader
+        is used only when stdin is an interactive console (``isatty()``)
+        and ``msvcrt`` is importable (Windows): pipe / redirect fds keep
+        the existing ``select`` / ``os.read`` paths, and non-Windows hosts
+        have no ``msvcrt`` (ImportError → ``None``).
+        """
+        if self._reader is not None:
+            return self._reader
+        stdin = sys.stdin
+        if stdin is None:
+            return None
+        try:
+            if not stdin.isatty():
+                return None
+        except (AttributeError, ValueError, OSError):
+            return None
+        try:
+            return MsvcrtConsoleReader()
+        except (ImportError, OSError, ValueError):
+            # ``msvcrt`` is Windows-only; elsewhere the fd paths apply.
+            return None
+
+    def _read_line_console(
+        self, timeout: float, reader: ConsoleInputReader
+    ) -> tuple[str | None, bool]:
+        """Read one reply from an interactive console, key by key.
+
+        Polls the reader's pending-key probe in the same deadline slices as
+        :meth:`_read_line_fd`: a reply that *completes* (Enter
+        pressed) before the deadline is honoured; a reply that does not is
+        a **timeout** rejection (fail-safe — a half-typed line is never an
+        approval, and a late ``y`` after the deadline cannot bypass it); a
+        set ``cancel_event`` unblocks the wait on the next slice, so an
+        emergency stop stays responsive. ``timeout=0`` is a single
+        non-blocking probe. No worker threads are involved (bounded
+        durations, safety contract).
+        """
+        cancel = self._cancel_event
+
+        if timeout <= 0:
+            # A genuine non-blocking probe — the documented contract, and the
+            # behaviour the fd path already honours on its ``timeout<=0``
+            # poll (see :meth:`_read_line_fd`). It never blocks or sleeps, so
+            # ``timeout=0`` stays a single-shot probe: a reply already
+            # available is consumed and honoured; a pending key that is not
+            # yet available is a single non-blocking timeout. Cancellation
+            # already signalled wins (the acceptance boundary), so a pending
+            # stop classifies as ``"interrupted"`` rather than a timeout.
+            if cancel is not None and cancel.is_set():
+                return (None, True)
+            try:
+                buf = ""
+                while True:
+                    if cancel is not None and cancel.is_set():
+                        return (None, True)
+                    if not reader.kbhit():
+                        # A key (or the terminating Enter) is not yet
+                        # buffered. A non-blocking probe must never block on
+                        # ``getwch()`` waiting for it, and a half-typed line is
+                        # never an approval — so this is a single-shot timeout,
+                        # not a wait.
+                        return (None, True)
+                    ch = reader.getwch()
+                    buf += ch
+                    if ch in "\r\n":
+                        break
+            except (EOFError, KeyboardInterrupt, OSError, ValueError):
+                # Ctrl-Z / Ctrl-C / a broken console handle: a fail-safe
+                # rejection — never an approval, never a crash.
+                return (None, False)
+            # Acceptance boundary: a cancel that landed while the reply was
+            # being consumed wins (fail-safe; never commit a buffered approval
+            # after a stop). Mirrors the fd ``timeout<=0`` boundary.
+            if cancel is not None and cancel.is_set():
+                return (None, True)
+            return (buf.rstrip("\r\n"), False)
+
+        # timeout > 0: bounded wait, re-polling in ~10 ms slices.
+        buf = ""
+        deadline = self._now() + timeout
+        try:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    return (None, True)
+                # Evaluate the deadline **before** consuming a pending key.
+                # A reply still pending once the deadline has passed is a
+                # timeout rejection (fail-safe): a late ``y`` typed at or past
+                # the deadline must not be honoured, and a half-typed line is
+                # never an approval. (A reply already buffered *before* the
+                # deadline is still honoured — e.g. the ``timeout_s=0`` poll.)
+                if self._now() >= deadline:
+                    return (None, True)
+                if reader.kbhit():
+                    try:
+                        ch = reader.getwch()
+                    except (EOFError, KeyboardInterrupt, OSError, ValueError):
+                        # Ctrl-Z / Ctrl-C / a broken console handle: a
+                        # fail-safe rejection — never an approval, never a
+                        # crash.
+                        return (None, False)
+                    buf += ch
+                    if ch in "\r\n":
+                        break
+                    continue
+                # Clamp the sleep non-negative: a clock jump that lands the
+                # deadline behind ``now`` (a fast injected clock or a real
+                # scheduling hiccup between the deadline check above and this
+                # line) would otherwise make ``deadline - now`` negative and
+                # ``time.sleep`` raise ``ValueError`` — aborting the approval
+                # prompt at the security boundary instead of falling through
+                # to the next probe (where the deadline check times it out,
+                # the fail-safe). The deadline was already checked above, so
+                # a zero sleep is safe: the loop re-evaluates and exits.
+                time.sleep(min(0.01, max(0.0, deadline - self._now())))
+        except KeyboardInterrupt:
+            return (None, False)
+        return (buf.rstrip("\r\n"), False)
+
+    def _read_line_fd(
+        self, timeout: float, fd: int
+    ) -> tuple[str | None, bool]:
+        """Read one reply from a real fd; deadline-strict and cancel-responsive.
+
+        The fd is driven non-blocking and read byte-by-byte with ``os.read``
+        (never ``readline``, so a lone byte cannot hang; no worker threads).
+        The partial line is carried across poll slices, so a reply whose
+        bytes arrive in more than one slice is still reassembled.
+        A reply is honoured **only** if its terminating newline is consumed
+        within the allowed window — a line that completes after the deadline
+        is a timeout rejection (fail-safe: a late ``y`` cannot bypass the
+        deadline).
+
+        * ``timeout <= 0``: a single bounded non-blocking poll — a line
+          already fully buffered (through its newline) is honoured; an
+          incomplete line, an EAGAIN read, or EOF is a timeout / no-channel
+          rejection. Never blocks and never spins.
+        * ``timeout > 0``: re-polls in ~10 ms slices until the deadline, and
+          a set ``cancel_event`` unblocks the wait on the next slice (and at
+          the acceptance boundary) — classified by the caller as
+          ``"interrupted"``.
+        * EOF (the writer closed the stream) returns promptly as a
+          no-channel rejection: no more data can ever arrive, so waiting
+          out the deadline is pointless.
+
+        Reads are non-blocking, so an "empty" read on a live pipe means
+        "not yet" and is re-polled; the deadline bounds the wait. The fd's
+        blocking mode is captured and restored; a restore failure is
+        swallowed (fail-closed) so it can never mask the result.
+        """
+        import os
+
+        def _blocking_mode(fd: int) -> bool | None:
+            try:
+                return os.get_blocking(fd)
+            except (OSError, ValueError, AttributeError, NotImplementedError):
+                return None
+
+        prev = _blocking_mode(fd)
+        if prev is None:
+            # The fd cannot even be probed: no usable channel — the caller
+            # classifies this as a rejection (fail-safe).
+            return (None, False)
+        try:
+            os.set_blocking(fd, False)
+        except (OSError, ValueError, AttributeError, NotImplementedError):
+            return (None, False)
+
+        cancel = self._cancel_event
+        now = self._now
+
+        # Hard cap on how much of a not-yet-complete line we are willing to
+        # buffer. A real approval reply is tiny; this bounds the partial
+        # buffer's memory growth so a continuous, newline-free stream cannot
+        # balloon it (and cannot spin the reader past the deadline).
+        max_partial = 64 * 1024
+
+        def _cancelled() -> bool:
+            return cancel is not None and cancel.is_set()
+
+        def _read_until_newline(
+            partial: bytearray,
+            deadline: float | None = None,
+        ) -> tuple[bytes | None, str]:
+            """Consume available bytes into ``partial`` until a newline.
+
+            Bounded two ways: ``deadline`` (when given) stops the loop once
+            the approval deadline is reached, and ``max_partial`` caps the
+            bytes buffered, so a continuously-readable stream can neither
+            monopolize the reader nor grow the buffer without bound. With
+            neither bound active (``deadline`` is ``None``) the loop is
+            still bounded by the byte cap plus ``BlockingIOError``/EOF on an
+            idle pipe.
+
+            Returns ``(line, "line")`` once a full line (through its
+            ``\\n``) is assembled — ``line`` holds the bytes and
+            ``partial`` is reset; ``(None, "eof")`` when the writer closed
+            the stream before a newline; ``(None, "incomplete")`` when no
+            more data is available yet (EAGAIN), the deadline was reached,
+            or the byte cap was hit — ``partial`` keeps the bytes consumed
+            so far and is carried into the next slice; ``(None, "error")``
+            on a hard fd error.
+            """
+            while True:
+                if deadline is not None and now() >= deadline:
+                    return None, "incomplete"
+                if len(partial) >= max_partial:
+                    return None, "incomplete"
+                try:
+                    b = os.read(fd, 1)
+                except BlockingIOError:
+                    return None, "incomplete"
+                except (OSError, ValueError):
+                    return None, "error"
+                if not b:
+                    return None, "eof"
+                partial.extend(b)
+                if b == b"\n":
+                    line = bytes(partial)
+                    del partial[:]
+                    return line, "line"
+
+        def _done(line: bytes) -> tuple[str | None, bool]:
+            return (line.decode("utf-8", "replace").rstrip("\n"), False)
+
+        try:
+            partial = bytearray()
+            if timeout <= 0:
+                line, status = _read_until_newline(partial)
+                if status == "line" and line is not None:
+                    # Acceptance boundary (Finding 3): a cancel already
+                    # signalled wins — never commit a buffered approval after
+                    # a stop. Mirrors the ``timeout > 0`` boundary above, so
+                    # both branches classify the same way: return ``(None, True)``
+                    # and let the caller classify a set ``cancel_event`` as an
+                    # ``"interrupted"`` rejection (the fail-safe direction).
+                    if not _cancelled():
+                        return _done(line)
+                    return (None, True)
+                if status == "eof":
+                    return (None, False)  # dead channel, not a timeout
+                return (None, True)  # incomplete -> timeout (single poll)
+
+            deadline = now() + timeout
+            while True:
+                if _cancelled():
+                    return (None, True)
+                line, status = _read_until_newline(partial, deadline)
+                if status == "error":
+                    return (None, False)
+                if status == "eof":
+                    # Stream exhausted: no more data can arrive, so fail fast
+                    # with a no-channel rejection (the caller classifies it
+                    # as ``"no-input-channel"``) instead of waiting out the
+                    # deadline on a dead pipe.
+                    return (None, False)
+                if line is not None:
+                    # Acceptance boundary: a line that completed at or past
+                    # the deadline, or after a cancel, is a timeout — never
+                    # an approval (fail-safe; the cancel event wins).
+                    if now() < deadline and not _cancelled():
+                        return _done(line)
+                    return (None, True)
+                remaining = deadline - now()
+                if remaining <= 0:
+                    return (None, True)
+                time.sleep(min(0.01, remaining))
+        finally:
+            try:
+                os.set_blocking(fd, prev)
+            except (OSError, ValueError, AttributeError, NotImplementedError):
+                pass  # fail-closed: a restore failure must not mask the result
+
+
+class _Slot:
+    """Internal mutable state for one approval request (not part of the API).
+
+    Lives in :attr:`QueueApprover._slots` keyed by request id; the public
+    read-only projection of an unsettled slot is a :class:`PendingRequest`.
+    """
+
+    __slots__ = (
+        "request_id",
+        "action",
+        "reasoning",
+        "confidence",
+        "deadline",
+        "decision",
+        "settled",
+    )
+
+    def __init__(
+        self,
+        request_id: str,
+        action: object,
+        reasoning: str,
+        confidence: float | None,
+        deadline: float,
+    ) -> None:
+        self.request_id = request_id
+        self.action = action
+        self.reasoning = reasoning
+        self.confidence = confidence
+        self.deadline = deadline
+        self.decision: ApprovalDecision | None = None
+        self.settled = False
+
+
+@dataclasses.dataclass(frozen=True)
+class PendingRequest:
+    """Immutable snapshot of one *outstanding* approval request.
+
+    Carries the *request* data (the proposed action plus the model's
+    reasoning and confidence) — deliberately separate from the eventual
+    decision, which is produced only once the human settles the request via
+    :meth:`QueueApprover.respond`. Because it is a frozen dataclass, a remote
+    client may hand the snapshot to its own machinery without the approver
+    being able to mutate it behind the client's back; and because
+    :class:`~ai_game_agent.actions.action.Action` itself is frozen, holding
+    it directly is safe.
+    """
+
+    request_id: str
+    action: object
+    reasoning: str
+    confidence: float | None
+
+
+class QueueApprover:
+    """Transport-agnostic :class:`Approver` for remote/web approval (Phase 6).
+
+    Contract (matching the :class:`Approver` protocol the loop programs
+    against):
+
+    * :meth:`request_approval` **blocks** until the request is settled and
+      returns an :class:`ApprovalDecision`. It never raises for a "no".
+    * :meth:`respond` — the human/remote side submits an outcome for a
+      specific request from another thread. A valid decision settles the
+      request; an unknown / replayed / malformed decision — or one that loses
+      the settle race to a cancel or a deadline — is a **no-op** that returns
+      ``False`` (it never produces a decision and never approves).
+    * :meth:`pending` — an immutable :class:`tuple` of
+      :class:`PendingRequest` snapshots of the *outstanding* (unsettled)
+      requests, for a client to display and poll. Reading it never settles
+      anything.
+
+    Settlement precedence (checked in this order, under the lock, on both the
+    waiting and responding sides — first-settle-wins, then immutable):
+
+    1. A set ``cancel_event`` (the F12 emergency stop) → ``"interrupted"``.
+       It is authoritative: it wins even over a valid approved response, so a
+       responder cannot bypass an emergency stop via a scheduling race.
+    2. Deadline expiry → ``"timeout"``. A late response cannot approve a
+       timed-out request.
+    3. A valid affirmative/negative ``ApprovalDecision`` → settles as that
+       decision; the waiter is woken immediately via the condition variable.
+
+    Fail-safe rule (the repo invariant, shared by every approver): a valid,
+    explicitly affirmative decision is the **only** path to execution.
+
+    Request-ID / replay trade-off: ids are per-approver and opaque
+    (``uuid4`` by default). A settled slot is removed from the pending set
+    and is no longer resolvable, so a replayed or forged id is a no-op — it
+    cannot re-approve, override, or resolve *another* request. The trade-off
+    is that there is no server-side session/lease state: the id alone is the
+    whole credential, which is exactly why ids are unguessable and single
+    use. A concrete web client (out of scope) would additionally carry auth.
+
+    The :class:`Approver` protocol does not define ``respond()`` /
+    ``pending()``; they are extensions on this concrete class for the
+    human/remote side. The loop never calls them — it only ever calls
+    ``request_approval``.
+    """
+
+    name: str = "queue"
+
+    #: Default per-call timeout, mirroring :class:`TerminalApprover`.
+    DEFAULT_TIMEOUT_S: float = 30.0
+
+    #: Wait-slice duration. Small enough to keep a set ``cancel_event``
+    #: responsive; large enough to avoid busy-spinning. The condition
+    #: variable wakes the waiter immediately on a response, so this slice is
+    #: only the cadence for the cancel / deadline re-check.
+    _SLICE_S: float = 0.05
+
+    def __init__(
+        self,
+        *,
+        timeout_s: float | None = None,
+        cancel_event: threading.Event | None = None,
+        id_factory: object | None = None,
+        now_fn: object | None = None,
+    ) -> None:
+        """Configure the approver.
+
+        Args:
+            timeout_s: Per-call default timeout (seconds). ``None`` uses
+                :attr:`DEFAULT_TIMEOUT_S`. Must be finite and >= 0.
+            cancel_event: A ``threading.Event`` that, when set, unblocks a
+                pending wait and settles the request as ``"interrupted"``
+                (the F12 emergency stop). ``None`` disables cancellation.
+            id_factory: A zero-argument callable returning a unique,
+                unguessable correlation id per request. The default is
+                ``uuid.uuid4().hex``. A misconfigured factory that can
+                return the *same* id twice while both requests are
+                outstanding will have the second registration refused as a
+                fail-safe rejection (``"duplicate-request-id"``) — it cannot
+                overwrite the first slot and corrupt it. The factory is
+                responsible for uniqueness; this class does not deduplicate.
+            now_fn: A zero-argument callable returning the current time in
+                seconds (a monotonic clock by default). Injectable for
+                deterministic tests.
+        """
+        self._default_timeout = (
+            self.DEFAULT_TIMEOUT_S if timeout_s is None else float(timeout_s)
+        )
+        if not math.isfinite(self._default_timeout) or self._default_timeout < 0:
+            raise ValueError(
+                f"timeout_s must be a finite value >= 0, got {timeout_s!r}"
+            )
+        self._cancel_event = cancel_event
+        self._id_factory = (
+            id_factory if id_factory is not None else (lambda: uuid.uuid4().hex)
+        )
+        self._now = now_fn if now_fn is not None else time.monotonic
+        self._cv = threading.Condition(threading.Lock())
+        self._slots: dict[str, _Slot] = {}
+
+    def request_approval(
+        self,
+        action: object,
+        *,
+        reasoning: str = "",
+        confidence: float | None = None,
+        timeout_s: float | None = None,
+    ) -> ApprovalDecision:
+        """Register an approval request and block until it is settled.
+
+        Settling happens by one of: a valid :meth:`respond` (response), a set
+        ``cancel_event`` (``"interrupted"``), or the deadline (``"timeout"``).
+        Settlement precedence is cancel → deadline → response (see the class
+        docstring), so the returned decision is always the one that won the
+        settle race. The method never raises for a "no"; it only raises
+        ``ValueError`` on a misconfigured ``timeout_s``. A failure of the
+        injected clock (``now_fn``) *after* registration propagates, but the
+        request's slot is always removed first, so it cannot linger in
+        :meth:`pending` or be resolved by a later :meth:`respond`.
+        """
+        timeout = self._default_timeout if timeout_s is None else float(timeout_s)
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError(
+                f"timeout_s must be a finite value >= 0, got {timeout_s!r}"
+            )
+        request_id = str(self._id_factory())
+        deadline = self._now() + timeout
+        slot = _Slot(request_id, action, reasoning, confidence, deadline)
+        with self._cv:
+            # Fail-safe: a duplicate id from the injected factory cannot
+            # overwrite an outstanding request — it would let a later
+            # ``respond()`` settle the *wrong* slot and corrupt it. A
+            # well-behaved factory (``uuid4``) never collides, so this is a
+            # defensive refusal of a misconfigured request, and a refusal is
+            # the only safe outcome (never an approval, never an overwrite).
+            if request_id in self._slots:
+                return ApprovalDecision.rejected("duplicate-request-id")
+            self._slots[request_id] = slot
+            try:
+                while not slot.settled:
+                    # Precedence re-checked each slice so the first of {cancel,
+                    # deadline} to become true settles the slot; a valid response
+                    # settles from the other thread via respond().
+                    if self._cancel_event is not None and self._cancel_event.is_set():
+                        self._settle(slot, ApprovalDecision.rejected("interrupted"))
+                        break
+                    if self._now() >= slot.deadline:
+                        self._settle(slot, ApprovalDecision.rejected("timeout"))
+                        break
+                    remaining = slot.deadline - self._now()
+                    self._cv.wait(timeout=max(0.0, min(self._SLICE_S, remaining)))
+                # Single-use cleanup: the slot is now settled and the waiter is
+                # the only thread that ever removes it (``respond()`` never does),
+                # so this runs exactly once. The ``is slot`` guard is defensive
+                # against a same-id collision, which the check above now refuses,
+                # so we never delete another request's slot. Dropping the entry
+                # keeps the store bounded and makes a replayed id an unresolvable
+                # no-op (the fail-safe direction).
+                if self._slots.get(request_id) is slot:
+                    del self._slots[request_id]
+                return (
+                    slot.decision
+                    if slot.decision is not None
+                    else ApprovalDecision.rejected("timeout")
+                )
+            except Exception:
+                # The injected clock (or a settle step) raised *after* the slot
+                # was registered. Remove *this* slot — and only this one (the
+                # ``is slot`` guard) — so it cannot linger in ``pending()`` or be
+                # resolved by a later ``respond()``; then propagate the failure.
+                if self._slots.get(request_id) is slot:
+                    del self._slots[request_id]
+                raise
+
+    def respond(self, request_id: str, decision: ApprovalDecision) -> bool:
+        """Settle a specific outstanding request from the human/remote side.
+
+        Returns ``True`` only when *this* call settled the request with the
+        given decision. Returns ``False`` (a no-op, never an approval) when:
+
+        * the id is unknown, already settled (replay), or was not issued;
+        * the decision is malformed (not an ``ApprovalDecision`` with a
+          closed-vocabulary outcome and a string reason);
+        * the settle race was lost to a set ``cancel_event`` (which settles
+          the slot as ``"interrupted"``) or to an expired deadline (which
+          settles it as ``"timeout"``).
+
+        A late response can never approve: the deadline is validated under the
+        same lock that settles, so even a response arriving after the deadline
+        — while the waiter has not yet woken — settles as ``"timeout"``.
+        """
+        with self._cv:
+            slot = self._slots.get(request_id)
+            if slot is None or slot.settled:
+                return False
+            if not self._valid_decision(decision):
+                return False
+            # Precedence (identical to the waiter's): cancel, then deadline,
+            # then accept. A set cancel is authoritative over a valid response.
+            # ``notify_all`` (not ``notify``) so the *correct* waiter is woken
+            # promptly: with multiple concurrent requests outstanding, ``notify``
+            # wakes an *arbitrary* waiter, which may be the one belonging to a
+            # different request (still pending) and so go back to sleep, leaving
+            # the just-settled request's waiter to the next poll slice. Wake
+            # every waiter; the settled one returns immediately and the others
+            # re-check and keep waiting. (Review #3.)
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                self._settle(slot, ApprovalDecision.rejected("interrupted"))
+                self._cv.notify_all()
+                return False
+            if self._now() >= slot.deadline:
+                # Deadline expiry also settles: the waiter must be woken too,
+                # otherwise it sleeps a full extra slice before noticing the
+                # settle (Review #3 — this branch previously settled without
+                # notifying at all).
+                self._settle(slot, ApprovalDecision.rejected("timeout"))
+                self._cv.notify_all()
+                return False
+            self._settle(slot, decision)
+            self._cv.notify_all()
+            return True
+
+    def pending(self) -> tuple[PendingRequest, ...]:
+        """Return an immutable snapshot of the outstanding (unsettled) requests.
+
+        A read-only projection for a client to display/poll; it never settles
+        or removes anything. Settled requests are excluded, so the snapshot
+        shrinks as requests are answered. Each element is a frozen
+        :class:`PendingRequest` carrying the request data (action, reasoning,
+        confidence) — separate from the eventual decision.
+        """
+        with self._cv:
+            return tuple(
+                PendingRequest(
+                    request_id=s.request_id,
+                    action=s.action,
+                    reasoning=s.reasoning,
+                    confidence=s.confidence,
+                )
+                for s in self._slots.values()
+                if not s.settled
+            )
+
+    # ---- internals ---------------------------------------------------------
+
+    def _settle(self, slot: _Slot, decision: ApprovalDecision) -> None:
+        """Record a slot's final decision and mark it settled (caller holds the lock)."""
+        slot.decision = decision
+        slot.settled = True
+
+    @staticmethod
+    def _valid_decision(decision: object) -> bool:
+        """A decision is usable only if it is a well-formed ``ApprovalDecision``.
+
+        Closed-vocabulary outcome plus a string reason; anything else is a
+        malformed payload that must not settle (and must not approve).
+        """
+        if not isinstance(decision, ApprovalDecision):
+            return False
+        if decision.outcome not in ("approved", "rejected"):
+            return False
+        return isinstance(decision.reason, str)

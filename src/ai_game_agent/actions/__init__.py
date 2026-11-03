@@ -19,6 +19,14 @@ from ai_game_agent.actions.action import (
     ActionResult,
     validate_action,
 )
+from ai_game_agent.actions.approver import (
+    ApprovalDecision,
+    Approver,
+    AutoApprover,
+    PendingRequest,
+    QueueApprover,
+    TerminalApprover,
+)
 from ai_game_agent.actions.base import (
     ActionError,
     ActionQueueError,
@@ -57,6 +65,12 @@ __all__ = [
     "SafetyViolation",
     "ActionQueue",
     "ActionRequest",
+    "Approver",
+    "ApprovalDecision",
+    "AutoApprover",
+    "PendingRequest",
+    "QueueApprover",
+    "TerminalApprover",
     "create_backend",
     "validate_action",
 ]
