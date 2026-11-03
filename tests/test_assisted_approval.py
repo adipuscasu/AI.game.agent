@@ -508,6 +508,70 @@ def test_approval_decision_with_invalid_outcome_is_not_approved():
     assert approvals[0].detail["reason"] == "invalid-approval-decision"
 
 
+# ---------------------------------------------------------------------------
+# P2/P3 (fresh review) — the gate must validate the *reason* type too.
+#
+# ``QueueApprover._valid_decision`` requires a string reason, but the loop
+# gate only checked the outcome vocabulary. An approver returning
+# ``ApprovalDecision(outcome="approved", reason=object())`` would pass the
+# gate and authorize execution with a non-JSON-serializable audit reason.
+# Both outcomes with a non-string reason must be treated as malformed and
+# rejected with the distinct ``invalid-approval-decision`` tag.
+# ---------------------------------------------------------------------------
+
+
+def test_approved_decision_with_non_string_reason_is_rejected():
+    """A non-string ``reason`` must not authorize execution, even if approved."""
+    payload = ApprovalDecision(outcome="approved", reason=object())
+    approver = _MalformedApprover(payload)
+    backend = MockBackend()
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[object] = []
+    loop = _loop(
+        mode=OperationMode.ASSISTED,
+        approver=approver,
+        backend=backend,
+        ai=ai,
+        max_ticks=3,
+        on_event=events.append,
+    )
+    report = loop.run()
+    assert loop._machine.state is AgentState.PAUSED
+    assert report.actions_ok == 0, (
+        "approved decision with non-string reason dispatched an action"
+    )
+    assert report.actions_attempted == 0
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert approvals
+    assert approvals[0].detail["approved"] is False
+    assert approvals[0].detail["reason"] == "invalid-approval-decision"
+
+
+def test_rejected_decision_with_non_string_reason_is_rejected():
+    """A non-string ``reason`` is malformed even when the outcome is rejected."""
+    payload = ApprovalDecision(outcome="rejected", reason=object())
+    approver = _MalformedApprover(payload)
+    backend = MockBackend()
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[object] = []
+    loop = _loop(
+        mode=OperationMode.ASSISTED,
+        approver=approver,
+        backend=backend,
+        ai=ai,
+        max_ticks=3,
+        on_event=events.append,
+    )
+    report = loop.run()
+    assert loop._machine.state is AgentState.PAUSED
+    assert report.actions_ok == 0
+    assert report.actions_attempted == 0
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert approvals
+    assert approvals[0].detail["approved"] is False
+    assert approvals[0].detail["reason"] == "invalid-approval-decision"
+
+
 def test_gate_does_not_fire_for_deterministic_actions_in_assisted():
     """ASSISTED without an AI decision must NOT consult the approver.
 

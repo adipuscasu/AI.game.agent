@@ -387,21 +387,22 @@ class AgentLoop:
         # affirmative approval decision is the *only* path to execution. So we
         # validate the decision against the closed :class:`ApprovalDecision`
         # contract and derive approval from the *outcome*, not truthiness.
-        approved = (
+        # Fresh review (P2/P3): the gate must apply the *same* validation
+        # contract as ``QueueApprover._valid_decision`` — a string reason in
+        # addition to the closed outcome vocabulary. Otherwise an approver
+        # could authorize execution with a non-JSON-serializable ``reason``
+        # that would poison the audit trail.
+        valid_decision = (
             isinstance(decision, ApprovalDecision)
-            and decision.outcome == "approved"
+            and decision.outcome in ("approved", "rejected")
+            and isinstance(decision.reason, str)
         )
+        approved = valid_decision and decision.outcome == "approved"
         # A well-formed ApprovalDecision (approved *or* rejected) carries its
-        # own audit reason; anything else — a wrong type, or an
-        # out-of-vocabulary outcome — is tagged distinctly so "why didn't it
-        # run?" is answerable from the audit trail alone.
-        if isinstance(decision, ApprovalDecision) and decision.outcome in (
-            "approved",
-            "rejected",
-        ):
-            reason = decision.reason
-        else:
-            reason = "invalid-approval-decision"
+        # own audit reason; anything else — a wrong type, an out-of-vocabulary
+        # outcome, or a non-string reason — is tagged distinctly so "why
+        # didn't it run?" is answerable from the audit trail alone.
+        reason = decision.reason if valid_decision else "invalid-approval-decision"
         if approved:
             self._approvals_granted += 1
         else:
