@@ -383,6 +383,124 @@ def test_raising_approver_is_classified_as_rejection():
     assert approvals and approvals[0].detail["approved"] is False
 
 
+# ---------------------------------------------------------------------------
+# P2 (review) — the gate must not treat a *malformed* decision as approval.
+#
+# The old gate read ``approved = getattr(decision, "is_approved", False)`` and
+# trusted the truthiness of whatever the approver returned. A broken approver
+# returning an object with a *truthy* non-bool ``is_approved`` (e.g. the string
+# ``"no"``) would be counted as granted and the AI action would dispatch —
+# violating the central invariant that an affirmative approval decision is the
+# only path to execution. Only a genuine :class:`ApprovalDecision` with an
+# affirmative outcome may approve; anything else is a rejection.
+# ---------------------------------------------------------------------------
+
+
+class _MalformedApprover:
+    """Duck-typed approver that returns a fixed, malformed payload."""
+
+    name = "malformed"
+
+    def __init__(self, payload: object) -> None:
+        self._payload = payload
+        self.calls = 0
+
+    def request_approval(self, action, **kwargs):
+        self.calls += 1
+        return self._payload
+
+
+def test_malformed_decision_truthy_string_is_not_approved():
+    """``is_approved="no"`` (a truthy string) must be a rejection, not approval."""
+    from types import SimpleNamespace
+
+    payload = SimpleNamespace(is_approved="no", reason="not actually approved")
+    approver = _MalformedApprover(payload)
+    backend = MockBackend()
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[object] = []
+    loop = _loop(
+        mode=OperationMode.ASSISTED,
+        approver=approver,
+        backend=backend,
+        ai=ai,
+        max_ticks=3,
+        on_event=events.append,
+    )
+    report = loop.run()
+    assert loop._machine.state is AgentState.PAUSED
+    assert report.actions_ok == 0, (
+        f"malformed decision dispatched an action: {report.actions_ok}"
+    )
+    assert report.actions_attempted == 0
+    assert approver.calls >= 1
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert approvals, "expected an APPROVAL audit event on the malformed decision"
+    assert approvals[0].detail["approved"] is False
+    assert approvals[0].detail["reason"], "a rejection must carry a reason"
+
+
+def test_malformed_decision_truthy_bool_is_not_approved():
+    """``is_approved=True`` on a non-``ApprovalDecision`` object must reject.
+
+    This is the trap the old gate fell into: ``True`` is truthy, so the action
+    dispatched. Only a real :class:`ApprovalDecision` may authorize execution.
+    The malformed object carries no reason, so the audit trail must tag it with
+    the distinct ``invalid-approval-decision`` reason.
+    """
+    from types import SimpleNamespace
+
+    payload = SimpleNamespace(is_approved=True)  # no ``reason`` attribute
+    approver = _MalformedApprover(payload)
+    backend = MockBackend()
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[object] = []
+    loop = _loop(
+        mode=OperationMode.ASSISTED,
+        approver=approver,
+        backend=backend,
+        ai=ai,
+        max_ticks=3,
+        on_event=events.append,
+    )
+    report = loop.run()
+    assert loop._machine.state is AgentState.PAUSED
+    assert report.actions_ok == 0, "truthy-bool malformed decision dispatched an action"
+    assert report.actions_attempted == 0
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert approvals
+    assert approvals[0].detail["approved"] is False
+    assert approvals[0].detail["reason"] == "invalid-approval-decision"
+
+
+def test_approval_decision_with_invalid_outcome_is_not_approved():
+    """A genuine :class:`ApprovalDecision` with an out-of-vocabulary ``outcome``
+    is a rejection — approval derives from the validated outcome, not truthiness.
+    """
+    # ``DecisionOutcome`` is a Literal annotation; the dataclass does not enforce
+    # it at runtime, so a malformed outcome can exist and must be treated as "no".
+    payload = ApprovalDecision(outcome="sneaky", reason="sneaky-outcome")
+    approver = _MalformedApprover(payload)
+    backend = MockBackend()
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[object] = []
+    loop = _loop(
+        mode=OperationMode.ASSISTED,
+        approver=approver,
+        backend=backend,
+        ai=ai,
+        max_ticks=3,
+        on_event=events.append,
+    )
+    report = loop.run()
+    assert loop._machine.state is AgentState.PAUSED
+    assert report.actions_ok == 0
+    assert report.actions_attempted == 0
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert approvals
+    assert approvals[0].detail["approved"] is False
+
+
 def test_gate_does_not_fire_for_deterministic_actions_in_assisted():
     """ASSISTED without an AI decision must NOT consult the approver.
 

@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from dataclasses import replace as _replace
 
 from ai_game_agent.actions.action import Action, ActionResult
+from ai_game_agent.actions.approver import ApprovalDecision
 from ai_game_agent.actions.executor import Executor
 from ai_game_agent.actions.hotkey import HotkeyListener
 from ai_game_agent.actions.modes import OperationMode
@@ -391,8 +392,28 @@ class AgentLoop:
                 reason=f"approver-error: {type(exc).__name__}: {exc}"
             )
 
-        approved = getattr(decision, "is_approved", False)
-        reason = getattr(decision, "reason", "")
+        # P2 (review): the gate must NOT trust the truthiness of whatever the
+        # approver returned. A malformed approver could return an object with a
+        # truthy, non-bool ``is_approved`` (e.g. the string ``"no"``) and be
+        # counted as granting approval — breaking the central invariant that an
+        # affirmative approval decision is the *only* path to execution. So we
+        # validate the decision against the closed :class:`ApprovalDecision`
+        # contract and derive approval from the *outcome*, not truthiness.
+        approved = (
+            isinstance(decision, ApprovalDecision)
+            and decision.outcome == "approved"
+        )
+        # A well-formed ApprovalDecision (approved *or* rejected) carries its
+        # own audit reason; anything else — a wrong type, or an
+        # out-of-vocabulary outcome — is tagged distinctly so "why didn't it
+        # run?" is answerable from the audit trail alone.
+        if isinstance(decision, ApprovalDecision) and decision.outcome in (
+            "approved",
+            "rejected",
+        ):
+            reason = decision.reason
+        else:
+            reason = "invalid-approval-decision"
         if approved:
             self._approvals_granted += 1
         else:
