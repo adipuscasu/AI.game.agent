@@ -378,9 +378,15 @@ def test_raising_approver_is_classified_as_rejection():
     )
     report = loop.run()  # must not raise
     assert loop._machine.state is AgentState.PAUSED
+    assert report.actions_attempted == 0
     assert report.actions_ok == 0
     approvals = [e for e in events if e.event is EventType.APPROVAL]
     assert approvals and approvals[0].detail["approved"] is False
+    # The audit trail must preserve the approver's actual failure reason,
+    # not the generic malformed-decision tag (P3, review of c57d5d1).
+    assert approvals[0].detail["reason"] == (
+        "approver-error: RuntimeError: approver blew up"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +505,7 @@ def test_approval_decision_with_invalid_outcome_is_not_approved():
     approvals = [e for e in events if e.event is EventType.APPROVAL]
     assert approvals
     assert approvals[0].detail["approved"] is False
+    assert approvals[0].detail["reason"] == "invalid-approval-decision"
 
 
 def test_gate_does_not_fire_for_deterministic_actions_in_assisted():

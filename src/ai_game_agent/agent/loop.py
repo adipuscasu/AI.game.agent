@@ -60,22 +60,6 @@ from ai_game_agent.state import (
 __all__ = ["AgentLoop", "TickResult"]
 
 
-class _ApprovalRejected:
-    """Minimal stand-in for a rejection when the approver itself raised.
-
-    Structurally satisfies the ``is_approved``/``reason`` reads in
-    :meth:`AgentLoop._gate_ai_actions` without importing the approver
-    module into the loop (keeps the loop's dependency surface unchanged).
-    """
-
-    __slots__ = ("reason",)
-    is_approved = False
-    is_rejected = True
-
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-
-
 @dataclass(frozen=True)
 class TickResult:
     """Outcome of one :meth:`AgentLoop.tick` (for ``--once`` and replay tests).
@@ -388,7 +372,11 @@ class AgentLoop:
                 confidence=confidence,
             )
         except Exception as exc:  # noqa: BLE001 - an errored approver = reject
-            decision = _ApprovalRejected(
+            # P3 (review): use a genuine ApprovalDecision.rejected so the gate's
+            # strict validation classifies this as a rejection and the audit
+            # trail preserves the approver's actual failure reason instead of
+            # the generic "invalid-approval-decision" tag.
+            decision = ApprovalDecision.rejected(
                 reason=f"approver-error: {type(exc).__name__}: {exc}"
             )
 
