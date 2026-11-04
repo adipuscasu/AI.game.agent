@@ -634,12 +634,16 @@ def test_gate_is_bypassed_in_autonomous_mode_even_with_approver():
     assert not [e for e in events if e.event is EventType.APPROVAL]
 
 
-def test_assisted_without_approver_dispatches_ai_action():
-    """ASSISTED + no approver → the gate is a no-op; the AI action runs.
+def test_assisted_without_approver_is_fail_closed():
+    """ASSISTED + AI + no approver configured → the AI action is REFUSED.
 
-    Absence of an approver is "no gate to apply" (the loop returns True
-    when ``self._approver is None``); the input safety guarantee remains
-    the SafetyGuard at the executor, not a default rejection here.
+    F2 (readiness): the Phase-6 invariant is that an affirmative approval
+    decision is the *only* path to AI-action execution. "No approver
+    configured" is not the same as "everyone approved" — it means nobody
+    can answer, so the gate must fail CLOSED: reject, enter PAUSED, emit the
+    APPROVAL audit event with a meaningful reason, and dispatch nothing.
+    (Previously this path returned True — fail-open — which let AI actions
+    execute with no human in the loop.)
     """
     backend = MockBackend()
     ai = _FakeAI(decision=_ai_decision())
@@ -653,8 +657,44 @@ def test_assisted_without_approver_dispatches_ai_action():
         on_event=events.append,
     )
     report = loop.run()
-    assert report.actions_ok == 1
-    assert not [e for e in events if e.event is EventType.APPROVAL]
+    assert loop._machine.state is AgentState.PAUSED, (
+        "AI action executed without an approver — must pause"
+    )
+    assert report.final_state is AgentState.PAUSED
+    assert report.actions_attempted == 0, f"AI action dispatched: {report.actions_attempted}"
+    assert report.actions_ok == 0
+    assert ("press", "e") not in [ev[:2] for ev in backend.events]
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert approvals, "expected an APPROVAL audit event on the no-approver rejection"
+    assert approvals[0].detail["approved"] is False
+    assert approvals[0].detail["reason"] == "no-approver-configured"
+
+
+def test_autonomous_without_approver_still_dispatches_ai_action():
+    """AUTONOMOUS + AI + no approver → the action still dispatches.
+
+    The fail-closed rule is ASSISTED-scoped (the Phase-6 contract): AUTONOMOUS
+    mode executes every action by definition and must not be altered when
+    no approver is present. Control case for the fail-closed gate.
+    """
+    backend = MockBackend()
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[object] = []
+    loop = _loop(
+        mode=OperationMode.AUTONOMOUS,
+        approver=None,
+        backend=backend,
+        ai=ai,
+        max_ticks=2,
+        on_event=events.append,
+    )
+    report = loop.run()
+    assert report.actions_ok == 1, f"AUTONOMOUS no-approver path changed: {report.actions_ok}"
+    assert report.actions_attempted == 1
+    assert ("press", "e") in [ev[:2] for ev in backend.events]
+    assert not [e for e in events if e.event is EventType.APPROVAL], (
+        "no approver exists, so no APPROVAL audit event may be emitted"
+    )
 
 
 # ---------------------------------------------------------------------------

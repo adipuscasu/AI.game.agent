@@ -342,10 +342,15 @@ class AgentLoop:
         rejection returns ``None`` and halts the episode. Deterministic
         (non-AI) actions never reach this gate; they dispatch as in Phase 4.
 
-        Contract (fail-safe):
-          * Only consulted when ``mode is ASSISTED`` AND an approver is
-            injected. Under any other mode this is a no-op (returns ``True``),
-            so OBSERVE_ONLY / SEMI_AUTONOMOUS / AUTONOMOUS are unchanged.
+        Contract (fail-closed):
+          * Only consulted for AI-proposed actions. Under any mode other than
+            ``ASSISTED`` this is a no-op (returns ``True``), so
+            OBSERVE_ONLY / SEMI_AUTONOMOUS / AUTONOMOUS are unchanged.
+          * Under ``ASSISTED`` a *configured* approver is required for an AI
+            action to run. No approver is present → the gate REJECTS, safe-
+            halts (``PAUSED``) and emits an ``APPROVAL`` event with reason
+            ``no-approver-configured``. Absence of an approver is never
+            treated as blanket approval (fail-closed, not fail-open).
           * One approval request per batch (the AI seam emits exactly one
             action per decision), so a human answers once for the proposal.
           * A rejection enters ``PAUSED`` (safe halt, executor stopped) and
@@ -354,12 +359,49 @@ class AgentLoop:
           * An approver that raises is classified as a rejection (the agent
             never crashes on an "answer" — it refuses the action).
         """
-        if self._approver is None:
-            return True
         if self._mode is not OperationMode.ASSISTED:
             return True
         if not actions:
             return True
+
+        # Fail-closed (F2 readiness): under ASSISTED an AI action may execute
+        # only with an affirmative decision from a *configured* approver. The
+        # absence of an approver is not "everyone approved" — nobody can
+        # answer, so the gate rejects, safe-halts (PAUSED) and records the
+        # outcome for the audit trail. Non-ASSISTED modes returned above; the
+        # empty-batch guard is a defensive no-op (the AI seam always yields a
+        # 1-action batch).
+        if self._approver is None:
+            self._approvals_requested += 1
+            self._approvals_rejected += 1
+            action = actions[0]
+            self._emit(
+                self._event(
+                    event=EventType.APPROVAL,
+                    ts=now,
+                    state_before=self._machine.state,
+                    state_after=self._machine.state,
+                    reason="rejected: no-approver-configured",
+                    detail={
+                        "kind": action.kind.value,
+                        "approved": False,
+                        "reason": "no-approver-configured",
+                        "channel": "none",
+                        "confidence": confidence,
+                        "action": action.to_dict(),
+                        "reasoning": reasoning,
+                        "approvals_requested": self._approvals_requested,
+                        "approvals_granted": self._approvals_granted,
+                        "approvals_rejected": self._approvals_rejected,
+                    },
+                )
+            )
+            self._machine.enter(
+                AgentState.PAUSED,
+                reason="assisted approval unavailable (no approver); safe pause",
+                now=now,
+            )
+            return None
 
         self._approvals_requested += 1
         action = actions[0]
