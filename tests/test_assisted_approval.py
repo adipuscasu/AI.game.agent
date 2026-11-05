@@ -394,6 +394,57 @@ def test_raising_approver_is_classified_as_rejection():
     )
 
 
+def test_all_rejection_paths_share_one_safe_halt_contract():
+    """PR #7 (F1): every ASSISTED rejection path must safe-halt identically.
+
+    The no-approver, explicit-rejection, raising-approver, and malformed-
+    decision paths all route through the shared rejection tail; this pins
+    the contract they share: PAUSED state, nothing dispatched, exactly one
+    APPROVAL audit event with ``approved is False`` and a non-empty reason.
+    If the tail is ever deduplicated, moved, or refactored, this stays green.
+    """
+    from types import SimpleNamespace
+
+    class _RaisingApproverForContract:
+        name = "raising"
+
+        def request_approval(self, action, **kwargs):
+            raise RuntimeError("approver blew up")
+
+    scenarios = {
+        "no-approver": None,
+        "rejected": _ScriptedApprover(
+            (ApprovalDecision.rejected("human said no"),)
+        ),
+        "raising": _RaisingApproverForContract(),
+        "malformed": _MalformedApprover(SimpleNamespace(is_approved=True)),
+    }
+    for label, approver in scenarios.items():
+        backend = MockBackend()
+        ai = _FakeAI(decision=_ai_decision())
+        events: list[object] = []
+        loop = _loop(
+            mode=OperationMode.ASSISTED,
+            approver=approver,
+            backend=backend,
+            ai=ai,
+            max_ticks=3,
+            on_event=events.append,
+        )
+        report = loop.run()
+        assert loop._machine.state is AgentState.PAUSED, label
+        assert report.actions_attempted == 0, label
+        assert report.actions_ok == 0, label
+        assert ("press", "e") not in [ev[:2] for ev in backend.events], label
+        approvals = [e for e in events if e.event is EventType.APPROVAL]
+        assert len(approvals) == 1, (
+            f"{label}: expected exactly one APPROVAL audit event, "
+            f"got {len(approvals)}"
+        )
+        assert approvals[0].detail["approved"] is False, label
+        assert approvals[0].detail["reason"], label
+
+
 # ---------------------------------------------------------------------------
 # P2 (review) — the gate must not treat a *malformed* decision as approval.
 #

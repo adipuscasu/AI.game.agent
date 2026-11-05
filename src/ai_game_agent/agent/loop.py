@@ -383,39 +383,19 @@ class AgentLoop:
         # 1-action batch).
         if self._approver is None:
             self._approvals_requested += 1
-            self._approvals_rejected += 1
-            action = actions[0]
-            self._emit(
-                self._event(
-                    event=EventType.APPROVAL,
-                    ts=now,
-                    state_before=self._machine.state,
-                    state_after=self._machine.state,
-                    reason="rejected: no-approver-configured",
-                    detail={
-                        "kind": action.kind.value,
-                        "approved": False,
-                        "reason": "no-approver-configured",
-                        "channel": "none",
-                        "confidence": confidence,
-                        "action": action.to_dict(),
-                        "reasoning": reasoning,
-                        "approvals_requested": self._approvals_requested,
-                        "approvals_granted": self._approvals_granted,
-                        "approvals_rejected": self._approvals_rejected,
-                    },
-                )
-            )
-            self._machine.enter(
-                AgentState.PAUSED,
-                reason="assisted approval unavailable (no approver); safe pause",
+            self._reject_and_halt(
+                actions[0],
                 now=now,
+                reason="no-approver-configured",
+                channel="none",
+                reasoning=reasoning,
+                confidence=confidence,
+                paused_reason="assisted approval unavailable (no approver); safe pause",
             )
             return None
 
         self._approvals_requested += 1
         action = actions[0]
-        kind = action.kind.value
         channel = getattr(self._approver, "name", "approver")
         try:
             decision = self._approver.request_approval(
@@ -457,54 +437,112 @@ class AgentLoop:
         reason = decision.reason if valid_decision else "invalid-approval-decision"
         if approved:
             self._approvals_granted += 1
-        else:
-            self._approvals_rejected += 1
-
-        self._emit(
-            self._event(
-                event=EventType.APPROVAL,
-                ts=now,
-                state_before=self._machine.state,
-                state_after=self._machine.state,
-                reason="approved" if approved else f"rejected: {reason}",
-                detail={
-                    "kind": kind,
-                    "approved": approved,
-                    "reason": reason,
-                    "channel": channel,
-                    "confidence": confidence,
-                    # F3 (P2): record the *proposed action* (JSON-serializable
-                    # via to_dict()) and the model's *reasoning* so a reviewer
-                    # can answer "what did the agent try to do, and why?" from
-                    # the audit trail alone — not just the outcome.
-                    "action": action.to_dict(),
-                    "reasoning": reasoning,
-                    # P2 (review #2): record the cumulative assisted-gate
-                    # counters on each APPROVAL event, as the phase-6 plan
-                    # (docs/phase-6-implementation-plan.md §2) promises, so an
-                    # audit reader can reconstruct the running totals without
-                    # holding the loop instance. Additive keys — the existing
-                    # detail shape (kind/approved/reason/channel/...) is
-                    # unchanged for existing consumers.
-                    "approvals_requested": self._approvals_requested,
-                    "approvals_granted": self._approvals_granted,
-                    "approvals_rejected": self._approvals_rejected,
-                },
+            self._emit(
+                self._approval_event(
+                    action,
+                    now=now,
+                    approved=True,
+                    reason=reason,
+                    channel=channel,
+                    reasoning=reasoning,
+                    confidence=confidence,
+                )
             )
-        )
-        if approved:
             return True
 
-        # Rejection: safe-halt. Enter PAUSED so the run() loop exits on the
-        # same terminal-ish state it already knows, the executor is released,
-        # and the next tick is not re-dispatched. This is a *forced* move
-        # (machine.enter), not an observation-driven decide().
-        self._machine.enter(
-            AgentState.PAUSED,
-            reason="assisted approval rejected; safe pause",
+        # Rejection: safe-halt via the shared tail (counter, APPROVAL event,
+        # PAUSED) — the same contract as the no-approver path above.
+        self._reject_and_halt(
+            action,
             now=now,
+            reason=reason,
+            channel=channel,
+            reasoning=reasoning,
+            confidence=confidence,
+            paused_reason="assisted approval rejected; safe pause",
         )
         return None
+
+    def _approval_event(
+        self,
+        action: Action,
+        *,
+        now: float,
+        approved: bool,
+        reason: str,
+        channel: str,
+        reasoning: str,
+        confidence: float | None,
+    ):
+        """Build the ``APPROVAL`` audit event for a gate outcome.
+
+        Callers must increment the relevant counter *before* calling so the
+        event's ``detail`` carries the updated running totals.
+        """
+        return self._event(
+            event=EventType.APPROVAL,
+            ts=now,
+            state_before=self._machine.state,
+            state_after=self._machine.state,
+            reason="approved" if approved else f"rejected: {reason}",
+            detail={
+                "kind": action.kind.value,
+                "approved": approved,
+                "reason": reason,
+                "channel": channel,
+                "confidence": confidence,
+                # F3 (P2): record the *proposed action* (JSON-serializable
+                # via to_dict()) and the model's *reasoning* so a reviewer
+                # can answer "what did the agent try to do, and why?" from
+                # the audit trail alone — not just the outcome.
+                "action": action.to_dict(),
+                "reasoning": reasoning,
+                # P2 (review #2): record the cumulative assisted-gate
+                # counters on each APPROVAL event, as the phase-6 plan
+                # (docs/phase-6-implementation-plan.md §2) promises, so an
+                # audit reader can reconstruct the running totals without
+                # holding the loop instance. Additive keys — the existing
+                # detail shape (kind/approved/reason/channel/...) is
+                # unchanged for existing consumers.
+                "approvals_requested": self._approvals_requested,
+                "approvals_granted": self._approvals_granted,
+                "approvals_rejected": self._approvals_rejected,
+            },
+        )
+
+    def _reject_and_halt(
+        self,
+        action: Action,
+        *,
+        now: float,
+        reason: str,
+        channel: str,
+        reasoning: str,
+        confidence: float | None,
+        paused_reason: str,
+    ) -> None:
+        """Shared safe-halt tail for every ASSISTED rejection path.
+
+        Records the rejection, emits the ``APPROVAL`` audit event, and
+        enters ``PAUSED`` (a *forced* move via ``machine.enter`` — not an
+        observation-driven ``decide()``) so the run() loop exits, the
+        executor is released, and the batch is not dispatched. The
+        no-approver and rejected-decision paths both route through here so
+        the safe-halt contract has exactly one source of truth.
+        """
+        self._approvals_rejected += 1
+        self._emit(
+            self._approval_event(
+                action,
+                now=now,
+                approved=False,
+                reason=reason,
+                channel=channel,
+                reasoning=reasoning,
+                confidence=confidence,
+            )
+        )
+        self._machine.enter(AgentState.PAUSED, reason=paused_reason, now=now)
 
     # ---- pipeline failure handling -----------------------------------------
 
