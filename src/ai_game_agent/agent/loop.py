@@ -284,19 +284,27 @@ class AgentLoop:
             else:
                 results = self._dispatch(actions, now)
 
+        # Re-read the authoritative state AFTER the approval gate: _gate_ai_actions
+        # can force the machine into PAUSED (an ASSISTED rejection safe-halt). The
+        # `state` snapshot above was captured BEFORE the gate, so it is stale on the
+        # rejection path — the TICK event and TickResult must report the machine's
+        # actual final state, not the pre-gate snapshot. For a normal tick (no
+        # transition) final_state == state and state_before == state_after.
+        final_state = self._machine.state
+
         zones = {h.zone: h.value for h in observation.ui_zones}
         self._emit(
             self._event(
                 event=EventType.TICK,
                 ts=now,
                 state_before=state,
-                state_after=state,
-                reason=f"tick @ {state.value}",
-                detail={"zones": zones, "state": state.value},
+                state_after=final_state,
+                reason=f"tick @ {final_state.value}",
+                detail={"zones": zones, "state": final_state.value},
             )
         )
         return TickResult(
-            observation=observation, state=state, actions=actions, results=results
+            observation=observation, state=final_state, actions=actions, results=results
         )
 
     # ---- action dispatch ----------------------------------------------------

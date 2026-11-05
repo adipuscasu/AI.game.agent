@@ -32,7 +32,12 @@ import threading
 
 import pytest
 
-from ai_game_agent.actions import Executor, OperationMode, SafetyGuard
+from ai_game_agent.actions import (
+    ApprovalDecision,
+    Executor,
+    OperationMode,
+    SafetyGuard,
+)
 from ai_game_agent.actions.hotkey import FakeHotkeyListener
 from ai_game_agent.actions.mock import MockBackend
 from ai_game_agent.agent import AgentLoop, AgentLoopReport
@@ -1046,3 +1051,146 @@ def test_ai_prompt_failure_routes_to_recovery_not_raised(make_loop, action_backe
     assert machine.state is AgentState.RECOVERY
     assert action_backend.events == []
     assert action_backend.events == []
+
+
+# --- PR #7: stale state reporting after approval rejection -----------------
+# tick() captured the state BEFORE _gate_ai_actions(). When the gate rejects
+# an ASSISTED AI action, _reject_and_halt() forces the machine into PAUSED, but
+# the TICK event and TickResult still reported the pre-gate snapshot (typically
+# AI_ANALYSIS) -- so the machine/STATE_ENTER said PAUSED while the TICK event and
+# TickResult said AI_ANALYSIS. These pin the fix: after the gate, the machine's
+# actual final state must flow into TICK.state_after, TICK.reason,
+# TICK.detail["state"], and TickResult.state -- while state_before keeps the
+# pre-gate state and the no-transition happy path keeps before == after.
+
+
+class _RejectingApprover:
+    """Duck-typed Approver that always rejects (the explicit-rejection seam)."""
+
+    name = "rejecting"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def request_approval(self, action, **kwargs) -> ApprovalDecision:
+        self.calls += 1
+        return ApprovalDecision.rejected("human said no")
+
+
+def _loop_in_ai_analysis_assisted(
+    make_loop, action_backend, *, mode, ai=None, approver=None, on_event=None
+):
+    """Build a loop in AI_ANALYSIS (real executor + policy) with an approver.
+
+    Mirrors :func:`_loop_in_ai_analysis` (a real 1x1 Frame capture so the AI
+    seam's PNG encode works) but adds the Phase-6 approver seam and an event
+    sink so the tests can inspect the final TICK event.
+    """
+    machine = GameStateMachine(
+        policy=_StubDecisionPolicy(), initial=AgentState.AI_ANALYSIS
+    )
+    loop = make_loop(mode=mode, machine=machine, on_event=on_event)
+    if ai is not None:
+        loop._ai = ai
+    loop._approver = approver
+    loop._capture = type(loop._capture)(frame=Frame(1, 1, b"\x00" * 3, _DT, "screen"))
+    return loop
+
+
+def _final_tick(events: list[LoopEvent]) -> LoopEvent:
+    """The single TICK event for one tick (distinct from APPROVAL/STATE_ENTER)."""
+    ticks = [e for e in events if e.event is EventType.TICK]
+    assert len(ticks) == 1, f"expected exactly one TICK event, got {len(ticks)}"
+    return ticks[0]
+
+
+def test_rejection_reports_paused_in_tick_and_result(make_loop, action_backend) -> None:
+    """Explicit approval rejection: TICK and TickResult must both report
+    PAUSED (state_after / reason / detail), while state_before stays the
+    pre-gate state (AI_ANALYSIS).
+    """
+    ai = _FakeAI(decision=_ai_decision())
+    approver = _RejectingApprover()
+    events: list[LoopEvent] = []
+    loop = _loop_in_ai_analysis_assisted(
+        make_loop, action_backend,
+        mode=OperationMode.ASSISTED, ai=ai, approver=approver,
+        on_event=events.append,
+    )
+    result = loop.tick()
+
+    # Safe-halt contract unchanged: the machine ended PAUSED.
+    assert loop._machine.state is AgentState.PAUSED
+    assert approver.calls == 1, "the APPROVER must be consulted on the AI path"
+
+    tick = _final_tick(events)
+    assert tick.state_before is AgentState.AI_ANALYSIS, (
+        f"state_before must be the pre-gate state (AI_ANALYSIS), "
+        f"got {tick.state_before!r}"
+    )
+    assert tick.state_after is AgentState.PAUSED, (
+        f"state_after must be the post-gate safe-halt (PAUSED), "
+        f"got {tick.state_after!r}"
+    )
+    assert tick.detail.get("state") == "paused", (
+        f"detail['state'] must be 'paused', got {tick.detail.get('state')!r}"
+    )
+    assert "paused" in tick.reason, (
+        f"TICK reason must reflect the final state (paused), got {tick.reason!r}"
+    )
+
+    # The returned TickResult must agree with the machine's final state.
+    assert result.state is AgentState.PAUSED, (
+        f"TickResult.state must be PAUSED, got {result.state!r}"
+    )
+
+    # The batch was NOT dispatched (safe-halt) -- regression guard.
+    assert action_backend.events == []
+
+
+def test_no_approver_rejection_reports_paused(make_loop, action_backend) -> None:
+    """no-approver-configured (fail-closed) rejection: the same final-state
+    reporting contract as the explicit-rejection path.
+    """
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[LoopEvent] = []
+    loop = _loop_in_ai_analysis_assisted(
+        make_loop, action_backend,
+        mode=OperationMode.ASSISTED, ai=ai, approver=None,
+        on_event=events.append,
+    )
+    result = loop.tick()
+
+    assert loop._machine.state is AgentState.PAUSED
+    tick = _final_tick(events)
+    assert tick.state_before is AgentState.AI_ANALYSIS
+    assert tick.state_after is AgentState.PAUSED
+    assert tick.detail.get("state") == "paused"
+    assert result.state is AgentState.PAUSED
+
+    # The fail-closed reason is still recorded (approval contract unchanged).
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert len(approvals) == 1
+    assert approvals[0].detail["approved"] is False
+    assert approvals[0].detail["reason"] == "no-approver-configured"
+    assert action_backend.events == []
+
+
+def test_normal_tick_state_before_equals_after(make_loop, action_backend) -> None:
+    """A tick WITHOUT a state transition must keep state_before ==
+    state_after (the fix must not perturb the happy path)."""
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[LoopEvent] = []
+    loop = _loop_in_ai_analysis_assisted(
+        make_loop, action_backend,
+        mode=OperationMode.AUTONOMOUS, ai=ai,  # no gate -> no transition
+        on_event=events.append,
+    )
+    action_backend.open()
+    result = loop.tick()
+
+    tick = _final_tick(events)
+    assert tick.state_before is AgentState.AI_ANALYSIS
+    assert tick.state_after is AgentState.AI_ANALYSIS
+    assert tick.state_before is tick.state_after
+    assert result.state is AgentState.AI_ANALYSIS
