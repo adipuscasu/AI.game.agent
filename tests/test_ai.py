@@ -760,6 +760,93 @@ class TestOllamaRequestShape:
             server.stop()
 
 
+class TestDecideImageGrounding:
+    """F1 (readiness): the ``decide()`` seam — image grounding must work
+    alongside the structured-output contract: the grounded image is base64-
+    encoded into ``payload["images"]``, JSON mode is still forced, and a
+    validated :class:`AIDecision` comes back."""
+
+    @staticmethod
+    def _decision_response():
+        return {"response": json.dumps(
+            {"action": {"kind": "mouse_click", "schema_version": 1},
+             "reasoning": "r", "confidence": 0.9})}
+
+    def test_decide_with_image_sends_images_and_json_mode(self):
+        from ai_game_agent.ai import OllamaProvider
+
+        server = _ScriptedOllamaServer(response=self._decision_response())
+        base_url = server.start()
+        try:
+            p = OllamaProvider(model="m", base_url=base_url, timeout=5.0)
+            img = _png_bytes()
+            out = p.decide("choose", image=img)
+            assert out.action.kind.value == "mouse_click"
+
+            req = server.requests[-1]
+            assert req["path"] == "/api/generate"
+            assert req["payload"]["format"] == "json"
+            assert len(req["payload"]["images"]) == 1
+            decoded = base64.b64decode(req["payload"]["images"][0])
+            assert decoded == img
+        finally:
+            server.stop()
+
+    def test_decide_with_image_and_format_schema(self):
+        from ai_game_agent.ai import OllamaProvider
+
+        server = _ScriptedOllamaServer(response=self._decision_response())
+        base_url = server.start()
+        try:
+            p = OllamaProvider(model="m", base_url=base_url, timeout=5.0)
+            schema = {"type": "object", "properties": {}}
+            p.decide("choose", image=_png_bytes(), format_schema=schema)
+            req = server.requests[-1]
+            assert req["payload"]["format"] == schema
+            assert len(req["payload"]["images"]) == 1
+        finally:
+            server.stop()
+
+    def test_decide_without_image_omits_images_key(self):
+        from ai_game_agent.ai import OllamaProvider
+
+        server = _ScriptedOllamaServer(response=self._decision_response())
+        base_url = server.start()
+        try:
+            p = OllamaProvider(model="m", base_url=base_url, timeout=5.0)
+            p.decide("choose")
+            req = server.requests[-1]
+            assert "images" not in req["payload"]
+        finally:
+            server.stop()
+
+    def test_decide_unsupported_image_mime_raises_without_http(self):
+        from ai_game_agent.ai import AIError, OllamaProvider
+
+        server = _ScriptedOllamaServer()
+        base_url = server.start()
+        try:
+            p = OllamaProvider(model="m", base_url=base_url, timeout=5.0)
+            with pytest.raises(AIError):
+                p.decide("x", image=b"png", image_mime="image/tiff")
+            assert server.requests == [], "mime rejection must happen pre-flight"
+        finally:
+            server.stop()
+
+    def test_decide_image_non_bytes_raises(self):
+        from ai_game_agent.ai import AIError, OllamaProvider
+
+        server = _ScriptedOllamaServer()
+        base_url = server.start()
+        try:
+            p = OllamaProvider(model="m", base_url=base_url, timeout=5.0)
+            with pytest.raises(AIError):
+                p.decide("x", image="not-bytes")  # type: ignore[arg-type]
+            assert server.requests == []
+        finally:
+            server.stop()
+
+
 class TestOllamaResponseParsing:
     def test_decide_strips_markdown_fence(self):
         from ai_game_agent.ai import OllamaProvider

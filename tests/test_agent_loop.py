@@ -32,11 +32,16 @@ import threading
 
 import pytest
 
-from ai_game_agent.actions import Executor, OperationMode, SafetyGuard
+from ai_game_agent.actions import (
+    ApprovalDecision,
+    Executor,
+    OperationMode,
+    SafetyGuard,
+)
 from ai_game_agent.actions.hotkey import FakeHotkeyListener
 from ai_game_agent.actions.mock import MockBackend
 from ai_game_agent.agent import AgentLoop, AgentLoopReport
-from ai_game_agent.capture import CaptureError
+from ai_game_agent.capture import CaptureError, Frame
 from ai_game_agent.games.wow import (
     ZONE_LOOT_GLOW,
     ZONE_TARGET,
@@ -47,6 +52,7 @@ from ai_game_agent.perception import BBox, Observation, UiZoneHit
 from ai_game_agent.state import AgentState, EventType, GameStateMachine, LoopEvent
 
 TS = datetime.datetime(2026, 10, 14, tzinfo=datetime.UTC)
+_DT = datetime.datetime(2025, 1, 1, tzinfo=datetime.UTC)
 _BB = BBox(x=10, y=10, width=20, height=10)
 
 
@@ -78,12 +84,13 @@ def _observation(
 class _FakeCapture:
     """Duck-typed capture: the loop only needs start/stop/grab/wait_next_frame."""
 
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, frame=None) -> None:
         self.fail = fail
         self.grab_count = 0
         self.wait_count = 0
         self.started = False
         self.stopped = False
+        self._frame = frame
 
     def start(self) -> None:
         self.started = True
@@ -95,7 +102,13 @@ class _FakeCapture:
         self.grab_count += 1
         if self.fail:
             raise CaptureError("scripted capture failure (test)")
-        return object()  # the fake perception ignores the frame payload
+        if self._frame is not None:
+            return self._frame
+        # F1b: the loop image-encodes every grabbed frame before AI decide();
+        # the default must be a real Frame, not a bare object().
+        return Frame(
+            width=1, height=1, pixels=b"\x00\x00\x00", captured_at=TS, source="test"
+        )
 
     def wait_next_frame(self) -> float:
         self.wait_count += 1
@@ -626,17 +639,25 @@ def test_final_tick_paused_outranks_max_ticks(make_loop) -> None:
 
 
 class _FakeAI:
-    """Duck-typed AIProvider: decide() returns a fixed decision or raises."""
+    """Duck-typed AIProvider: decide() returns a fixed decision or raises.
+
+    Records ``image`` / ``image_mime`` kwargs so tests can assert the loop
+    passes the captured frame's PNG bytes (F1b contract).
+    """
 
     def __init__(self, decision=None, error=None) -> None:
         self._decision = decision
         self._error = error
         self.decide_calls = 0
         self.last_prompt = None
+        self.last_image: bytes | None = None
+        self.last_image_mime: str | None = None
 
     def decide(self, prompt, **kwargs):
         self.decide_calls += 1
         self.last_prompt = prompt
+        self.last_image = kwargs.get("image")
+        self.last_image_mime = kwargs.get("image_mime")
         if self._error is not None:
             raise self._error
         return self._decision
@@ -657,6 +678,9 @@ def _loop_in_ai_analysis(make_loop, action_backend, *, mode, ai=None):
     loop = make_loop(mode=mode, machine=machine)
     if ai is not None:
         loop._ai = ai
+    # F1b: the AI seam encodes the captured frame to PNG, so the default
+    # object() capture must be a real Frame (1x1) for these tests.
+    loop._capture = type(loop._capture)(frame=Frame(1, 1, b"\x00" * 3, _DT, "screen"))
     return loop
 
 
@@ -692,6 +716,183 @@ def test_ai_observe_only_zero_backend_events(make_loop, action_backend) -> None:
                                 mode=OperationMode.OBSERVE_ONLY, ai=ai)
     loop.tick()
     # The AI may be consulted, but OBSERVE_ONLY must emit zero OS input.
+    assert action_backend.events == []
+
+
+# --- F1b: visual grounding — the captured Frame reaches decide() as PNG ----
+
+def test_decide_receives_frame_png_bytes(make_loop, action_backend) -> None:
+    """F1b: the loop encodes the Frame and passes PNG bytes to decide()."""
+    import io
+    from datetime import datetime
+
+    # Pillow is an optional dependency (the ``capture`` / ``ocr`` / ``dev``
+    # extras, not the core package). Guard on it with the proper optional-
+    # dependency mechanism so the test SKIPS (not errors) in a bare venv.
+    Image = pytest.importorskip(
+        "PIL.Image", reason="Pillow is the capture/ocr/dev extra (optional)"
+    )
+
+    # The expected PNG payload is what Frame.to_png_bytes() must produce
+    # (Pillow output is deterministic): encode the known 1x1 frame and compare
+    # it byte-for-byte against the image the loop hands to decide().
+    expected_png = Frame(1, 1, b"\x00" * 3, datetime(2025, 1, 1), "screen").to_png_bytes()
+    frame = Frame(1, 1, b"\x00" * 3, datetime(2025, 1, 1), "screen")
+    cap = _FakeCapture(frame=frame)
+
+    ai = _FakeAI(decision=_ai_decision())
+    machine = GameStateMachine(policy=_StubDecisionPolicy(), initial=AgentState.AI_ANALYSIS)
+    loop = make_loop(mode=OperationMode.AUTONOMOUS, machine=machine,
+                     capture=cap, ai=ai)
+    loop.tick()
+
+    assert ai.decide_calls == 1
+    # F1b contract: image kwarg is the frame's PNG bytes, not None.
+    assert ai.last_image is not None, (
+        "F1b violation: decide() was not passed the frame's PNG bytes "
+        "(image=None). The loop must encode the Frame and pass image=<bytes>."
+    )
+    assert ai.last_image == expected_png, "image must be the frame's PNG bytes"
+    assert ai.last_image_mime == "image/png"
+    # The PNG must be valid: Pillow can decode it back.
+    dec = Image.open(io.BytesIO(ai.last_image))
+    assert dec.format == "PNG"
+
+
+def test_decide_encoding_failure_routes_to_recovery(make_loop, action_backend) -> None:
+    """F1b: if Frame.to_png_bytes() raises, the failure is classified as an
+    AI-stage failure, routed to bounded RECOVERY (never a silent
+    image=None fallback), and decide() is never called.
+
+    This pins the *actual* recovery contract (not just "didn't raise"):
+    encoding and provider.decide() share the same classified "ai" stage, so
+    an encoding failure takes the identical path a provider failure would —
+    one bounded RECOVERY attempt (state is RECOVERY on this tick, not PAUSED
+    yet), a RECOVERY LoopEvent with stage="ai", a STATE_ENTER transition into
+    RECOVERY, and zero input dispatch. The transition is *immediate* on this
+    tick (the machine enters RECOVERY inside _on_pipeline_error before the
+    recovery-exhaustion check), so we assert result.state is RECOVERY rather
+    than merely "not PAUSED".
+    """
+    from datetime import datetime
+
+    class _UnencodableFrame(Frame):
+        def to_png_bytes(self) -> bytes:
+            raise RuntimeError("simulated encoding failure")
+
+    frame = _UnencodableFrame(1, 1, b"\x00" * 3, datetime(2025, 1, 1), "screen")
+    cap = _FakeCapture(frame=frame)
+
+    ai = _FakeAI(decision=_ai_decision())
+    machine = GameStateMachine(policy=_StubDecisionPolicy(), initial=AgentState.AI_ANALYSIS)
+    events: list[LoopEvent] = []
+    loop = make_loop(
+        mode=OperationMode.AUTONOMOUS, machine=machine,
+        capture=cap, ai=ai, on_event=events.append,
+    )
+    result = loop.tick()
+
+    # Bounded RECOVERY: the machine enters RECOVERY on this tick (bounded,
+    # recovery_attempts=3 so it is NOT yet PAUSED). The transition is
+    # immediate, not deferred to a later loop operation.
+    assert result.state is AgentState.RECOVERY, (
+        "F1b violation: an encoding failure must route to bounded RECOVERY "
+        f"on the failing tick (got {result.state!r})"
+    )
+    assert machine.state is AgentState.RECOVERY
+    assert result.state is not AgentState.PAUSED
+
+    # Classified as an AI-stage failure (shared with provider.decide()): the
+    # error string carries the "ai" stage and the recorded RECOVERY event
+    # records detail.stage == "ai".
+    assert result.error is not None
+    assert "ai failed" in result.error
+    recovery_events = [e for e in events if e.event is EventType.RECOVERY]
+    assert len(recovery_events) == 1, "exactly one RECOVERY event for one failure"
+    ev = recovery_events[0]
+    assert ev.detail.get("stage") == "ai", (
+        "F1b violation: an encoding failure must be classified on the "
+        f"'ai' stage (got {ev.detail.get('stage')!r})"
+    )
+    assert "simulated encoding failure" in ev.reason
+    assert ev.state_before is AgentState.AI_ANALYSIS
+    assert ev.state_after is AgentState.RECOVERY
+
+    # The machine's own transition seam fired: AI_ANALYSIS -> RECOVERY.
+    state_entries = [e for e in loop._transitions if e.event is EventType.STATE_ENTER]
+    assert any(
+        e.state_before is AgentState.AI_ANALYSIS and e.state_after is AgentState.RECOVERY
+        for e in state_entries
+    ), "the machine must transition AI_ANALYSIS -> RECOVERY on the encoding failure"
+
+    # Bounded: one recovery attempt is counted (not exhausted), so the
+    # machine stays in RECOVERY until recovery_attempts elapse.
+    assert machine.recovery_count == 1
+
+    # The provider's decide() must NEVER be called when encoding fails —
+    # there is no silent image=None fallback.
+    assert ai.decide_calls == 0, (
+        "F1b violation: decide() must not be called when to_png_bytes() "
+        f"fails (got {ai.decide_calls} call(s))"
+    )
+
+    # No input is dispatched on the failure path.
+    assert action_backend.events == []
+
+
+def test_non_frame_grab_classified_as_capture_stage(make_loop, action_backend) -> None:
+    """Review F4: a backend that violates ``grab() -> Frame`` is a
+    capture-layer failure, not an "ai" failure.
+
+    Without the contract check, a non-Frame object flows into the AI seam
+    and raises AttributeError at encode time — misclassified on the "ai"
+    stage in the audit trail. The loop must check the capture contract at
+    the grab boundary and route the violation to bounded RECOVERY with
+    stage="capture"; the provider is never consulted and no input is
+    dispatched.
+    """
+
+    class _NotAFrame:
+        """Stand-in for a backend return value that breaks the grab() contract."""
+
+    cap = _FakeCapture(frame=_NotAFrame())
+    ai = _FakeAI(decision=_ai_decision())
+    machine = GameStateMachine(policy=_StubDecisionPolicy(), initial=AgentState.AI_ANALYSIS)
+    events: list[LoopEvent] = []
+    loop = make_loop(
+        mode=OperationMode.AUTONOMOUS, machine=machine,
+        capture=cap, ai=ai, on_event=events.append,
+    )
+    result = loop.tick()
+
+    # Bounded RECOVERY on the failing tick (not PAUSED yet, not raised).
+    assert result.state is AgentState.RECOVERY, (
+        "a non-Frame grab must route to bounded RECOVERY "
+        f"(got {result.state!r})"
+    )
+    assert result.state is not AgentState.PAUSED
+
+    # Classified on the capture stage, not "ai": the error string and the
+    # RECOVERY event detail both carry stage="capture".
+    assert result.error is not None
+    assert "capture failed" in result.error, (
+        "a non-Frame grab must be classified on the 'capture' stage "
+        f"(got error: {result.error!r})"
+    )
+    recovery_events = [e for e in events if e.event is EventType.RECOVERY]
+    assert len(recovery_events) == 1, "exactly one RECOVERY event for one failure"
+    ev = recovery_events[0]
+    assert ev.detail.get("stage") == "capture", (
+        "a non-Frame grab must be classified on the 'capture' stage "
+        f"(got {ev.detail.get('stage')!r})"
+    )
+
+    # The provider is never consulted — the failure precedes the AI seam.
+    assert ai.decide_calls == 0, (
+        "a non-Frame grab must not reach provider.decide() "
+        f"(got {ai.decide_calls} call(s))"
+    )
+    # No input is dispatched on the failure path.
     assert action_backend.events == []
 
 
@@ -767,7 +968,9 @@ def test_ai_consulted_once_per_ai_analysis_episode(make_loop, action_backend) ->
         policy=_StubDecisionPolicy(), initial=AgentState.AI_ANALYSIS
     )
     ai = _FakeAI(decision=_ai_decision())
-    loop = make_loop(mode=OperationMode.AUTONOMOUS, machine=machine, ai=ai)
+    capture = _FakeCapture(frame=Frame(1, 1, b"\x00" * 3, _DT, "screen"))
+    loop = make_loop(mode=OperationMode.AUTONOMOUS, machine=machine, ai=ai,
+                     capture=capture)
     action_backend.open()
     # The fixed 0.0 clock never trips the watchdog, so the state persists
     # across all three ticks — exactly the persistent-episode scenario.
@@ -813,8 +1016,10 @@ def test_ai_reconsulted_on_new_episode(make_loop, action_backend) -> None:
         initial=AgentState.AI_ANALYSIS,
     )
     ai = _FakeAI(decision=_ai_decision())
+    capture = _FakeCapture(frame=Frame(1, 1, b"\x00" * 3, _DT, "screen"))
     loop = make_loop(
-        mode=OperationMode.AUTONOMOUS, perception=perception, machine=machine, ai=ai
+        mode=OperationMode.AUTONOMOUS, perception=perception, machine=machine,
+        ai=ai, capture=capture,
     )
     action_backend.open()
     for _ in range(4):
@@ -846,3 +1051,146 @@ def test_ai_prompt_failure_routes_to_recovery_not_raised(make_loop, action_backe
     assert machine.state is AgentState.RECOVERY
     assert action_backend.events == []
     assert action_backend.events == []
+
+
+# --- PR #7: stale state reporting after approval rejection -----------------
+# tick() captured the state BEFORE _gate_ai_actions(). When the gate rejects
+# an ASSISTED AI action, _reject_and_halt() forces the machine into PAUSED, but
+# the TICK event and TickResult still reported the pre-gate snapshot (typically
+# AI_ANALYSIS) -- so the machine/STATE_ENTER said PAUSED while the TICK event and
+# TickResult said AI_ANALYSIS. These pin the fix: after the gate, the machine's
+# actual final state must flow into TICK.state_after, TICK.reason,
+# TICK.detail["state"], and TickResult.state -- while state_before keeps the
+# pre-gate state and the no-transition happy path keeps before == after.
+
+
+class _RejectingApprover:
+    """Duck-typed Approver that always rejects (the explicit-rejection seam)."""
+
+    name = "rejecting"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def request_approval(self, action, **kwargs) -> ApprovalDecision:
+        self.calls += 1
+        return ApprovalDecision.rejected("human said no")
+
+
+def _loop_in_ai_analysis_assisted(
+    make_loop, action_backend, *, mode, ai=None, approver=None, on_event=None
+):
+    """Build a loop in AI_ANALYSIS (real executor + policy) with an approver.
+
+    Mirrors :func:`_loop_in_ai_analysis` (a real 1x1 Frame capture so the AI
+    seam's PNG encode works) but adds the Phase-6 approver seam and an event
+    sink so the tests can inspect the final TICK event.
+    """
+    machine = GameStateMachine(
+        policy=_StubDecisionPolicy(), initial=AgentState.AI_ANALYSIS
+    )
+    loop = make_loop(mode=mode, machine=machine, on_event=on_event)
+    if ai is not None:
+        loop._ai = ai
+    loop._approver = approver
+    loop._capture = type(loop._capture)(frame=Frame(1, 1, b"\x00" * 3, _DT, "screen"))
+    return loop
+
+
+def _final_tick(events: list[LoopEvent]) -> LoopEvent:
+    """The single TICK event for one tick (distinct from APPROVAL/STATE_ENTER)."""
+    ticks = [e for e in events if e.event is EventType.TICK]
+    assert len(ticks) == 1, f"expected exactly one TICK event, got {len(ticks)}"
+    return ticks[0]
+
+
+def test_rejection_reports_paused_in_tick_and_result(make_loop, action_backend) -> None:
+    """Explicit approval rejection: TICK and TickResult must both report
+    PAUSED (state_after / reason / detail), while state_before stays the
+    pre-gate state (AI_ANALYSIS).
+    """
+    ai = _FakeAI(decision=_ai_decision())
+    approver = _RejectingApprover()
+    events: list[LoopEvent] = []
+    loop = _loop_in_ai_analysis_assisted(
+        make_loop, action_backend,
+        mode=OperationMode.ASSISTED, ai=ai, approver=approver,
+        on_event=events.append,
+    )
+    result = loop.tick()
+
+    # Safe-halt contract unchanged: the machine ended PAUSED.
+    assert loop._machine.state is AgentState.PAUSED
+    assert approver.calls == 1, "the APPROVER must be consulted on the AI path"
+
+    tick = _final_tick(events)
+    assert tick.state_before is AgentState.AI_ANALYSIS, (
+        f"state_before must be the pre-gate state (AI_ANALYSIS), "
+        f"got {tick.state_before!r}"
+    )
+    assert tick.state_after is AgentState.PAUSED, (
+        f"state_after must be the post-gate safe-halt (PAUSED), "
+        f"got {tick.state_after!r}"
+    )
+    assert tick.detail.get("state") == "paused", (
+        f"detail['state'] must be 'paused', got {tick.detail.get('state')!r}"
+    )
+    assert "paused" in tick.reason, (
+        f"TICK reason must reflect the final state (paused), got {tick.reason!r}"
+    )
+
+    # The returned TickResult must agree with the machine's final state.
+    assert result.state is AgentState.PAUSED, (
+        f"TickResult.state must be PAUSED, got {result.state!r}"
+    )
+
+    # The batch was NOT dispatched (safe-halt) -- regression guard.
+    assert action_backend.events == []
+
+
+def test_no_approver_rejection_reports_paused(make_loop, action_backend) -> None:
+    """no-approver-configured (fail-closed) rejection: the same final-state
+    reporting contract as the explicit-rejection path.
+    """
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[LoopEvent] = []
+    loop = _loop_in_ai_analysis_assisted(
+        make_loop, action_backend,
+        mode=OperationMode.ASSISTED, ai=ai, approver=None,
+        on_event=events.append,
+    )
+    result = loop.tick()
+
+    assert loop._machine.state is AgentState.PAUSED
+    tick = _final_tick(events)
+    assert tick.state_before is AgentState.AI_ANALYSIS
+    assert tick.state_after is AgentState.PAUSED
+    assert tick.detail.get("state") == "paused"
+    assert result.state is AgentState.PAUSED
+
+    # The fail-closed reason is still recorded (approval contract unchanged).
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert len(approvals) == 1
+    assert approvals[0].detail["approved"] is False
+    assert approvals[0].detail["reason"] == "no-approver-configured"
+    assert action_backend.events == []
+
+
+def test_normal_tick_state_before_equals_after(make_loop, action_backend) -> None:
+    """A tick WITHOUT a state transition must keep state_before ==
+    state_after (the fix must not perturb the happy path)."""
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[LoopEvent] = []
+    loop = _loop_in_ai_analysis_assisted(
+        make_loop, action_backend,
+        mode=OperationMode.AUTONOMOUS, ai=ai,  # no gate -> no transition
+        on_event=events.append,
+    )
+    action_backend.open()
+    result = loop.tick()
+
+    tick = _final_tick(events)
+    assert tick.state_before is AgentState.AI_ANALYSIS
+    assert tick.state_after is AgentState.AI_ANALYSIS
+    assert tick.state_before is tick.state_after
+    assert result.state is AgentState.AI_ANALYSIS

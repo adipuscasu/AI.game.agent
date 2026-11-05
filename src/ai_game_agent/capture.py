@@ -65,6 +65,60 @@ class Frame:
 
         return Image.frombytes("RGB", (self.width, self.height), self.pixels)
 
+    def to_png_bytes(self) -> bytes:
+        """Encode this frame as PNG and return the bytes.
+
+        Uses Pillow (deferred import, optional dependency). The PNG is the
+        canonical wire format for passing frames to AI providers (F1b).
+
+        Validates the frame *before* encoding: dimensions must be positive
+        and the pixel buffer must be exactly ``width * height * 3`` bytes.
+        Pillow would silently truncate an oversized buffer, so the length
+        check is explicit and rejects both short and oversized payloads.
+
+        Raises:
+            CaptureError: if the frame is invalid, Pillow is unavailable,
+                or encoding fails.
+        """
+        if self.width <= 0 or self.height <= 0:
+            raise CaptureError(
+                f"frame dimensions must be positive, got "
+                f"{self.width}x{self.height}"
+            )
+        if not isinstance(self.pixels, (bytes, bytearray, memoryview)):
+            raise CaptureError(
+                f"frame pixels must be bytes, got {type(self.pixels).__name__}"
+            )
+        expected = self.width * self.height * 3
+        # A memoryview's ``len()`` counts *elements*, not bytes (e.g. a view
+        # cast to 2-byte shorts: len()=3 over 6 bytes). bytes/bytearray are
+        # 1 element per byte, so ``len()`` == byte count for them. Validate on
+        # the true byte length: ``.nbytes`` for memoryview, ``len()`` otherwise.
+        if isinstance(self.pixels, memoryview):
+            actual = self.pixels.nbytes
+        else:
+            actual = len(self.pixels)
+        if actual != expected:
+            raise CaptureError(
+                f"frame pixel buffer size mismatch: expected {expected} bytes "
+                f"for {self.width}x{self.height}, got {actual}"
+            )
+        try:
+            from PIL import Image  # deferred: PIL is optional at import time
+        except ImportError as exc:
+            raise CaptureError(
+                "Pillow is required for Frame.to_png_bytes() but is not installed. "
+                "Install it with: uv sync --extra capture  (or: pip install Pillow)"
+            ) from exc
+        try:
+            img = Image.frombytes("RGB", (self.width, self.height), bytes(self.pixels))
+            import io
+            buf = io.BytesIO()
+            img.save(buf, "PNG")
+            return buf.getvalue()
+        except Exception as exc:
+            raise CaptureError(f"PNG encoding failed: {exc}") from exc
+
     def region(self, x: int, y: int, width: int, height: int) -> Frame:
         """Extract a sub-region of this frame as a new frame.
 

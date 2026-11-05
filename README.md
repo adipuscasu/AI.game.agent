@@ -82,6 +82,8 @@ uv sync --extra dev
 
 `uv sync` installs the project in editable mode into `.venv/` and activates it for all `uv run` commands below.
 
+> **Note:** AI mode (the `ai:` provider consulted in `AI_ANALYSIS`) additionally requires Pillow to encode the captured frame for the VLM — it ships with the `dev` and `capture` extras above. Without it an AI consult fails closed with a clear install hint, not a silent text-only fallback.
+
 ## Phase 1 — Screen Observation
 
 The first milestone of the project (see `docs/high-level-development-plan.md`,

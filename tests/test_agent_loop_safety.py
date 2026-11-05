@@ -27,7 +27,7 @@ from ai_game_agent.actions import Executor, OperationMode, SafetyGuard
 from ai_game_agent.actions.hotkey import FakeHotkeyListener
 from ai_game_agent.actions.mock import MockBackend
 from ai_game_agent.agent import AgentLoop
-from ai_game_agent.capture import CaptureError
+from ai_game_agent.capture import CaptureError, Frame
 from ai_game_agent.games.wow import ZONE_TARGET_HOSTILE, DeterministicPolicy
 from ai_game_agent.perception import BBox, Observation, UiZoneHit
 from ai_game_agent.state import AgentState, GameStateMachine
@@ -83,7 +83,11 @@ class _FakeCapture:
     def grab(self):
         if self.fail:
             raise CaptureError("scripted capture failure (test)")
-        return object()
+        # F1b: the loop image-encodes every grabbed frame before AI decide();
+        # the default must be a real Frame, not a bare object().
+        return Frame(
+            width=1, height=1, pixels=b"\x00\x00\x00", captured_at=TS, source="test"
+        )
 
     def wait_next_frame(self) -> float:
         return 0.0

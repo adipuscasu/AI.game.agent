@@ -57,6 +57,7 @@ from ai_game_agent.actions import (
 from ai_game_agent.actions.mock import MockBackend
 from ai_game_agent.agent import AgentLoop
 from ai_game_agent.ai.schema import AIDecision
+from ai_game_agent.capture import Frame
 from ai_game_agent.games.wow import ZONE_TARGET_HOSTILE, DeterministicPolicy
 from ai_game_agent.perception import BBox, Observation, UiZoneHit
 from ai_game_agent.state import AgentState, EventType, GameStateMachine
@@ -99,7 +100,11 @@ class _FakeCapture:
 
     def grab(self):
         self.grab_count += 1
-        return object()
+        # F1b: the loop image-encodes every grabbed frame before AI decide();
+        # return a real (1x1) Frame, not a bare object().
+        return Frame(
+            width=1, height=1, pixels=b"\x00\x00\x00", captured_at=TS, source="test"
+        )
 
     def wait_next_frame(self) -> float:
         return 0.0
@@ -389,6 +394,57 @@ def test_raising_approver_is_classified_as_rejection():
     )
 
 
+def test_all_rejection_paths_share_one_safe_halt_contract():
+    """PR #7 (F1): every ASSISTED rejection path must safe-halt identically.
+
+    The no-approver, explicit-rejection, raising-approver, and malformed-
+    decision paths all route through the shared rejection tail; this pins
+    the contract they share: PAUSED state, nothing dispatched, exactly one
+    APPROVAL audit event with ``approved is False`` and a non-empty reason.
+    If the tail is ever deduplicated, moved, or refactored, this stays green.
+    """
+    from types import SimpleNamespace
+
+    class _RaisingApproverForContract:
+        name = "raising"
+
+        def request_approval(self, action, **kwargs):
+            raise RuntimeError("approver blew up")
+
+    scenarios = {
+        "no-approver": None,
+        "rejected": _ScriptedApprover(
+            (ApprovalDecision.rejected("human said no"),)
+        ),
+        "raising": _RaisingApproverForContract(),
+        "malformed": _MalformedApprover(SimpleNamespace(is_approved=True)),
+    }
+    for label, approver in scenarios.items():
+        backend = MockBackend()
+        ai = _FakeAI(decision=_ai_decision())
+        events: list[object] = []
+        loop = _loop(
+            mode=OperationMode.ASSISTED,
+            approver=approver,
+            backend=backend,
+            ai=ai,
+            max_ticks=3,
+            on_event=events.append,
+        )
+        report = loop.run()
+        assert loop._machine.state is AgentState.PAUSED, label
+        assert report.actions_attempted == 0, label
+        assert report.actions_ok == 0, label
+        assert ("press", "e") not in [ev[:2] for ev in backend.events], label
+        approvals = [e for e in events if e.event is EventType.APPROVAL]
+        assert len(approvals) == 1, (
+            f"{label}: expected exactly one APPROVAL audit event, "
+            f"got {len(approvals)}"
+        )
+        assert approvals[0].detail["approved"] is False, label
+        assert approvals[0].detail["reason"], label
+
+
 # ---------------------------------------------------------------------------
 # P2 (review) — the gate must not treat a *malformed* decision as approval.
 #
@@ -634,12 +690,16 @@ def test_gate_is_bypassed_in_autonomous_mode_even_with_approver():
     assert not [e for e in events if e.event is EventType.APPROVAL]
 
 
-def test_assisted_without_approver_dispatches_ai_action():
-    """ASSISTED + no approver → the gate is a no-op; the AI action runs.
+def test_assisted_without_approver_is_fail_closed():
+    """ASSISTED + AI + no approver configured → the AI action is REFUSED.
 
-    Absence of an approver is "no gate to apply" (the loop returns True
-    when ``self._approver is None``); the input safety guarantee remains
-    the SafetyGuard at the executor, not a default rejection here.
+    F2 (readiness): the Phase-6 invariant is that an affirmative approval
+    decision is the *only* path to AI-action execution. "No approver
+    configured" is not the same as "everyone approved" — it means nobody
+    can answer, so the gate must fail CLOSED: reject, enter PAUSED, emit the
+    APPROVAL audit event with a meaningful reason, and dispatch nothing.
+    (Previously this path returned True — fail-open — which let AI actions
+    execute with no human in the loop.)
     """
     backend = MockBackend()
     ai = _FakeAI(decision=_ai_decision())
@@ -653,8 +713,44 @@ def test_assisted_without_approver_dispatches_ai_action():
         on_event=events.append,
     )
     report = loop.run()
-    assert report.actions_ok == 1
-    assert not [e for e in events if e.event is EventType.APPROVAL]
+    assert loop._machine.state is AgentState.PAUSED, (
+        "AI action executed without an approver — must pause"
+    )
+    assert report.final_state is AgentState.PAUSED
+    assert report.actions_attempted == 0, f"AI action dispatched: {report.actions_attempted}"
+    assert report.actions_ok == 0
+    assert ("press", "e") not in [ev[:2] for ev in backend.events]
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert approvals, "expected an APPROVAL audit event on the no-approver rejection"
+    assert approvals[0].detail["approved"] is False
+    assert approvals[0].detail["reason"] == "no-approver-configured"
+
+
+def test_autonomous_without_approver_still_dispatches_ai_action():
+    """AUTONOMOUS + AI + no approver → the action still dispatches.
+
+    The fail-closed rule is ASSISTED-scoped (the Phase-6 contract): AUTONOMOUS
+    mode executes every action by definition and must not be altered when
+    no approver is present. Control case for the fail-closed gate.
+    """
+    backend = MockBackend()
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[object] = []
+    loop = _loop(
+        mode=OperationMode.AUTONOMOUS,
+        approver=None,
+        backend=backend,
+        ai=ai,
+        max_ticks=2,
+        on_event=events.append,
+    )
+    report = loop.run()
+    assert report.actions_ok == 1, f"AUTONOMOUS no-approver path changed: {report.actions_ok}"
+    assert report.actions_attempted == 1
+    assert ("press", "e") in [ev[:2] for ev in backend.events]
+    assert not [e for e in events if e.event is EventType.APPROVAL], (
+        "no approver exists, so no APPROVAL audit event may be emitted"
+    )
 
 
 # ---------------------------------------------------------------------------
