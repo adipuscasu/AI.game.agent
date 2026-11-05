@@ -47,7 +47,7 @@ from ai_game_agent.actions.executor import Executor
 from ai_game_agent.actions.hotkey import HotkeyListener
 from ai_game_agent.actions.modes import OperationMode
 from ai_game_agent.agent.report import AgentLoopReport
-from ai_game_agent.capture import CaptureError
+from ai_game_agent.capture import CaptureError, Frame
 from ai_game_agent.perception import Observation
 from ai_game_agent.state import (
     AgentState,
@@ -214,6 +214,19 @@ class AgentLoop:
             frame = self._capture.grab()
         except CaptureError as exc:
             return self._on_pipeline_error(exc, "capture", now)
+        if not isinstance(frame, Frame):
+            # Review F4: a backend that violates the grab() -> Frame contract
+            # is a capture-layer failure, not an AI/perception one. Catch it
+            # at the grab boundary (classified "capture") instead of letting
+            # it surface later as a misattributed AttributeError.
+            return self._on_pipeline_error(
+                CaptureError(
+                    f"capture backend returned {type(frame).__name__}, "
+                    f"expected Frame"
+                ),
+                "capture",
+                now,
+            )
         try:
             observation = self._perception.observe(frame)
         except Exception as exc:  # noqa: BLE001 - classify, never kill the loop
@@ -473,7 +486,7 @@ class AgentLoop:
         channel: str,
         reasoning: str,
         confidence: float | None,
-    ):
+    ) -> LoopEvent:
         """Build the ``APPROVAL`` audit event for a gate outcome.
 
         Callers must increment the relevant counter *before* calling so the

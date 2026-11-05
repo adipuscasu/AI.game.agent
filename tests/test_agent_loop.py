@@ -835,6 +835,62 @@ def test_decide_encoding_failure_routes_to_recovery(make_loop, action_backend) -
     assert action_backend.events == []
 
 
+def test_non_frame_grab_classified_as_capture_stage(make_loop, action_backend) -> None:
+    """Review F4: a backend that violates ``grab() -> Frame`` is a
+    capture-layer failure, not an "ai" failure.
+
+    Without the contract check, a non-Frame object flows into the AI seam
+    and raises AttributeError at encode time — misclassified on the "ai"
+    stage in the audit trail. The loop must check the capture contract at
+    the grab boundary and route the violation to bounded RECOVERY with
+    stage="capture"; the provider is never consulted and no input is
+    dispatched.
+    """
+
+    class _NotAFrame:
+        """Stand-in for a backend return value that breaks the grab() contract."""
+
+    cap = _FakeCapture(frame=_NotAFrame())
+    ai = _FakeAI(decision=_ai_decision())
+    machine = GameStateMachine(policy=_StubDecisionPolicy(), initial=AgentState.AI_ANALYSIS)
+    events: list[LoopEvent] = []
+    loop = make_loop(
+        mode=OperationMode.AUTONOMOUS, machine=machine,
+        capture=cap, ai=ai, on_event=events.append,
+    )
+    result = loop.tick()
+
+    # Bounded RECOVERY on the failing tick (not PAUSED yet, not raised).
+    assert result.state is AgentState.RECOVERY, (
+        "a non-Frame grab must route to bounded RECOVERY "
+        f"(got {result.state!r})"
+    )
+    assert result.state is not AgentState.PAUSED
+
+    # Classified on the capture stage, not "ai": the error string and the
+    # RECOVERY event detail both carry stage="capture".
+    assert result.error is not None
+    assert "capture failed" in result.error, (
+        "a non-Frame grab must be classified on the 'capture' stage "
+        f"(got error: {result.error!r})"
+    )
+    recovery_events = [e for e in events if e.event is EventType.RECOVERY]
+    assert len(recovery_events) == 1, "exactly one RECOVERY event for one failure"
+    ev = recovery_events[0]
+    assert ev.detail.get("stage") == "capture", (
+        "a non-Frame grab must be classified on the 'capture' stage "
+        f"(got {ev.detail.get('stage')!r})"
+    )
+
+    # The provider is never consulted — the failure precedes the AI seam.
+    assert ai.decide_calls == 0, (
+        "a non-Frame grab must not reach provider.decide() "
+        f"(got {ai.decide_calls} call(s))"
+    )
+    # No input is dispatched on the failure path.
+    assert action_backend.events == []
+
+
 def test_no_provider_ai_analysis_dispatches_nothing(make_loop, action_backend) -> None:
     """Default ai=None: AI_ANALYSIS behaves exactly as today (no dispatch)."""
     machine = GameStateMachine(policy=_StubDecisionPolicy(), initial=AgentState.AI_ANALYSIS)
