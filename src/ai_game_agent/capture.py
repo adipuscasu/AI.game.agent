@@ -108,7 +108,7 @@ class Frame:
         except ImportError as exc:
             raise CaptureError(
                 "Pillow is required for Frame.to_png_bytes() but is not installed. "
-                "Install it with: pip install Pillow"
+                "Install it with: uv sync --extra capture  (or: pip install Pillow)"
             ) from exc
         try:
             img = Image.frombytes("RGB", (self.width, self.height), bytes(self.pixels))

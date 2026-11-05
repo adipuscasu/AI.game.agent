@@ -316,9 +316,10 @@ def test_to_png_bytes_pixel_fidelity():
 
     img = Image.open(io.BytesIO(png))
     assert img.size == (2, 1)
-    px = list(img.getdata())
-    # RGB mode: each pixel is (10, 20, 30)
-    assert px[0][:3] == (10, 20, 30)
+    # RGB mode: each pixel is (10, 20, 30). ``tobytes()`` is the non-
+    # deprecated flat-buffer read (available since Pillow 1.0, so it holds
+    # on the project floor Pillow>=10.0); ``getdata()`` is deprecated.
+    assert img.tobytes()[:3] == bytes((10, 20, 30))
 
 
 def test_to_png_bytes_rejects_short_buffer():
@@ -387,4 +388,29 @@ def test_to_png_bytes_accepts_memoryview_by_byte_count():
     img = Image.open(io.BytesIO(png))
     assert img.format == "PNG"
     assert img.size == (2, 1)
-    assert list(img.getdata()) == [(1, 2, 3), (4, 5, 6)]
+    assert list(img.tobytes()) == [1, 2, 3, 4, 5, 6]
+
+
+def test_to_png_bytes_missing_pillow_raises_capture_error():
+    """PR #7 (F2): no Pillow -> clean CaptureError, not a bare ImportError.
+
+    Blocks PIL in ``sys.modules`` so the deferred import inside
+    ``to_png_bytes()`` fails even when Pillow is installed in the venv, and
+    asserts the failure is a :class:`CaptureError` whose diagnostic names
+    the extra that provides Pillow (the capture/vision contract), rather
+    than leaking a raw ``ImportError`` out of the perception layer.
+    """
+    import sys
+    from datetime import datetime
+
+    frame = Frame(2, 1, bytes((1, 2, 3)) * 2, datetime(2026, 1, 1), "test")
+    saved = {k: v for k, v in sys.modules.items() if k == "PIL" or k.startswith("PIL.")}
+    for k in saved:
+        del sys.modules[k]
+    sys.modules["PIL"] = None  # None blocks the import (raises ImportError)
+    try:
+        with pytest.raises(CaptureError, match="Pillow"):
+            frame.to_png_bytes()
+    finally:
+        sys.modules.pop("PIL", None)
+        sys.modules.update(saved)
