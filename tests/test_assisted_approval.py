@@ -57,6 +57,7 @@ from ai_game_agent.actions import (
 from ai_game_agent.actions.mock import MockBackend
 from ai_game_agent.agent import AgentLoop
 from ai_game_agent.ai.schema import AIDecision
+from ai_game_agent.capture import Frame
 from ai_game_agent.games.wow import ZONE_TARGET_HOSTILE, DeterministicPolicy
 from ai_game_agent.perception import BBox, Observation, UiZoneHit
 from ai_game_agent.state import AgentState, EventType, GameStateMachine
@@ -99,7 +100,11 @@ class _FakeCapture:
 
     def grab(self):
         self.grab_count += 1
-        return object()
+        # F1b: the loop image-encodes every grabbed frame before AI decide();
+        # return a real (1x1) Frame, not a bare object().
+        return Frame(
+            width=1, height=1, pixels=b"\x00\x00\x00", captured_at=TS, source="test"
+        )
 
     def wait_next_frame(self) -> float:
         return 0.0

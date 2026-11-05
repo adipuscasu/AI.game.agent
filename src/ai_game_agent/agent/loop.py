@@ -243,7 +243,17 @@ class AgentLoop:
             prompt_fn = getattr(self._policy, "ai_prompt", None)
             try:
                 prompt = prompt_fn(state, observation) if prompt_fn else ""
-                decision = self._ai.decide(prompt)
+                # F1b: visual grounding — encode the captured frame and pass
+                # it to the provider as PNG bytes. Encoding is part of the
+                # same classified "ai" stage: a to_png_bytes() failure routes
+                # to bounded RECOVERY exactly like a provider failure, and
+                # there is deliberately NO silent image=None fallback (the
+                # model must not silently answer a grounded question from
+                # text alone). The AIProvider contract (ai/base.py) accepts
+                # image= / image_mime=; OllamaProvider base64-encodes them
+                # into the payload.
+                image = frame.to_png_bytes()
+                decision = self._ai.decide(prompt, image=image, image_mime="image/png")
             except Exception as exc:  # noqa: BLE001 - classify, never kill the loop
                 return self._on_pipeline_error(exc, "ai", now)
             self._ai_consulted = True
