@@ -1,0 +1,359 @@
+# Phase 7 Execution Plan — One Bounded WoW Scenario, No Human Involvement
+
+**Status:** ready for implementation (execution plan; supersedes §1.1 item 4 and the
+ASSISTED-only milestone framing in `phase-7-implementation-plan.md`)
+**Branch:** `feature/phase-7-operational-autonomy`
+**Base:** `develop` at `d4bc1ef192aed9c1849641541df190feb68d0e27`
+**Date:** 2026-11-06
+**Prerequisites:** Phases 1–6 and PR #7 merged
+
+> **Relationship to the existing plan.** `phase-7-implementation-plan.md` is the
+> *baseline* planning document. This file is the *execution plan* that refines it
+> against the actual code and the stated goal: **the agent completes one small
+> WoW scenario entirely on its own — no human involvement — with no new
+> mouse-control feature needed.** Where this file disagrees with the baseline,
+> this file wins for Phase 7 execution and the baseline must be reconciled (see
+> §2.4).
+
+---
+
+## 1. Goal (restated, testable)
+
+Drive one small, bounded, repeatable World of Warcraft scenario from
+observation → decision → action → verification, **with zero human intervention
+at runtime**, using only input primitives that already exist in the codebase
+(the loot action is a mouse click on the marker plus a pickup key-press — both
+already implemented; §2.1). The agent must:
+
+1. Observe the game screen and extract the small set of scenario facts it needs.
+2. Decide on the single action the scenario allows (deterministic policy
+   first; local AI only as a fallback).
+3. Execute that action through the existing executor — the scenario is the
+   already-implemented loot sequence (click the marker + pickup key), so
+   **no new input-control feature is added** (the pynput backend already
+   implements it; §2.1).
+4. Re-observe and classify the outcome as success, failure, or unknown using
+   fresh visual evidence.
+5. Stop safely when evidence is missing, stale, contradictory, or out of
+   scenario.
+
+"Done" for Phase 7 is a **reproducible, evidence-backed run** — not a green CLI
+exit.
+
+---
+
+## 2. What the code already gives us (verified, with evidence)
+
+These were read directly from the tree, not assumed. They bound the work and
+prevent building things that already exist.
+
+### 2.1 The input contract already supports the scenario (and more)
+
+- `src/ai_game_agent/actions/action.py` defines a full input contract:
+  `ActionKind.KEY_PRESS`, `KEY_HOLD`, `MOUSE_MOVE`, `MOUSE_CLICK`,
+  `MOUSE_DOWN`, `MOUSE_UP`, `MOUSE_SCROLL`, and `DELAY`, with per-kind
+  required/forbidden field validation.
+- `src/ai_game_agent/actions/windows.py` (Phase 3, pynput backend) **fully
+  implements** real mouse + keyboard I/O (`mouse_move`/`mouse_click`/
+  `mouse_down`/`mouse_up`/`mouse_scroll`), and `mock.py` implements them for
+  tests. So mouse control **already exists** — it is not missing.
+- `src/ai_game_agent/games/wow/policy.py` already builds the full loot action
+  sequence: `_looting_actions` emits
+  **`MOUSE_CLICK` (center of the detected loot bounding box) → `DELAY` →
+  `KEY_PRESS` (the loot pickup key)** (see `_click`, `_looting_actions`, and
+  the `_key`/`_delay` builders). So the scenario the goal describes — pick up
+  a glowing loot marker — is **already implemented**, including its mouse
+  click.
+- Consequence: **no new mouse-control feature is needed** for this scenario
+  (the click is already there and the executor already runs it), and no
+  executor work is required. The scenario is *not* keyboard-only — it is a
+  click + key-press, both of which are fully present in the existing input
+  contract and the pynput backend.
+
+### 2.2 The two templates are the same in-game object
+
+- `shots/wow_orb_template.png` (183×221) is a **byte-identical crop** of
+  `shots/wow_crystal_template.png` (1061×1347): a `TM_CCOEFF_NORMED` match of
+  orb-in-crystal scores **1.0000 at (242, 385) with 0.0 mean absolute pixel
+  difference**.
+- Implication for scenario design: the "loot" signal (a glowing collectible)
+  can be driven by **one** calibrated template. Treating orb and crystal as two
+  independent detectors is redundant and risks double-counting. Pick one
+  canonical name (recommend keeping `wow_crystal` as the full, well-framed
+  template and retiring/dedicating `wow_orb` to a sub-region, or use only
+  `wow_crystal`).
+
+### 2.3 The approval gate is the only thing that blocks "no human involvement"
+
+- `src/ai_game_agent/agent/loop.py::_gate_ai_actions` is **fail-closed**: in
+  `ASSISTED` mode an AI-proposed action dispatches **only** on an affirmative,
+  valid approval decision. Missing approver, rejection, timeout, malformed
+  decision, cancellation, or an approval exception all reject and pause
+  (`no-approver-configured` is the recorded reason for the no-approver case).
+- `src/ai_game_agent/actions/approver.py` provides `AutoApprover` (always
+  approve) and `QueueApprover` (console-driven). `AutoApprover` is the natural
+  "no human at runtime" approver — but it is a *test double* by its docstring
+  intent and is currently only reachable by direct injection, not by config.
+- Consequence: the single code change required to run unattended is **exposing
+  an explicit auto-approve mode via configuration** (a new `approval: auto`
+  setting that wires `AutoApprover`, or an equivalent explicit
+  `AutoApprover`-backed `ASSISTED`-mode bypass). This is an *additive,
+  opt-in* relaxation — the default remains fail-closed — and it is the precise,
+  minimal change the goal requires.
+
+### 2.4 Documentation is already corrected (do not re-litigate)
+
+- `phase-6-implementation-plan.md` §3.1/§4/§6 now state the shipped fail-closed
+  contract (missing approver rejects and pauses; no "fallback dispatch").
+- `README.md` now separates implemented capabilities from roadmap, and names
+  `AutoApprover` as a **test double**, and lists a **CLI approval console** as
+  a future extension.
+- Therefore §2.2 of the baseline plan (P0 documentation correction) is **done**;
+  it is listed here only to record that it is complete and to note the two
+  residual README refinements still open (line 61 diagram label, line 72
+  "planning" wording) — see §7, optional.
+
+---
+
+## 3. Scenario (selected, bounded, already-implemented action)
+
+**Scenario: "Loot the glowing crystal when the agent is in range."**
+
+Chosen because it satisfies every constraint: one clear initial condition, one
+observable fact, one bounded action (a click on the loot marker + the pickup
+key), one observable completion condition, and it uses only primitives that
+already exist and are already wired in the policy.
+
+- **Initial condition:** the crystal/loot template is visible in the frame
+  (detected at or above the calibrated confidence threshold) and the agent is
+  `IDLE`/`READY` in the state machine.
+- **Facts needed to recognize it:** a positive detection on the `ZONE_LOOT_GLOW`
+  UI zone (or the `wow_crystal` template if the zone is not yet wired) at or
+  above the calibrated confidence threshold (default 0.8), present in two
+  consecutive frames to reject a transient. The signal name used must match
+  what the policy actually reads (the policy uses `SIGNAL_LOOT_PRESENT`,
+  derived from `ZONE_LOOT_GLOW`), so calibrate that signal specifically.
+- **The one action the agent may propose:** the policy's existing loot sequence
+  — `MOUSE_CLICK` on the center of the detected loot bounding box
+  (`ZONE_LOOT_GLOW`), then `DELAY`, then `KEY_PRESS` of the configured pickup
+  key (default `q`). This is the deterministic path and is **already
+  implemented** (`DeterministicPolicy._looting_actions`). AI is *not* required
+  to produce it. (If the operator wants to also exercise the AI-proposal path,
+  see §5.)
+- **Expected visual result:** after the key press, the crystal is no longer
+  detected (looted) — or, if the scenario is "open an interaction," the
+  loot-glow state transitions. Define **one** of these as the completion
+  condition before collecting evidence.
+- **Abort conditions (all safe-pause, record evidence, zero further actions):**
+  - no crystal detected after the action within the bounded observation window
+    → classify **unknown** and pause;
+  - a *different* state appears (target hostile, health low, zone change) →
+    pause;
+  - stale evidence (frame age beyond threshold) → reject and pause;
+  - detector error (crystal detector did not run) → **unknown**, not "absent";
+  - emergency stop / `OBSERVE_ONLY` boundary → no input, ever.
+- **Why no new input feature is needed:** the loot action (click the marker +
+  pickup key) is already built by the policy and the click is already
+  implemented by the pynput executor — there is nothing to add. (Contrast:
+  pathing/navigation and arbitrary mouse work *would* be new and are out of
+  scope.)
+
+> **Deliberately not chosen:** kill a training dummy (needs target-acquire +
+> a combat rotation and a hostile-state transition — larger surface),
+> pathing/navigation (out of scope), or any scenario needing a capability the
+> executor/policy do not already have. The loot scenario is kept because its
+> full action (click + key) is *already implemented*, which is what makes
+> "no new input feature needed" provable.
+
+### 3.1 Test environment & game-policy gate (must close before any input)
+
+Per the baseline §3.3 and `AGENTS.md`: automated interaction with online games
+may violate terms. Before the first control-capable run, the operator must
+confirm the **selected environment and activity permit this automation**.
+Acceptable evidence: a documented private test environment (e.g. a dedicated
+test client, a throwaway character on a private/authorized setup, or a local
+test harness/mock client) where the activity is permitted. If it cannot be
+established, **Phase 7 stays observation-only** and the "no human involvement"
+claim is deferred — do not weaken this gate.
+
+This is a **one-time human gate** (the operator confirms the environment is
+appropriate). It is *not* runtime human involvement; after it is closed, the
+agent runs the scenario alone.
+
+---
+
+## 4. Work packages (ordered, each independently testable)
+
+Each package ends with a checkable exit gate. Run `uv run --extra dev pytest -q`
+and `uv run ruff check src tests` after each.
+
+### 7.0 — Close documentation and confirm the environment (no runtime change)
+
+- [ ] Confirm §2.4 documentation corrections are merged (they are — verify in
+      the PR).
+- [ ] Close the §3.1 game-policy/environment gate with written evidence; record
+      it in the scenario doc.
+- [ ] (Optional, low-risk) Apply the two residual README refinements: line 61
+      node label `Decision & Planning (Rules + AI)` → `Decision (Rules + AI)`;
+      line 72 "planning" wording → "deterministic rules + local AI".
+- **Exit gate:** a reviewer can point to (a) the merged fail-closed docs and
+  (b) the written environment-authorization evidence. No code changed yet.
+
+### 7.1 — Scenario state & deterministic policy wiring (no input dispatch)
+
+- [ ] Add/confirm a single calibrated `wow_crystal` template signal in the
+      scenario (retire or repurpose `wow_orb` per §2.2).
+- [ ] Ensure `DeterministicPolicy` proposes the loot action sequence
+      (click on the loot marker + pickup key; §3) when the loot fact is true
+      and the agent is ready, and proposes nothing otherwise.
+- [ ] Add deterministic fixture tests: loot-present → the loot action sequence;
+      loot-absent → no action; detector-error → no action + unknown.
+- **Exit gate:** with `OBSERVE_ONLY`, the loop logs the proposed action but
+  dispatches **zero** input; tests pass headless.
+
+### 7.2 — Opt-in auto-approve mode (the only gate change)
+
+- [ ] Add an explicit config knob (e.g. `approval: auto`) that wires the
+      existing `AutoApprover` so an AI-proposed action is auto-approved when the
+      operator opts in. **Default stays `assisted`/fail-closed.**
+- [ ] Make the Phase 7 action **traceable as AI-gated**: the baseline §2.1
+      notes the gate applies to `source == "ai"` actions only. Either (a) mark
+      the scenario's proposal `source == "ai"` so it demonstrably passes the
+      gate, or (b) document that the deterministic path is intentionally
+      non-AI and the gate does not apply — pick one and make it explicit.
+      (Recommended: (a), so the "auto-approve" path is exercised end-to-end and
+      the fail-closed default is still proven for the human path.)
+- [ ] Tests: `approval: auto` → AI action dispatches with no approver present;
+      `approval: assisted` (default) with no approver → rejects, pauses,
+      `no-approver-configured`; `assisted` + explicit rejection → rejects.
+- **Exit gate:** the same scenario run dispatches under `approval: auto` with
+  **zero** human input, and the fail-closed default is unchanged and tested.
+
+### 7.3 — Real-screen observation baseline (Windows)
+
+- [ ] Run the existing capture + perception pipeline against the real game
+      screen in `OBSERVE_ONLY`, with a documented monitor/region/scale config.
+- [ ] Collect ≥ 50 representative frames (positive / negative / borderline /
+      degraded) + a small held-out set; label them.
+- [ ] Record detector errors and distinguish "not detected" from "detector
+      failed" from "detector did not run".
+- [ ] Tune the `wow_crystal` threshold **only on the training split**; report
+      precision/recall on the held-out split.
+- **Exit gate:** repeated observation-only runs produce valid, timestamped,
+  replayable records; the crystal is detected on the held-out positives with an
+  acceptable precision/recall (record the numbers).
+
+### 7.4 — Unattended end-to-end slice (the actual goal)
+
+- [ ] Wire 7.1 + 7.2 on the real environment: `approval: auto`, the scenario
+      action is AI-gated (`source == "ai"`), `OBSERVE_ONLY` is *not* set.
+- [ ] Run the scenario with **no human at the keyboard**: the agent observes,
+      the policy proposes the key press, auto-approve dispatches it, the loop
+      re-observes and classifies the outcome.
+- [ ] Record the full evidence trail: commands, config, resolution/UI scale,
+      model tag (if AI used), trial count, timings, frame captures, serialized
+      observations, and loop/approval events.
+- [ ] On the first **unknown/failure**, the loop must safe-pause with evidence
+      and dispatch no further input.
+- **Exit gate:** at least one fully unattended run succeeds (crystal looted /
+  interaction completed) **and** at least one run that aborts on missing
+  evidence safe-pauses cleanly — both with complete evidence. The operator
+  intervened **zero times** at runtime.
+
+### 7.5 — Evaluation report & close acceptance criteria
+
+- [ ] Write the manual/automated validation report: trial counts, success rate,
+      false positive/negative counts, detector-failure counts, latency, and the
+      one-abort-on-unknown demonstration.
+- [ ] Close **only** the acceptance criteria the evidence supports; leave the
+      rest explicitly open.
+- **Exit gate:** a reviewer can map each claimed capability to a recorded
+      evidence artifact.
+
+---
+
+## 5. The one design decision to lock down (AI-source vs deterministic)
+
+The baseline §2.1 is explicit that the approval gate applies to `source ==
+"ai"` actions only, and §7.1 says the control trial's action "must be marked
+`source == "ai"` so it actually passes through the existing approval gate."
+
+**Decision for Phase 7:** keep the *decision* deterministic (the policy reads
+the loot fact and proposes the key press), but **mark the resulting `Action`
+with `source == "ai"`** for the Phase 7 control trial. This:
+
+- exercises the real auto-approve gate end-to-end (proving the "no human
+  involvement" path works through the safety mechanism, not around it);
+- keeps the fail-closed default (`assisted`) meaningful and tested;
+- avoids adding a second, parallel "deterministic auto-approve" mechanism.
+
+Document this choice in the scenario doc and in the PR description. If the
+operator instead prefers the purely deterministic (non-AI) path, that is a
+valid alternative — but then the auto-approve gate is *not* exercised, and the
+"no human involvement" proof must rely on the non-AI path, which should be
+stated explicitly.
+
+---
+
+## 6. Explicit non-goals (unchanged from baseline, reaffirmed)
+
+- No *new* mouse-control feature (the executor already implements mouse via pynput; §2.1) — and the selected scenario does not require one, so none is exercised in Phase 7.
+- No unattended *long-running* sessions (this is one bounded scenario, repeated
+  for evidence, not an open-ended run).
+- No general questing/combat/routing; no web dashboard; no remote approver;
+  no cloud model; no anti-cheat bypass, process-memory read, or code injection.
+- No persistent memory / world model / RL / multi-agent.
+
+---
+
+## 7. Optional, deferred (owner decision)
+
+- README line 61: relabel architecture node `Decision & Planning (Rules + AI)`
+  → `Decision (Rules + AI)`.
+- README line 72: "general planning" wording → "deterministic rules + local AI"
+  to match the shipped capability.
+These are cosmetic/prose; they do not block Phase 7. Apply during 7.0 if
+approved, otherwise leave for a follow-up.
+
+---
+
+## 8. Open questions / unresolved scope (report only what is not yet closed)
+
+1. **Completion condition for the loot scenario** — pick *one*: (a) crystal
+   no longer detected after the key press, or (b) a loot-glow state transition.
+   Must be fixed **before** 7.3 evidence collection so labels are defined up
+   front. *(Decision needed from the operator; §3 states the requirement but
+   does not force a choice.)*
+2. **Exact game key bind** for the loot/interaction action in the chosen
+   environment (default `q` from config; confirm the bind in the test client).
+3. **Test-environment authorization evidence** for §3.1 — not yet provided;
+   this is the hard gate before 7.2/7.4 dispatch any input.
+4. Whether to keep `wow_orb` as a distinct template or retire it (recommend
+   retire, per §2.2) — minor, resolve during 7.1.
+5. The optional README prose refinements in §7 — not yet approved.
+
+---
+
+## 9. Definition of done (Phase 7, no human involvement)
+
+- The selected loot scenario and test environment are documented, with the
+  completion condition fixed and the environment-authorization evidence on
+  record.
+- A single calibrated `wow_crystal` signal is tuned on labelled, held-out
+  frames with reported precision/recall.
+- The deterministic policy proposes the one bounded loot action (click the marker + pickup key) and nothing else for the scenario.
+- `approval: auto` (opt-in) dispatches the AI-gated action with **zero**
+  runtime human input; the `assisted` fail-closed default is unchanged and
+  still proven by tests (no-approver → reject + pause).
+- At least one **fully unattended** run succeeds and one run that hits missing
+  evidence safe-pauses cleanly with complete evidence; the operator intervened
+  zero times at runtime in either.
+- Automated regression checks pass headless; no WoW client, desktop, Ollama,
+  or network required for CI.
+- The validation report maps every claimed capability to a recorded evidence
+  artifact, and only evidence-backed acceptance criteria are closed.
+
+**Phase 7 does not authorize a claim of general autonomous gameplay.** It proves
+one controlled operational slice — the agent completing one bounded scenario
+entirely on its own — and provides the evidence to decide what the next phase
+should tackle.

@@ -7,17 +7,26 @@ The project combines traditional computer vision, OCR, state machines, local LLM
 
 The initial target is **World of Warcraft**, with the long-term goal of providing a generic framework that can operate different GUI-based games and applications.
 
-## Key Features
+## Key Features (implemented)
 
 * 🖥️ Real-time screen capture and visual perception
 * 👁️ Computer vision, OCR, object detection and multimodal AI
 * 🧠 Local LLM/VLM reasoning through Ollama
 * 🎮 Mouse and keyboard automation
-* 🔄 State-machine-based gameplay control
-* 🗺️ Planning, navigation and recovery
-* 🧠 Short-term and persistent agent memory
+* 🔄 State-machine-based gameplay control with bounded, safe recovery
 * 🛑 Independent emergency-stop and safety mechanisms
 * 📊 Detailed decision and action logging
+* 🔬 Replay and testing of recorded sessions
+* 🧩 Game-independent core with pluggable game adapters
+* 🏠 Designed for local execution and privacy
+
+## Roadmap (not yet implemented)
+
+These appear in `docs/high-level-development-plan.md` as project goals but are **not** shipped in the current codebase:
+
+* 🗺️ General planning, navigation and multi-step route recovery
+* 🧠 Short-term and persistent agent memory across sessions
+* Unattended autonomous gameplay (the first control-capable milestone is ASSISTED mode with explicit human approval — see `docs/phase-7-implementation-plan.md`)
 
 ## Testing and Development Workflow
 
@@ -31,10 +40,6 @@ uv run pytest
 \`\`\`
 
 The currently detected version of `pytest` is 9.1.1. Remember to run tests from the root directory of the workspace.
-
-* 🔬 Replay and testing of recorded sessions
-* 🧩 Game-independent core with pluggable game adapters
-* 🏠 Designed for local execution and privacy
 
 ## Architecture
 
@@ -52,7 +57,7 @@ Perception
 Game State
   │
   ▼
-Decision & Planning
+Decision
 (Rules + AI)
   │
   ▼
@@ -63,7 +68,7 @@ Action Executor
 Game
 ```
 
-The system is intentionally designed so that fast, deterministic computer-vision and state-machine logic handles routine operations, while AI models are used for higher-level interpretation, planning, and unexpected situations.
+The system is intentionally designed so that fast, deterministic computer-vision and state-machine logic handles routine operations, while AI models are used for higher-level interpretation, decision support, and unexpected situations.
 
 ## Goals
 
