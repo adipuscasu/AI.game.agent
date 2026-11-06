@@ -101,6 +101,7 @@ Relevant implementation locations include:
 - The policy proposes `Action` objects; only the executor dispatches input.
 - `OBSERVE_ONLY` must remain a hard no-input boundary.
 - In `ASSISTED`, an AI-proposed action must never dispatch without an affirmative, valid approval decision. Missing approver, rejection, timeout, malformed decision, cancellation, or an approval exception must not authorize execution.
+- The current gate applies to actions marked `source == "ai"`; deterministic/non-AI actions are not automatically covered by that approval gate. The Phase 7 control scenario must make this distinction explicit. Do not assume that selecting `ASSISTED` means every action source is human-approved.
 - Perception detector failures are recorded in `Observation.detector_errors`. A failed detector means **unknown**, not “the feature is absent.”
 - The captured frame used for an AI decision must be the frame associated with that observation; do not silently fall back to a text-only decision if image encoding fails.
 - Cleanup, held-input release, emergency stop, bounded recovery, and event sequencing remain mandatory.
@@ -224,9 +225,10 @@ Tasks:
 2. Ensure the prompt includes the current scenario state and the screenshot from the same capture.
 3. Keep the model output structured and validate it through the existing decision/action schemas and safety boundary. Reject unsupported action kinds, malformed arguments, stale context, or proposals outside the scenario allow-list.
 4. Start with **one action per decision**. Do not introduce multi-step plans or arbitrary action batches.
-5. Use `ASSISTED` mode with the terminal human approver for manual trials. Do not use `AutoApprover` for a real-game control trial.
-6. Prove with regression tests that no input is dispatched on missing approval, rejection, timeout, cancellation, invalid output, provider failure, or safety-guard rejection.
-7. Keep F12/emergency-stop and release-all behavior active for every control-capable run.
+5. Use `ASSISTED` mode with the terminal human approver for manual trials. The action under test must be marked `source == "ai"` so it actually passes through the existing approval gate. Do not use `AutoApprover` for a real-game control trial.
+6. If the selected scenario can only produce a deterministic/non-AI action, stop and decide explicitly whether Phase 7 should extend the approval contract to cover it. Treat that as a separate safety change with its own tests; do not quietly assume the current gate protects it.
+7. Prove with regression tests that no input is dispatched on missing approval, rejection, timeout, cancellation, invalid output, provider failure, or safety-guard rejection.
+8. Keep F12/emergency-stop and release-all behavior active for every control-capable run.
 
 **Exit gate:** a valid scenario decision can reach the approval prompt, and only an affirmative approval permits the one bounded action to reach the executor.
 
