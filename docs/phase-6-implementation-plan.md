@@ -1,6 +1,6 @@
 # Phase 6: Assisted Mode — Implementation Plan
 
-**Status:** implemented
+**Status:** implemented; §3.1, §4, §6 corrected on 2026-11-06 to the shipped fail-closed contract (see PR #7, commit `af3891b`) — earlier wording described an intended fail-open design that never shipped
 **Branch:** `feature/phase-6`
 **Date:** 2026-10-25
 **Prerequisite:** Phase 5 complete (AI provider seam in `agent/loop.py`; `AIDecision` schema; `ai/` package; full suite green)
@@ -61,12 +61,24 @@ it to `ASSISTED` so that:
 
 - `OBSERVE_ONLY` / `SEMI_AUTONOMOUS` / `AUTONOMOUS` dispatch exactly as in
   Phase 4/5 (byte-for-byte; their tests are unchanged and still pass).
-- `ASSISTED` with **no** approver injected (the default CLI for other modes,
-  and existing tests) falls back to today's Phase-5 behavior — no surprise
-  prompts.
+- `ASSISTED` **requires a configured approver** for any AI-proposed action
+  to run. With no approver injected, the gate **rejects** the proposal —
+  it emits an `APPROVAL` audit event with reason `no-approver-configured`,
+  forces the machine into `PAUSED` (a safe halt), and dispatches nothing.
+  Absence of an approver is never treated as blanket approval (fail-closed,
+  not fail-open).
 
 This is the smallest surface that adds the feature without touching any
 working path.
+
+> **Historical note (superseded).** An earlier draft of this section — and
+> the original Phase-6 design intent — described `ASSISTED` without an
+> approver as *falling back to the pre-gate Phase-5 behavior* (i.e. the
+> action dispatched anyway, "no surprise prompts"). That fail-open design
+> **did not ship**. The implemented contract — pinned by
+> `test_assisted_without_approver_is_fail_closed` and the shared safe-halt
+> contract test in `tests/test_assisted_approval.py`, and corrected in PR #7
+> (`af3891b`) — is fail-closed as described above.
 
 ### 3.2 Pluggable `Approver` protocol — one seam, three implementations
 
@@ -150,35 +162,48 @@ about an action, not a phase of the loop.
 
 ## 4. The approval flow (code)
 
-`AgentLoop._gate_ai_actions(actions, now)`:
+`AgentLoop._gate_ai_actions(actions, now, reasoning, confidence)` returns
+`True` (proceed to dispatch), `False` (unused), or `None` (rejection — the
+caller halts the episode before dispatch). Shipped contract:
 
 ```python
-if (self._mode is not OperationMode.ASSISTED
-        or self._approver is None
-        or not any(a.source == "ai" for a in actions)):
-    return actions                       # no gate: dispatch as before
-
-if any(a.source == "ai" for a in actions) is False:
-    return actions
-
-for action in actions:
-    decision = self._approver.request_approval(...)
+if self._mode is not OperationMode.ASSISTED:
+    return True                          # gate is ASSISTED-scoped
+if not actions:
+    return True                          # defensive no-op
+if self._approver is None:
+    # Fail-closed: nobody can answer, so nobody approved.
     self._approvals_requested += 1
-    if not decision.is_approved:
-        self._approvals_rejected += 1
-        self._emit(LoopEvent(event=EventType.APPROVAL, ..., detail={...}))
-        self._machine.enter(AgentState.PAUSED,
-                            reason="assisted approval rejected; safe pause", now=now)
-        return None                      # the caller emits nothing & halts
-    self._approvals_granted += 1
-    self._emit(LoopEvent(event=EventType.APPROVAL, ..., detail={...approved: True...}))
-return actions
+    self._reject_and_halt(actions[0], now=now,
+                          reason="no-approver-configured", channel="none", ...)
+    return None                          # PAUSED; nothing dispatched
+
+self._approvals_requested += 1
+try:
+    decision = self._approver.request_approval(actions[0], ...)
+except Exception as exc:                 # an errored approver is a rejection
+    decision = ApprovalDecision.rejected(reason=f"approver-error: {exc}")
+
+# Approval is derived from the *validated* decision, never from truthiness:
+a valid affirmative decision  -> APPROVAL event (approved), return True
+anything else (rejection, malformed, out-of-vocabulary) ->
+    _reject_and_halt(...) -> PAUSED; return None
 ```
 
-The loop then calls `_dispatch` **only if** the gate returned actions — a
-`None` return is the "halt before dispatch" signal. Deterministic
-(non-AI) actions in an `ASSISTED` episode still dispatch immediately; only
-`source == "ai"` actions are gated.
+The loop calls `_dispatch` **only if** the gate returned `True` — a `None`
+return is the "halt before dispatch" signal (machine → `PAUSED`, held inputs
+released, `APPROVAL` audit event recorded). Deterministic (non-AI) actions
+never reach the gate; only actions produced by the AI decision path (the
+`ai_proposed` flag set at the AI seam in `agent/loop.py`, i.e. state is
+`AI_ANALYSIS` and the provider returns a decision) are gated. The gate does
+not read `Action.source`; it keys off the AI seam.
+
+> **Historical note (superseded).** An earlier version of this section
+> showed the guard as `if (... or self._approver is None ...): return
+> actions`, i.e. a missing approver was treated as *no gate — dispatch as
+> before*. That fail-open path was never the shipped behavior; the current
+> implementation rejects, safe-halts, and records the outcome as shown
+> above.
 
 ## 5. CLI
 
@@ -198,18 +223,33 @@ The approver is built **only** when `mode is ASSISTED`; `--approve-all` and
 
 ## 6. Verification
 
-- `pytest` — full suite green: **732 passed**.
+- **Original Phase-6 verification (historical close-out):** `pytest` full
+  suite green — **732 passed** (no skips recorded at Phase 6), and
+  `ruff check .` clean. This is the result of the Phase-6 implementation
+  itself, as recorded in §2 and the §2 test table.
+- **Current repository baseline (later, for reference only):** **848 passed /
+  2 skipped**. This count is a *later* baseline from after additional phases
+  were added (the 2 skips are environment-dependent — they require a live
+  Windows console, `CONIN$`). It is **not** the original Phase-6 result, and
+  this documentation pass did not rerun the test suite; the figure is
+  quoted from the existing baseline record.
 - `ruff check .` — clean across the repo.
-- `tests/test_assisted_approval.py` — 17 new tests covering: approved
-  action executes; rejection is a safe halt that blocks dispatch; a
-  raising approver is classified as a rejection; the gate never fires
-  for deterministic actions or outside `ASSISTED`; `ASSISTED` with no
-  approver still dispatches (back-compat); the executor has no approver
-  seam; the fail-safe approver table (affirmatives approve; negatives,
-  unparsable, EOF, `KeyboardInterrupt`, and timeout all reject);
-  F12 emergency stop wins while the approver would block;
-  `OBSERVE_ONLY` dispatches nothing even with AI + approver present;
-  and the `APPROVAL` event detail contract.
+- `tests/test_assisted_approval.py` — 76 tests (17 at Phase-6 time of
+  writing) covering: approved action executes; rejection is a safe halt
+  that blocks dispatch; a raising approver is classified as a rejection;
+  the gate never fires for deterministic actions or outside `ASSISTED`;
+  **`ASSISTED` with no approver is fail-closed** — `test_assisted_without_approver_is_fail_closed`
+  asserts the AI proposal is *refused*: machine in
+  `PAUSED`, zero actions dispatched, exactly one `APPROVAL` audit event
+  with `approved is False` and `reason == "no-approver-configured"`
+  (earlier drafts claimed this path "still dispatches (back-compat)" — that
+  was never the shipped contract); every rejection path (no-approver,
+  explicit rejection, raising approver, malformed decision) shares one
+  safe-halt contract; the executor has no approver seam; the fail-safe
+  approver table (affirmatives approve; negatives, unparsable, EOF,
+  `KeyboardInterrupt`, and timeout all reject); F12 emergency stop wins
+  while the approver would block; `OBSERVE_ONLY` dispatches nothing even
+  with AI + approver present; and the `APPROVAL` event detail contract.
 - `tests/test_state_machine.py` — `EventType` closed set now includes
   `APPROVAL` (9 values).
 
