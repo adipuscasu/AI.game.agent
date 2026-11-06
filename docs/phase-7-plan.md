@@ -116,8 +116,8 @@ prevent building things that already exist.
   a future extension.
 - Therefore §2.2 of the baseline plan (P0 documentation correction) is **done**;
   it is listed here only to record that it is complete and to note the two
-  residual README refinements still open (line 61 diagram label, line 72
-  "planning" wording) — see §7, optional.
+  residual README refinements still open (`Architecture` diagram node label,
+  `Architecture` section "planning" wording) — see §7, optional.
 
 ---
 
@@ -200,9 +200,10 @@ and `uv run ruff check src tests` after each.
       the PR).
 - [ ] Close the §3.1 game-policy/environment gate with written evidence; record
       it in the scenario doc.
-- [ ] (Optional, low-risk) Apply the two residual README refinements: line 61
-      node label `Decision & Planning (Rules + AI)` → `Decision (Rules + AI)`;
-      line 72 "planning" wording → "deterministic rules + local AI".
+- [ ] (Optional, low-risk) Apply the two residual README refinements: the
+      `Architecture` diagram node label `Decision & Planning (Rules + AI)` →
+      `Decision (Rules + AI)`; and the `Architecture` section "planning"
+      wording → "deterministic rules + local AI".
 - **Exit gate:** a reviewer can point to (a) the merged fail-closed docs and
   (b) the written environment-authorization evidence. No code changed yet.
 
@@ -336,10 +337,10 @@ decision (baseline §7.1 item 6).
 
 ## 7. Optional, deferred (owner decision)
 
-- README line 61: relabel architecture node `Decision & Planning (Rules + AI)`
-  → `Decision (Rules + AI)`.
-- README line 72: "general planning" wording → "deterministic rules + local AI"
-  to match the shipped capability.
+- README `Architecture` diagram node: relabel `Decision & Planning (Rules +
+  AI)` → `Decision (Rules + AI)`.
+- README `Architecture` section: "general planning" wording → "deterministic
+  rules + local AI" to match the shipped capability.
 These are cosmetic/prose; they do not block Phase 7. Apply during 7.0 if
 approved, otherwise leave for a follow-up.
 
