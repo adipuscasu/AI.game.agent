@@ -1,6 +1,6 @@
 # Phase 7: Operational Autonomy and Gameplay Validation
 
-**Status:** proposed — planning baseline only; no Phase 7 implementation is included in this commit
+**Status:** authoritative definition of the Phase 7 ASSISTED-first milestone — planning baseline; no Phase 7 implementation is included in this commit. `docs/phase-7-plan.md` is the subordinate execution plan that refines this document against the actual code; where the two disagree, this document wins.
 **Branch:** `feature/phase-7-operational-autonomy`
 **Base:** `develop` at `d4bc1ef192aed9c1849641541df190feb68d0e27`
 **Date:** 2026-11-06
@@ -101,19 +101,26 @@ Relevant implementation locations include:
 - The policy proposes `Action` objects; only the executor dispatches input.
 - `OBSERVE_ONLY` must remain a hard no-input boundary.
 - In `ASSISTED`, an AI-proposed action must never dispatch without an affirmative, valid approval decision. Missing approver, rejection, timeout, malformed decision, cancellation, or an approval exception must not authorize execution.
-- The current gate applies to actions marked `source == "ai"`; deterministic/non-AI actions are not automatically covered by that approval gate. The Phase 7 control scenario must make this distinction explicit. Do not assume that selecting `ASSISTED` means every action source is human-approved.
+- The `ASSISTED` approval gate is keyed off the **AI seam**: in `agent/loop.py` the gate is consulted only when the action is produced by the AI decision path (state is `AI_ANALYSIS` and the provider seam returns a decision). It is **not** keyed off the `Action.source` field (which the AI schema enforces to `"ai"`, but the gate itself never reads it). A deterministic action produced by the policy path does not reach the gate; it dispatches as in Phase 4. The Phase 7 control scenario must state which path it exercises. Do not assume that selecting `ASSISTED` means every action path is human-approved.
 - Perception detector failures are recorded in `Observation.detector_errors`. A failed detector means **unknown**, not “the feature is absent.”
 - The captured frame used for an AI decision must be the frame associated with that observation; do not silently fall back to a text-only decision if image encoding fails.
 - Cleanup, held-input release, emergency stop, bounded recovery, and event sequencing remain mandatory.
 - Local Ollama inference remains the default target. Phase 7 must not introduce a cloud dependency.
 
-### 2.2 Documentation readiness correction
+### 2.2 Documentation readiness (verified done on this branch)
 
-Before implementation work begins, reconcile the existing Phase 6 plan with the shipped fail-closed behavior. In `docs/phase-6-implementation-plan.md`, sections 3.1, 4, and 6 still describe the old behavior in which ASSISTED mode without an injected approver falls back to dispatch. That is inconsistent with the current implementation and must be corrected to state that a missing approver rejects the AI proposal and safely pauses before dispatch.
+The fail-open descriptions in `docs/phase-6-implementation-plan.md` §3.1/§4/§6
+that described ASSISTED mode without an injected approver as *falling back to
+dispatch* have been corrected to state the shipped fail-closed contract
+(missing approver rejects the AI proposal, safe-pauses, and dispatches
+nothing). The correction landed in PR #7 / commit `af3891b` and is recorded in
+the historical notes in that plan. This PR does not re-open that correction; it
+verifies the correction is present in-tree and that `README.md` distinguishes
+implemented capabilities from roadmap items (persistent memory and general
+planning are listed under roadmap, not under implemented features).
 
-Also review the README feature list. Clearly separate implemented capabilities from roadmap items; do not present persistent memory, general planning, or navigation as shipped functionality unless the code actually supports those claims.
-
-This is a documentation/safety-contract correction, not permission to weaken the implementation for backward compatibility.
+This remains a documentation/safety-contract correction, not permission to
+weaken the implementation for backward compatibility.
 
 ---
 
@@ -225,8 +232,8 @@ Tasks:
 2. Ensure the prompt includes the current scenario state and the screenshot from the same capture.
 3. Keep the model output structured and validate it through the existing decision/action schemas and safety boundary. Reject unsupported action kinds, malformed arguments, stale context, or proposals outside the scenario allow-list.
 4. Start with **one action per decision**. Do not introduce multi-step plans or arbitrary action batches.
-5. Use `ASSISTED` mode with the terminal human approver for manual trials. The action under test must be marked `source == "ai"` so it actually passes through the existing approval gate. Do not use `AutoApprover` for a real-game control trial.
-6. If the selected scenario can only produce a deterministic/non-AI action, stop and decide explicitly whether Phase 7 should extend the approval contract to cover it. Treat that as a separate safety change with its own tests; do not quietly assume the current gate protects it.
+5. Use `ASSISTED` mode with the interactive CLI approver (`TerminalApprover`; the existing `--approve-all`/`--approve-timeout` CLI flags switch to `AutoApprover`/a timeout-bounded variant) for manual trials. **Preserve provenance accurately**: the shipped gate in `agent/loop.py` is keyed off the AI seam (the action is produced by the AI decision path in `AI_ANALYSIS`), **not** off the `Action.source` field — so a deterministic policy action is not gated under the current contract, and the correct documentation statement is "the `ASSISTED` approval boundary is scoped to AI-seam actions", not "mark the deterministic action as `source == "ai"` so it reaches the gate" (that would mislabel a deterministic action as AI-proposed and, under the shipped gate, would not change the gating decision). Do not use `AutoApprover` for a real-game control trial.
+6. If the scenario can only produce a deterministic policy action, state explicitly that the `ASSISTED` approval boundary does not apply to that path and is proven by the AI-seam path (regression tests: no-approver → reject + pause, rejection, malformed, timeout, raising approver). Extending the gate to cover deterministic actions is a **separate safety change** with its own tests and must not be assumed as already in place.
 7. Prove with regression tests that no input is dispatched on missing approval, rejection, timeout, cancellation, invalid output, provider failure, or safety-guard rejection.
 8. Keep F12/emergency-stop and release-all behavior active for every control-capable run.
 
@@ -346,7 +353,7 @@ Capture and retain the exact command, configuration, app/game version where rele
 
 Prefer small PRs with a narrow review surface:
 
-1. **P0 — Documentation truth and Phase 6 safety contract.** Correct the stale fail-open descriptions; reconcile README feature claims.
+1. **P0 — Documentation truth and Phase 6 safety contract.** The fail-open descriptions in `docs/phase-6-implementation-plan.md` §3.1/§4/§6 are **already corrected** (PR #7 / commit `af3891b`; see the historical notes in that plan). This PR verifies the correction is present in-tree and that `README.md` distinguishes implemented capabilities from roadmap items.
 2. **P1 — Observer baseline and scenario fixtures.** Add only the capture/evidence support demonstrated to be missing; define and label the first scenario.
 3. **P2 — Calibrated WoW scenario state.** Add typed state and deterministic fixture tests, if needed.
 4. **P3 — One-action ASSISTED vertical slice.** Connect the scenario decision to validated, approved execution.

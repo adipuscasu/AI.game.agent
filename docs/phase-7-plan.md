@@ -1,16 +1,18 @@
 # Phase 7 Execution Plan — One Bounded WoW Scenario, ASSISTED First
 
-**Status:** ready for implementation (execution plan; aligned with the baseline
-`phase-7-implementation-plan.md` — the first control-capable milestone is
-ASSISTED mode with explicit human approval)
+**Status:** ready for implementation — *subordinate execution plan* to the
+authoritative milestone definition in `phase-7-implementation-plan.md` (the
+first control-capable milestone is ASSISTED mode with explicit human
+approval)
 **Branch:** `feature/phase-7-operational-autonomy`
 **Base:** `develop` at `d4bc1ef192aed9c1849641541df190feb68d0e27`
 **Date:** 2026-11-06
 **Prerequisites:** Phases 1–6 and PR #7 merged
 
-> **Relationship to the existing plan.** `phase-7-implementation-plan.md` is the
-> *baseline* planning document. This file is the *execution plan* that refines it
-> against the actual code. The first control-capable milestone is **ASSISTED
+> **Relationship to the baseline.** `phase-7-implementation-plan.md` is the
+> **authoritative** definition of the Phase 7 ASSISTED-first milestone. This file
+> is its **subordinate execution plan**: it refines that document against the
+> actual code and does not redefine the milestone. The first control-capable milestone is **ASSISTED
 > mode with explicit human approval** — the same milestone the baseline
 > defines. **Unattended crystal collection is a later, separate goal** (see
 > §7.4) with its own prerequisites; it does not supersede the ASSISTED-first
@@ -23,8 +25,11 @@ ASSISTED mode with explicit human approval)
 
 Drive one small, bounded, repeatable World of Warcraft scenario from
 observation → decision → action → verification. **The first control-capable
-milestone is ASSISTED mode: every action the agent proposes requires an
-explicit human approval decision before it is dispatched.** It uses only
+milestone is ASSISTED mode: the AI-proposed action the agent produces requires
+an explicit human approval decision before it is dispatched** (the shipped
+approval gate in `agent/loop.py` is scoped to AI-seam actions — see §5; the
+deterministic path is proven separately to dispatch nothing under
+`OBSERVE_ONLY`). It uses only
 input primitives that already exist in the codebase (the loot action is a
 mouse click on the marker plus a pickup key-press — both already
 implemented; §2.1). The agent must:
@@ -95,10 +100,16 @@ prevent building things that already exist.
   decision, cancellation, or an approval exception all reject and pause
   (`no-approver-configured` is the recorded reason for the no-approver case).
 - `src/ai_game_agent/actions/approver.py` provides `AutoApprover` (always
-  approve) and `QueueApprover` (console-driven). For the ASSISTED milestone the
-  approver is a human (the `QueueApprover` console or equivalent); `AutoApprover`
-  is a *test double* by its docstring intent and is currently only reachable by
-  direct injection, not by config.
+  approve — docstring: "Use in tests, CI, and explicit 'trust the AI' runs"),
+  `TerminalApprover` (the **default human channel**: blocks on stdin for a y/N
+  answer; non-interactive stdin, timeout, and interrupt are all *rejections*),
+  and `QueueApprover` (a transport-agnostic remote/web approver, Phase 6). The
+  CLI wires `TerminalApprover` for an ASSISTED run by default; `--approve-all`
+  switches it to `AutoApprover` and `--approve-timeout` bounds the approval wait
+  (`__main__.py`, ASSISTED-mode wiring). For the ASSISTED milestone the approver
+  is therefore a human via `TerminalApprover`; `AutoApprover` is a *test
+  double* by its docstring intent and is only reachable explicitly (`--approve-all`
+  or direct injection), never by default config.
 - Consequence: the ASSISTED milestone needs **no gate change** — the existing
   fail-closed gate plus a human approver is sufficient. The *later unattended
   goal* (§7.4) will additionally require exposing an explicit auto-approve mode
@@ -110,14 +121,25 @@ prevent building things that already exist.
 ### 2.4 Documentation is already corrected (do not re-litigate)
 
 - `phase-6-implementation-plan.md` §3.1/§4/§6 now state the shipped fail-closed
-  contract (missing approver rejects and pauses; no "fallback dispatch").
-- `README.md` now separates implemented capabilities from roadmap, and names
-  `AutoApprover` as a **test double**, and lists a **CLI approval console** as
-  a future extension.
+  contract (missing approver rejects and pauses; no "fallback dispatch"). This
+  was corrected in PR #7 / commit `af3891b` and the historical notes in that
+  plan record the earlier draft's fail-open wording as superseded.
+- `README.md` now separates **implemented** capabilities from **roadmap**
+  items (persistent memory and general planning are listed under roadmap, not
+  under implemented features), and the `Architecture` diagram node is labelled
+  `Decision (Rules + AI)` (not `Decision & Planning`) with matching prose.
+- The **interactive CLI approval console is already implemented** in the shipped
+  code: `TerminalApprover` is the default approver for `ASSISTED` mode and the
+  `--approve-all` / `--approve-timeout` CLI flags switch to `AutoApprover` / a
+  timeout-bounded variant. `AutoApprover`'s docstring marks it as a
+  test/CI-friendly always-approve approver; the docs must not present it as
+  the human approval boundary.
 - Therefore §2.2 of the baseline plan (P0 documentation correction) is **done**;
-  it is listed here only to record that it is complete and to note the two
-  residual README refinements still open (`Architecture` diagram node label,
-  `Architecture` section "planning" wording) — see §7, optional.
+  it is listed here only to record that it is complete. The residual README
+  refinements that the baseline §7.0 checklist listed (the `Architecture`
+  diagram node label and the `Architecture` section "planning" wording) have
+  already been applied on this branch and are recorded under `### 7.0` below
+  as already-complete.
 
 ---
 
@@ -142,10 +164,13 @@ already exist and are already wired in the policy.
 - **The one action the agent may propose:** the policy's existing loot sequence
   — `MOUSE_CLICK` on the center of the detected loot bounding box
   (`ZONE_LOOT_GLOW`), then `DELAY`, then `KEY_PRESS` of the configured pickup
-  key (default `q`). This is the deterministic path and is **already
-  implemented** (`DeterministicPolicy._looting_actions`). AI is *not* required
-  to produce it. (If the operator wants to also exercise the AI-proposal path,
-  see §5.)
+  key (default `q`). This action is already implemented as a deterministic
+  policy (`DeterministicPolicy._looting_actions`), which is what makes "no new
+  input feature needed" provable. **Provenance:** under the shipped gate only
+  the AI-seam path is gated, so the first control-capable run must be an
+  AI-seam run (the provider proposes this same action and a human approves it)
+  — see §5. The deterministic path is exercised separately to prove
+  `OBSERVE_ONLY` dispatches zero input.
 - **Expected visual result:** after the key press, the crystal is no longer
   detected (looted) — or, if the scenario is "open an interaction," the
   loot-glow state transitions. Define **one** of these as the completion
@@ -196,14 +221,14 @@ and `uv run ruff check src tests` after each.
 
 ### 7.0 — Close documentation and confirm the environment (no runtime change)
 
-- [ ] Confirm §2.4 documentation corrections are merged (they are — verify in
-      the PR).
+- [x] **Already done on this branch:** the fail-closed corrections in
+      `docs/phase-6-implementation-plan.md` §3.1/§4/§6 (PR #7 / `af3891b`),
+      the `README.md` implemented-vs-roadmap separation, the `Architecture`
+      diagram node relabel (`Decision & Planning (Rules + AI)` →
+      `Decision (Rules + AI)`), and the matching `Architecture` section prose
+      ("planning" → "decision support"). These are part of this PR's diff.
 - [ ] Close the §3.1 game-policy/environment gate with written evidence; record
       it in the scenario doc.
-- [ ] (Optional, low-risk) Apply the two residual README refinements: the
-      `Architecture` diagram node label `Decision & Planning (Rules + AI)` →
-      `Decision (Rules + AI)`; and the `Architecture` section "planning"
-      wording → "deterministic rules + local AI".
 - **Exit gate:** a reviewer can point to (a) the merged fail-closed docs and
   (b) the written environment-authorization evidence. No code changed yet.
 
@@ -222,18 +247,22 @@ and `uv run ruff check src tests` after each.
 ### 7.2 — Opt-in auto-approve mode (later-goal prerequisite — not part of the first ASSISTED milestone)
 
 - [ ] Add an explicit config knob (e.g. `approval: auto`) that wires the
-      existing `AutoApprover` so an AI-proposed action is auto-approved when the
-      operator opts in. **Default stays `assisted`/fail-closed.**
-- [ ] Make the Phase 7 action **traceable as AI-gated**: the baseline §2.1
-      notes the gate applies to `source == "ai"` actions only. Either (a) mark
-      the scenario's proposal `source == "ai"` so it demonstrably passes the
-      gate, or (b) document that the deterministic path is intentionally
-      non-AI and the gate does not apply — pick one and make it explicit.
-      (Recommended: (a), so the "auto-approve" path is exercised end-to-end and
-      the fail-closed default is still proven for the human path.)
-- [ ] Tests: `approval: auto` → AI action dispatches with no approver present;
-      `approval: assisted` (default) with no approver → rejects, pauses,
-      `no-approver-configured`; `assisted` + explicit rejection → rejects.
+      existing `AutoApprover` so an **AI-seam** action is auto-approved when
+      the operator opts in. **Default stays `assisted`/fail-closed.**
+- [ ] State the provenance explicitly and correctly: the shipped gate in
+      `agent/loop.py` is keyed off the **AI seam** (state is `AI_ANALYSIS` and
+      the provider decision produced the action), **not** off the
+      `Action.source` field. For a deterministic policy action the gate does not
+      apply under the current contract — do not paper over that by relabelling
+      the deterministic action as `source == "ai"` to "make it pass through the
+      gate"; that would misrepresent the action's provenance and, under the
+      shipped gate, would not change the gating decision (see §5).
+- [ ] Tests: `approval: auto` → an AI-seam action dispatches with no approver
+      present; `approval: assisted` (default) with no approver → rejects,
+      pauses, `no-approver-configured`; `assisted` + explicit rejection →
+      rejects. All three tests must use a genuinely AI-seam action (one
+      produced by the provider path), not a deterministic policy action
+      relabelled as AI.
 - **Exit gate:** the same scenario run dispatches under `approval: auto` with
   **zero** human input, and the fail-closed default is unchanged and tested.
 
@@ -267,12 +296,15 @@ decision) is accepted **and** each prerequisite below is met:
   explicitly elects unattended operation.
 - **Prerequisite 3 — opt-in auto-approve exposed:** an explicit auto-approve mode
   is available via configuration (e.g. `approval: auto` wiring the existing
-  `AutoApprover`), the default remains fail-closed, and the scenario action is
-  marked `source == "ai"` so it demonstrably passes through the gate (see §5).
+  `AutoApprover`), the default remains fail-closed, and the action exercised is
+  a **genuinely AI-seam** action (produced by the provider path in `AI_ANALYSIS`)
+  so it demonstrably passes through the shipped gate (see §5). A deterministic
+  policy action must **not** be relabelled as AI to "reach" the gate.
 
 Only once all three prerequisites hold:
 - [ ] Wire 7.1 + 7.2 on the real environment: `approval: auto`, the scenario
-      action is AI-gated (`source == "ai"`), `OBSERVE_ONLY` is *not* set.
+      action is produced by the **AI seam** (so the shipped gate in
+      `agent/loop.py` is consulted), `OBSERVE_ONLY` is *not* set.
 - [ ] Run the scenario with **no human at the keyboard**: the agent observes,
       the policy proposes the key press, auto-approve dispatches it, the loop
       re-observes and classifies the outcome.
@@ -298,29 +330,44 @@ Only once all three prerequisites hold:
 
 ---
 
-## 5. The one design decision to lock down (AI-source vs deterministic)
+## 5. The one design decision to lock down (which path exercises the gate)
 
-The baseline §2.1 is explicit that the approval gate applies to `source ==
-"ai"` actions only, and §7.1 says the control trial's action "must be marked
-`source == "ai"` so it actually passes through the existing approval gate."
+The shipped gate in `agent/loop.py` is keyed off the **AI seam**, not off the
+`Action.source` field: it is consulted when the action is produced by the AI
+decision path (state is `AI_ANALYSIS` and the provider returns a decision), and
+it is not consulted for actions produced by the deterministic policy path.
+The `Action.source` field is a **provenance tag** (the AI schema enforces
+`source == "ai"` on AI-seam actions, and the deterministic policy sets a
+non-AI source), not the gate's trigger. This means:
 
-**Decision for Phase 7:** keep the *decision* deterministic (the policy reads
-the loot fact and proposes the key press), but **mark the resulting `Action`
-with `source == "ai"`** for the control trial. This:
+- The deterministic policy path does **not** pass through the `ASSISTED`
+  approval gate under the current contract.
+- Relabelling a deterministic action as `source == "ai"` to "make it pass
+  through the gate" is **incorrect on both counts**: it misrepresents the
+  action's provenance, and it does not change the gating decision (the gate
+  still keys off the AI seam, not the `source` field).
+- The only way to exercise the gate for the loot scenario is for the action to
+  be produced by the AI seam (i.e. the loop enters `AI_ANALYSIS` and the
+  provider returns the loot action), or to make a **separate, explicit safety
+decision** to extend the gate to cover deterministic actions (baseline §7.3
+  item 6) — the latter is a distinct change with its own tests, not an
+  in-scope refinement of the first milestone.
 
-- routes the scenario action through the existing approval gate so the safety
-  mechanism is exercised, not bypassed;
-- keeps the fail-closed default (`assisted`) meaningful and tested;
-- for the ASSISTED milestone the gate resolves to a **human approval decision**;
-  the later unattended goal (§7.4), if undertaken, resolves the same gate to an
-  opt-in auto-approve;
-- avoids adding a second, parallel "deterministic auto-approve" mechanism.
+**Decision for Phase 7 (ASSISTED milestone):** the first control-capable run
+must be an **AI-seam** run — the loop enters `AI_ANALYSIS`, the provider
+returns the loot action, and the gate resolves to a human approval decision.
+This keeps the provenance accurate (the action really is AI-proposed),
+exercises the shipped gate, and preserves the fail-closed default
+(`assisted`) meaningfully and tested (no-approver → reject + pause). The later
+unattended goal (§7.4), if undertaken, resolves the same gate to an opt-in
+auto-approve for AI-seam actions.
 
 Document this choice in the scenario doc and in the PR description. If the
-operator instead prefers the purely deterministic (non-AI) path, that is a
-valid alternative — but then the approval gate is *not* exercised by that
-action, which must be stated explicitly and treated as a separate safety
-decision (baseline §7.1 item 6).
+operator instead wants the loot scenario to stay purely deterministic
+(non-AI), state explicitly that the `ASSISTED` approval boundary does not
+apply to that path and prove the boundary via the AI-seam regression tests;
+treating the deterministic path as if it were gated is a separate safety
+decision (baseline §7.3 item 6), not an in-scope assumption.
 
 ---
 
@@ -335,14 +382,14 @@ decision (baseline §7.1 item 6).
 
 ---
 
-## 7. Optional, deferred (owner decision)
+## 7. Applied during this documentation PR (no further owner decision needed)
 
 - README `Architecture` diagram node: relabel `Decision & Planning (Rules +
-  AI)` → `Decision (Rules + AI)`.
-- README `Architecture` section: "general planning" wording → "deterministic
-  rules + local AI" to match the shipped capability.
-These are cosmetic/prose; they do not block Phase 7. Apply during 7.0 if
-approved, otherwise leave for a follow-up.
+  AI)` → `Decision (Rules + AI)` — **applied in this PR's diff**.
+- README `Architecture` section: "general planning" wording → "decision
+  support" to match the shipped capability — **applied in this PR's diff**.
+Both are cosmetic/prose and are already part of the `README.md` change in this
+PR; no further owner decision is required to land them.
 
 ---
 
@@ -359,7 +406,8 @@ approved, otherwise leave for a follow-up.
    this is the hard gate before 7.2/7.4 dispatch any input.
 4. Whether to keep `wow_orb` as a distinct template or retire it (recommend
    retire, per §2.2) — minor, resolve during 7.1.
-5. The optional README prose refinements in §7 — not yet approved.
+5. *(Resolved in this PR: the README refinements listed in §7 are
+   applied in this PR's diff; no open owner decision remains for them.)*
 
 ---
 
@@ -370,7 +418,10 @@ approved, otherwise leave for a follow-up.
   record.
 - A single calibrated `wow_crystal` signal is tuned on labelled, held-out
   frames with reported precision/recall.
-- The deterministic policy proposes the one bounded loot action (click the marker + pickup key) and nothing else for the scenario.
+- The one bounded loot action (click the marker + pickup key) is proposed by
+  the AI seam for the control-capable run, and nothing else is proposed; the
+  deterministic policy is proven to produce the same action and to dispatch
+  nothing under `OBSERVE_ONLY`.
 - A single bounded action is proposed, validated, and **explicitly approved by
   a human in ASSISTED mode** before it reaches the executor; the `assisted`
   fail-closed default is unchanged and still proven by tests (no-approver →
