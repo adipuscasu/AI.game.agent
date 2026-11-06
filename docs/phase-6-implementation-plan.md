@@ -193,7 +193,10 @@ anything else (rejection, malformed, out-of-vocabulary) ->
 The loop calls `_dispatch` **only if** the gate returned `True` — a `None`
 return is the "halt before dispatch" signal (machine → `PAUSED`, held inputs
 released, `APPROVAL` audit event recorded). Deterministic (non-AI) actions
-never reach the gate; only `source == "ai"` actions are gated.
+never reach the gate; only actions produced by the AI decision path (the
+`ai_proposed` flag set at the AI seam in `agent/loop.py`, i.e. state is
+`AI_ANALYSIS` and the provider returns a decision) are gated. The gate does
+not read `Action.source`; it keys off the AI seam.
 
 > **Historical note (superseded).** An earlier version of this section
 > showed the guard as `if (... or self._approver is None ...): return

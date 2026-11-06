@@ -306,7 +306,7 @@ Only once all three prerequisites hold:
       action is produced by the **AI seam** (so the shipped gate in
       `agent/loop.py` is consulted), `OBSERVE_ONLY` is *not* set.
 - [ ] Run the scenario with **no human at the keyboard**: the agent observes,
-      the policy proposes the key press, auto-approve dispatches it, the loop
+      the AI provider proposes the key press (AI seam), auto-approve dispatches it, the loop
       re-observes and classifies the outcome.
 - [ ] Record the full evidence trail: commands, config, resolution/UI scale,
       model tag (if AI used), trial count, timings, frame captures, serialized
