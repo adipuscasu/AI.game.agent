@@ -1,7 +1,8 @@
-# Phase 7 Execution Plan — One Bounded WoW Scenario, No Human Involvement
+# Phase 7 Execution Plan — One Bounded WoW Scenario, ASSISTED First
 
-**Status:** ready for implementation (execution plan; supersedes §1.1 item 4 and the
-ASSISTED-only milestone framing in `phase-7-implementation-plan.md`)
+**Status:** ready for implementation (execution plan; aligned with the baseline
+`phase-7-implementation-plan.md` — the first control-capable milestone is
+ASSISTED mode with explicit human approval)
 **Branch:** `feature/phase-7-operational-autonomy`
 **Base:** `develop` at `d4bc1ef192aed9c1849641541df190feb68d0e27`
 **Date:** 2026-11-06
@@ -9,21 +10,24 @@ ASSISTED-only milestone framing in `phase-7-implementation-plan.md`)
 
 > **Relationship to the existing plan.** `phase-7-implementation-plan.md` is the
 > *baseline* planning document. This file is the *execution plan* that refines it
-> against the actual code and the stated goal: **the agent completes one small
-> WoW scenario entirely on its own — no human involvement — with no new
-> mouse-control feature needed.** Where this file disagrees with the baseline,
-> this file wins for Phase 7 execution and the baseline must be reconciled (see
-> §2.4).
+> against the actual code. The first control-capable milestone is **ASSISTED
+> mode with explicit human approval** — the same milestone the baseline
+> defines. **Unattended crystal collection is a later, separate goal** (see
+> §7.4) with its own prerequisites; it does not supersede the ASSISTED-first
+> milestone. Where this file and the baseline disagree on the milestone, the
+> baseline (ASSISTED-first) wins.
 
 ---
 
 ## 1. Goal (restated, testable)
 
 Drive one small, bounded, repeatable World of Warcraft scenario from
-observation → decision → action → verification, **with zero human intervention
-at runtime**, using only input primitives that already exist in the codebase
-(the loot action is a mouse click on the marker plus a pickup key-press — both
-already implemented; §2.1). The agent must:
+observation → decision → action → verification. **The first control-capable
+milestone is ASSISTED mode: every action the agent proposes requires an
+explicit human approval decision before it is dispatched.** It uses only
+input primitives that already exist in the codebase (the loot action is a
+mouse click on the marker plus a pickup key-press — both already
+implemented; §2.1). The agent must:
 
 1. Observe the game screen and extract the small set of scenario facts it needs.
 2. Decide on the single action the scenario allows (deterministic policy
@@ -83,7 +87,7 @@ prevent building things that already exist.
   template and retiring/dedicating `wow_orb` to a sub-region, or use only
   `wow_crystal`).
 
-### 2.3 The approval gate is the only thing that blocks "no human involvement"
+### 2.3 The approval gate is the safety boundary of the ASSISTED milestone
 
 - `src/ai_game_agent/agent/loop.py::_gate_ai_actions` is **fail-closed**: in
   `ASSISTED` mode an AI-proposed action dispatches **only** on an affirmative,
@@ -91,15 +95,17 @@ prevent building things that already exist.
   decision, cancellation, or an approval exception all reject and pause
   (`no-approver-configured` is the recorded reason for the no-approver case).
 - `src/ai_game_agent/actions/approver.py` provides `AutoApprover` (always
-  approve) and `QueueApprover` (console-driven). `AutoApprover` is the natural
-  "no human at runtime" approver — but it is a *test double* by its docstring
-  intent and is currently only reachable by direct injection, not by config.
-- Consequence: the single code change required to run unattended is **exposing
-  an explicit auto-approve mode via configuration** (a new `approval: auto`
-  setting that wires `AutoApprover`, or an equivalent explicit
-  `AutoApprover`-backed `ASSISTED`-mode bypass). This is an *additive,
-  opt-in* relaxation — the default remains fail-closed — and it is the precise,
-  minimal change the goal requires.
+  approve) and `QueueApprover` (console-driven). For the ASSISTED milestone the
+  approver is a human (the `QueueApprover` console or equivalent); `AutoApprover`
+  is a *test double* by its docstring intent and is currently only reachable by
+  direct injection, not by config.
+- Consequence: the ASSISTED milestone needs **no gate change** — the existing
+  fail-closed gate plus a human approver is sufficient. The *later unattended
+  goal* (§7.4) will additionally require exposing an explicit auto-approve mode
+  via configuration (a new `approval: auto` setting that wires `AutoApprover`,
+  or an equivalent explicit `AutoApprover`-backed `ASSISTED`-mode bypass). That
+  is an *additive, opt-in* relaxation — the default remains fail-closed — and it
+  is out of scope for the first milestone.
 
 ### 2.4 Documentation is already corrected (do not re-litigate)
 
@@ -173,12 +179,13 @@ confirm the **selected environment and activity permit this automation**.
 Acceptable evidence: a documented private test environment (e.g. a dedicated
 test client, a throwaway character on a private/authorized setup, or a local
 test harness/mock client) where the activity is permitted. If it cannot be
-established, **Phase 7 stays observation-only** and the "no human involvement"
-claim is deferred — do not weaken this gate.
+established, **Phase 7 stays observation-only** and the unattended goal (§7.4)
+is deferred — do not weaken this gate.
 
 This is a **one-time human gate** (the operator confirms the environment is
-appropriate). It is *not* runtime human involvement; after it is closed, the
-agent runs the scenario alone.
+appropriate). It is distinct from, and in addition to, the per-action human
+approval the ASSISTED milestone requires: closing the one-time gate does not
+remove the requirement that each proposed action be approved at runtime.
 
 ---
 
@@ -211,7 +218,7 @@ and `uv run ruff check src tests` after each.
 - **Exit gate:** with `OBSERVE_ONLY`, the loop logs the proposed action but
   dispatches **zero** input; tests pass headless.
 
-### 7.2 — Opt-in auto-approve mode (the only gate change)
+### 7.2 — Opt-in auto-approve mode (later-goal prerequisite — not part of the first ASSISTED milestone)
 
 - [ ] Add an explicit config knob (e.g. `approval: auto`) that wires the
       existing `AutoApprover` so an AI-proposed action is auto-approved when the
@@ -243,8 +250,26 @@ and `uv run ruff check src tests` after each.
   replayable records; the crystal is detected on the held-out positives with an
   acceptable precision/recall (record the numbers).
 
-### 7.4 — Unattended end-to-end slice (the actual goal)
+### 7.4 — Later goal: unattended end-to-end slice (not the first milestone)
 
+**Status: follow-up goal — not part of the first ASSISTED milestone.** It is
+recorded here so its prerequisites and exit condition are explicit. It may be
+undertaken only after the ASSISTED milestone (7.1 + 7.3 + one approved bounded
+decision) is accepted **and** each prerequisite below is met:
+
+- **Prerequisite 1 — ASSISTED milestone accepted:** one bounded action is
+  proposed, validated, and explicitly approved by a human in ASSISTED mode, with
+  the fail-closed default (`assisted`) unchanged and still proven by tests
+  (no-approver → reject + pause).
+- **Prerequisite 2 — environment authorised:** the §3.1 environment / game-policy
+  gate is closed with written authorization evidence, and the operator
+  explicitly elects unattended operation.
+- **Prerequisite 3 — opt-in auto-approve exposed:** an explicit auto-approve mode
+  is available via configuration (e.g. `approval: auto` wiring the existing
+  `AutoApprover`), the default remains fail-closed, and the scenario action is
+  marked `source == "ai"` so it demonstrably passes through the gate (see §5).
+
+Only once all three prerequisites hold:
 - [ ] Wire 7.1 + 7.2 on the real environment: `approval: auto`, the scenario
       action is AI-gated (`source == "ai"`), `OBSERVE_ONLY` is *not* set.
 - [ ] Run the scenario with **no human at the keyboard**: the agent observes,
@@ -255,10 +280,10 @@ and `uv run ruff check src tests` after each.
       observations, and loop/approval events.
 - [ ] On the first **unknown/failure**, the loop must safe-pause with evidence
       and dispatch no further input.
-- **Exit gate:** at least one fully unattended run succeeds (crystal looted /
-  interaction completed) **and** at least one run that aborts on missing
-  evidence safe-pauses cleanly — both with complete evidence. The operator
-  intervened **zero times** at runtime.
+- **Exit gate (later goal):** at least one fully unattended run succeeds
+  (crystal looted / interaction completed) **and** at least one run that aborts
+  on missing evidence safe-pauses cleanly — both with complete evidence. The
+  operator intervened **zero times** at runtime.
 
 ### 7.5 — Evaluation report & close acceptance criteria
 
@@ -280,18 +305,21 @@ The baseline §2.1 is explicit that the approval gate applies to `source ==
 
 **Decision for Phase 7:** keep the *decision* deterministic (the policy reads
 the loot fact and proposes the key press), but **mark the resulting `Action`
-with `source == "ai"`** for the Phase 7 control trial. This:
+with `source == "ai"`** for the control trial. This:
 
-- exercises the real auto-approve gate end-to-end (proving the "no human
-  involvement" path works through the safety mechanism, not around it);
+- routes the scenario action through the existing approval gate so the safety
+  mechanism is exercised, not bypassed;
 - keeps the fail-closed default (`assisted`) meaningful and tested;
+- for the ASSISTED milestone the gate resolves to a **human approval decision**;
+  the later unattended goal (§7.4), if undertaken, resolves the same gate to an
+  opt-in auto-approve;
 - avoids adding a second, parallel "deterministic auto-approve" mechanism.
 
 Document this choice in the scenario doc and in the PR description. If the
 operator instead prefers the purely deterministic (non-AI) path, that is a
-valid alternative — but then the auto-approve gate is *not* exercised, and the
-"no human involvement" proof must rely on the non-AI path, which should be
-stated explicitly.
+valid alternative — but then the approval gate is *not* exercised by that
+action, which must be stated explicitly and treated as a separate safety
+decision (baseline §7.1 item 6).
 
 ---
 
@@ -334,7 +362,7 @@ approved, otherwise leave for a follow-up.
 
 ---
 
-## 9. Definition of done (Phase 7, no human involvement)
+## 9. Definition of done (Phase 7 — first ASSISTED milestone)
 
 - The selected loot scenario and test environment are documented, with the
   completion condition fixed and the environment-authorization evidence on
@@ -342,18 +370,25 @@ approved, otherwise leave for a follow-up.
 - A single calibrated `wow_crystal` signal is tuned on labelled, held-out
   frames with reported precision/recall.
 - The deterministic policy proposes the one bounded loot action (click the marker + pickup key) and nothing else for the scenario.
-- `approval: auto` (opt-in) dispatches the AI-gated action with **zero**
-  runtime human input; the `assisted` fail-closed default is unchanged and
-  still proven by tests (no-approver → reject + pause).
-- At least one **fully unattended** run succeeds and one run that hits missing
-  evidence safe-pauses cleanly with complete evidence; the operator intervened
-  zero times at runtime in either.
+- A single bounded action is proposed, validated, and **explicitly approved by
+  a human in ASSISTED mode** before it reaches the executor; the `assisted`
+  fail-closed default is unchanged and still proven by tests (no-approver →
+  reject + pause).
+- At least one **ASSISTED** run succeeds (the action is approved, the crystal is
+  looted / the interaction completes) and one run that hits missing evidence
+  safe-pauses cleanly, both with complete evidence; every action was approved by
+  a human at runtime.
+- *(Later unattended goal, §7.4 — separate DoD, not part of this milestone)*
+  once its three prerequisites are met, at least one fully unattended run
+  succeeds and one run that hits missing evidence safe-pauses cleanly, with the
+  operator intervening zero times at runtime.
 - Automated regression checks pass headless; no WoW client, desktop, Ollama,
   or network required for CI.
 - The validation report maps every claimed capability to a recorded evidence
   artifact, and only evidence-backed acceptance criteria are closed.
 
-**Phase 7 does not authorize a claim of general autonomous gameplay.** It proves
-one controlled operational slice — the agent completing one bounded scenario
-entirely on its own — and provides the evidence to decide what the next phase
-should tackle.
+**Phase 7 does not authorize a claim of general autonomous gameplay.** The
+first milestone proves one controlled operational slice — the agent proposes a
+single bounded action that is explicitly approved by a human in ASSISTED mode —
+and provides the evidence to decide what the next phase should tackle.
+Unattended crystal collection is a later, separately-gated goal (§7.4).
