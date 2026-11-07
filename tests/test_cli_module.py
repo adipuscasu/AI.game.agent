@@ -10,13 +10,17 @@ Why this module exists at all (and why we don't just delete ``__main__.py``):
 
 * ``pyproject.toml`` pins the console script to
   ``ai_game_agent.__main__:main``.
-* The test suite (``test_cli``, ``test_run_cli``, ``test_stop_wiring``,
-  ``test_objects``, ``test_ui_zones``, ``test_replay``) patches
-  *module-global* names on ``ai_game_agent.__main__`` — e.g.
-  ``monkeypatch.setattr(cli, "AgentLoop", factory)`` where ``cli`` is
-  ``import ai_game_agent.__main__ as cli``. That pattern only works if
-  ``ai_game_agent.__main__`` re-exports the same function objects the
-  production code resolves through.
+* The patching tests (``test_cli``, ``test_run_cli``,
+  ``test_stop_wiring``) patch *module-global* names on
+  ``ai_game_agent.cli`` — e.g. ``monkeypatch.setattr(cli, "AgentLoop",
+  factory)`` where ``cli`` is ``import ai_game_agent.cli as cli``. A
+  patch must target the module where the production functions resolve
+  their globals: the CLI code is defined in ``cli``, so a patch on the
+  ``ai_game_agent.__main__`` re-export would silently do nothing. The
+  remaining test files (``test_objects``, ``test_ui_zones``,
+  ``test_replay``) only *import* names from ``ai_game_agent.__main__``
+  (no patching), so the re-export's initial shared references are
+  sufficient for them.
 * ``tests/test_cli.py::_repo_root`` derives the repo root from
   ``Path(cli.__file__).parents[2]`` — the shim and the real module must
   live in the same package directory.
