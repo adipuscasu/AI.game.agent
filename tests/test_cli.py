@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-import ai_game_agent.__main__ as cli
-from ai_game_agent.__main__ import main
+import ai_game_agent.cli as cli
+from ai_game_agent.cli import main
 from ai_game_agent.config import load_config
 
 
