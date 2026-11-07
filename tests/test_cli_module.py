@@ -63,6 +63,8 @@ in the shim's namespace to the same object ``cli`` bound, but that is an
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import ai_game_agent.__main__ as main_mod
 import ai_game_agent.cli as cli
 from ai_game_agent.cli import (
@@ -113,10 +115,10 @@ def test_files_live_in_the_same_directory() -> None:
     # the file is at ``<repo>/src/ai_game_agent/<name>.py``. Keeping the
     # shim and the real module in the same package dir guarantees that for
     # whichever one a test imports.
-    assert cli.__file__.rpartition("/")[0] == main_mod.__file__.rpartition("/")[0]
+    assert Path(cli.__file__).resolve().parent == Path(main_mod.__file__).resolve().parent
     # Both resolve to the same repo root under the parents[2] convention.
-    assert __import__("pathlib").Path(cli.__file__).resolve().parents[2] == \
-        __import__("pathlib").Path(main_mod.__file__).resolve().parents[2]
+    assert Path(cli.__file__).resolve().parents[2] == \
+        Path(main_mod.__file__).resolve().parents[2]
 
 
 def test_build_parser_returns_the_same_parser_type() -> None:
