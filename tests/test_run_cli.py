@@ -32,8 +32,8 @@ import json
 import textwrap
 from pathlib import Path
 
-import ai_game_agent.__main__ as cli
-from ai_game_agent.__main__ import main
+import ai_game_agent.cli as cli
+from ai_game_agent.cli import main
 
 # A config that (a) uses the mock capture backend and (b) configures the two
 # target UI zones the WoW policy's COMBAT entry depends on (``target`` and

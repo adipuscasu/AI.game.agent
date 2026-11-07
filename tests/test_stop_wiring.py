@@ -14,14 +14,14 @@ import json
 import threading
 from pathlib import Path
 
-import ai_game_agent.__main__ as cli
-from ai_game_agent.__main__ import main
+import ai_game_agent.cli as cli
 from ai_game_agent.actions.action import Action, ActionKind
 from ai_game_agent.actions.base import InputConfig, create_backend
 from ai_game_agent.actions.executor import Executor
 from ai_game_agent.actions.mock import MockBackend
 from ai_game_agent.actions.modes import OperationMode
 from ai_game_agent.actions.safety import SafetyGuard
+from ai_game_agent.cli import main
 
 _OBSERVE_CONFIG = """
 capture:
