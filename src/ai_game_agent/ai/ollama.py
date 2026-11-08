@@ -208,10 +208,38 @@ class OllamaProvider:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
-            err_body = exc.read()[:512]
+            # Best-effort *release* of the error body: it may echo request
+            # content (prompts can carry base64 screen images) or server
+            # internals, and the message flows into logs, event streams,
+            # and recovery events. The status code + reason (already
+            # captured by the HTTPError) are sufficient to diagnose the
+            # failure without surfacing the body.
+            #
+            # `close()` releases the response stream without draining the
+            # body into the process; the status + reason remain available
+            # after close.
+            try:
+                exc.close()
+            except Exception:
+                pass
+            # P2 (PR #11 review): the HTTP status *reason phrase* is
+            # server-controlled — a local server can read the POST body and
+            # echo request content (prompts, base64 images) into it. Python
+            # stores that phrase in ``HTTPError.msg`` and ``HTTPError``
+            # stringifies itself via ``msg`` (``__str__``/``__repr__`` and
+            # the ``.reason`` property all read it), so the untrusted phrase
+            # would reappear in the ``AIError`` message *and*, via the
+            # ``__cause__`` chain, in the agent-loop exception diagnostics
+            # (``exc_repr``/``exc_cause`` and the formatted traceback,
+            # which renders the cause with its repr). Scrub ``msg`` on the
+            # *chained* HTTPError (keep the exception, its type, ``code``,
+            # and the already-released stream — observability preserved) and
+            # build the message from trusted data only: the local status
+            # code, the locally chosen path, and a fixed description.
+            exc.msg = "server error response (reason withheld)"
             raise AIError(
-                f"Ollama HTTP {exc.code} from {path}: {exc.reason}; "
-                f"body={err_body!r}"
+                f"Ollama HTTP {exc.code} from {path}: "
+                f"{exc.msg}"
             ) from exc
         except urllib.error.URLError as exc:
             raise AIError(
