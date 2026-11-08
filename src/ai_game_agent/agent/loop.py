@@ -607,27 +607,60 @@ class AgentLoop:
     def _on_pipeline_error(
         self, exc: Exception, stage: str, now: float
     ) -> TickResult:
-        """Route a capture/perception failure to bounded RECOVERY -> PAUSED."""
+        """Route a capture/perception failure to bounded RECOVERY -> PAUSED.
+
+        EH4: the diagnostic must be *fully* best-effort, mirroring the EH3
+        cleanup fallback. ``str(exc)``, ``repr(exc)``, the cause/context
+        ``repr`` calls, and ``traceback.format_exception`` can each raise
+        on a pathological exception (broken ``__str__``/``__repr__``,
+        broken cause/context); a secondary diagnostic failure must not
+        escape this method — it would defeat the intended bounded RECOVERY
+        and replace the original pipeline failure with a diagnostic
+        exception. A diagnostic failure therefore falls back to a safe
+        minimal RECOVERY event (stage + attempt + exception type, "details
+        unavailable") that never touches the exception's stringification.
+        """
         before = self._machine.state
         if before is not AgentState.RECOVERY:
             self._machine.enter(AgentState.RECOVERY, reason=f"{stage} failed", now=now)
         attempt = self._machine.note_recovery_attempt()
-        reason = f"{stage} failed (attempt {attempt}): {type(exc).__name__}: {exc}"
-        ev = self._event(
-            event=EventType.RECOVERY,
-            ts=now,
-            state_before=before,
-            state_after=self._machine.state,
-            reason=reason,
-            detail={
-                "stage": stage,
-                "error": str(exc),
-                "attempt": attempt,
-                **self._exception_detail(exc),
-            },
-        )
+        try:
+            reason = f"{stage} failed (attempt {attempt}): {type(exc).__name__}: {exc}"
+            ev = self._event(
+                event=EventType.RECOVERY,
+                ts=now,
+                state_before=before,
+                state_after=self._machine.state,
+                reason=reason,
+                detail={
+                    "stage": stage,
+                    "error": str(exc),
+                    "attempt": attempt,
+                    **self._exception_detail(exc),
+                },
+            )
+        except Exception:  # noqa: BLE001 - a raising diagnostic must not defeat RECOVERY
+            reason = (
+                f"{stage} failed (attempt {attempt}): "
+                f"{type(exc).__name__} (details unavailable)"
+            )
+            ev = self._event(
+                event=EventType.RECOVERY,
+                ts=now,
+                state_before=before,
+                state_after=self._machine.state,
+                reason=reason,
+                detail={
+                    "stage": stage,
+                    "attempt": attempt,
+                    "exc_type": type(exc).__name__,
+                },
+            )
         self._errors.append(ev)
-        self._emit(ev)
+        try:
+            self._emit(ev)
+        except Exception:  # noqa: BLE001 - a broken sink must not defeat RECOVERY
+            pass
         if self._machine.recovery_exhausted():
             self._machine.enter(
                 AgentState.PAUSED,

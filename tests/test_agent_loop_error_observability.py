@@ -611,7 +611,7 @@ def test_clean_run_with_failing_cleanup_is_reported_and_delivered(make_loop) -> 
 # ---------------------------------------------------------------------------
 
 
-def test_cleanup_step_with_raising_exception_repr_is_recorded_and_primary_propagates(make_loop) -> None:
+def test_cleanup_step_with_raising_exception_repr_is_recorded_and_primary_propagates(make_loop) -> None:  # noqa: E501
     """Primary exception + a failing ``disarm()`` whose exception type
     raises in ``__str__``/``__repr__``: the diagnostic path must be fully
     best-effort — the ``capture.stop`` step after it must still run, and
@@ -654,4 +654,396 @@ def test_cleanup_step_with_raising_exception_repr_is_recorded_and_primary_propag
     # No diagnostic exception leaked into the recorded events.
     for e in errors:
         assert "diagnostic clock failure (EH3)" not in (e.reason or "")
+
+
+# ---------------------------------------------------------------------------
+# 8. EH4 — the pipeline failure-reporting path must be *fully* best-effort
+#    too (F1), plus the two regression locks the EH3 review flagged as
+#    missing: a cleanup *clock* failure (F2) and an *isolated* __repr__
+#    failure (F3).
+#
+#    Central invariant: an exception-reporting failure must never become a
+#    new operational failure, prevent recovery, interrupt safe shutdown,
+#    or replace the original failure.
+# ---------------------------------------------------------------------------
+
+
+class _EH4ClockDisarm(Exception):
+    """Ordinary exception: only the *clock* is broken, not the exception."""
+
+    def __str__(self) -> str:
+        return "disarm broke (EH4 clock)"
+
+
+def test_cleanup_clock_failure_is_best_effort_and_primary_propagates(make_loop) -> None:
+    """The clock failing *during cleanup diagnostic generation* must not
+    mask the primary exception or abort the remaining cleanup steps.
+
+    The first ``now()`` call (the tick's own timestamp) succeeds so the run
+    reaches the intended cleanup path; every subsequent call — the
+    diagnostic's timestamp — raises. The failing step's evidence must still
+    be retained (step name, best-effort), the ``capture.stop`` step after it
+    must still run, and the PRIMARY exception must remain the one that
+    propagates (the clock exception must not replace it)."""
+    hotkey = FakeHotkeyListener(on_trigger=lambda: None)
+
+    def failing_disarm() -> None:
+        raise _EH4ClockDisarm()
+
+    hotkey.disarm = failing_disarm  # type: ignore[method-assign]
+    capture = _FakeCapture()  # capture.stop must still run
+
+    calls = {"n": 0}
+
+    # Call budget: 1 = run()'s _reset_report()/_start_wall, 2 = the tick's
+    # own timestamp (tick: now = self._now()). Both must SUCCEED so the run
+    # reaches the intended cleanup path. Call 3 onward = the cleanup
+    # diagnostic's timestamp — and only there does the clock fail.
+    def flaky_clock() -> float:
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise RuntimeError("diagnostic clock failure (EH4)")
+        return 0.0
+
+    loop = _primary_failure_loop(make_loop, capture=capture, hotkey=hotkey)
+    loop._now = flaky_clock  # the tick's timestamp succeeds; the diagnostic's fails
+
+    with pytest.raises(RuntimeError, match=re.escape("simulated decision failure (EH2 primary)")):
+        loop.run()
+
+    # The clock failure did not prevent the following step.
+    assert capture.stopped is True, "capture.stop must run after a clock-failing diagnostic"
+    assert capture.stop_call_count == 1
+
+    # Fallback evidence for the failing step is retained (best-effort).
+    errors = _error_events(loop._errors)
+    assert len(errors) >= 1, "a clock-failing diagnostic must still leave a step-named ERROR event"
+    assert "disarm" in {e.detail.get("step") for e in errors}
+
+    # No diagnostic clock exception leaked into any recorded event.
+    for e in errors:
+        assert "diagnostic clock failure (EH4)" not in (e.reason or "")
+        assert "diagnostic clock failure (EH4)" not in str(e.detail)
+
+
+class _EH4ReprOnlyDisarm(Exception):
+    """``__str__`` succeeds; ``__repr__`` raises — isolates the ``repr()``
+    seam inside the diagnostic from the ``str`` seam (the combined EH3 test
+    cannot prove the repr line is protected, because str() is invoked
+    first)."""
+
+    def __str__(self) -> str:
+        return "disarm broke (EH4 repr-only)"
+
+    def __repr__(self) -> str:
+        raise RuntimeError("repr diagnostic failure (EH4)")
+
+
+def test_cleanup_step_with_raising_repr_only_is_isolated(make_loop) -> None:
+    """A failing cleanup step whose exception type has a healthy ``__str__``
+    but a raising ``__repr__``: the diagnostic must actually *reach* the
+    ``repr()`` operation (inside ``_exception_detail``) without it
+    escaping — the ``capture.stop`` step after it must still run, the
+    PRIMARY exception must remain the one that propagates, and the retained
+    evidence must identify the failing step while leaking no diagnostic
+    exception."""
+    hotkey = FakeHotkeyListener(on_trigger=lambda: None)
+
+    def failing_disarm() -> None:
+        raise _EH4ReprOnlyDisarm()
+
+    hotkey.disarm = failing_disarm  # type: ignore[method-assign]
+    capture = _FakeCapture()  # capture.stop must still run after the failing step
+
+    loop = _primary_failure_loop(make_loop, capture=capture, hotkey=hotkey)
+
+    with pytest.raises(RuntimeError, match=re.escape("simulated decision failure (EH2 primary)")):
+        loop.run()
+
+    # The step AFTER the failing one still ran (the repr failure did not escape).
+    assert capture.stopped is True, "capture.stop must run after a repr-failing diagnostic"
+    assert capture.stop_call_count == 1
+
+    # Fallback/primary evidence retains the failing step name.
+    errors = _error_events(loop._errors)
+    assert len(errors) >= 1
+    assert "disarm" in {e.detail.get("step") for e in errors}
+
+    # No diagnostic exception leaked into the recorded events.
+    for e in errors:
+        assert "repr diagnostic failure (EH4)" not in (e.reason or "")
+        assert "repr diagnostic failure (EH4)" not in str(e.detail)
+
+
+class _EH4RaisingReprPerception(Exception):
+    """``__str__`` succeeds (a recognizable message); ``__repr__`` raises a
+    secondary exception — the pipeline-diagnostic failure seam (F1/F4)."""
+
+    def __str__(self) -> str:
+        return "perception broke (EH4 pipeline)"
+
+    def __repr__(self) -> str:
+        raise RuntimeError("repr diagnostic failure (EH4)")
+
+
+class _EH4RaisingStrPerception(Exception):
+    """``__str__`` raises (``__repr__`` left working) — isolates the
+    pipeline's ``str(exc)`` diagnostic failure seam, which no other EH4
+    pipeline test exercises: there ``__repr__`` (or the cause/context
+    ``repr``) is what fails."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("str diagnostic failure (EH4)")
+
+    def __repr__(self) -> str:
+        return "<EH4RaisingStrPerception: str broken>"
+
+
+def test_pipeline_repr_failure_routes_to_recovery_without_leaking(make_loop) -> None:
+    """A perception failure whose exception type raises in ``__repr__``:
+    ``tick()`` must still *return* the bounded RECOVERY result (never leak
+    the diagnostic exception), the machine must be in RECOVERY, and the
+    RECOVERY event must be retained with the stage, attempt, and the
+    original exception type — explicitly flagging that detailed diagnostics
+    were unavailable, without fabricating message/cause/context content.
+    """
+    events: list[LoopEvent] = []
+    loop = make_loop(
+        perception=_ScriptedPerception(_EH4RaisingReprPerception()),
+        on_event=events.append,
+        recovery_attempts=2,  # one attempt: stay in RECOVERY, not exhausted
+    )
+
+    result = loop.tick()  # must RETURN, not raise the diagnostic exception
+
+    # Bounded RECOVERY routing preserved.
+    assert result.state is AgentState.RECOVERY
+    assert loop._machine.state is AgentState.RECOVERY
+
+    recovery = _recovery_events(events)
+    assert len(recovery) == 1
+    ev = recovery[0]
+
+    # Stage/attempt preserved; the ORIGINAL exception type is identifiable.
+    assert ev.detail.get("stage") == "perception"
+    assert ev.detail.get("attempt") == 1
+    assert ev.detail.get("exc_type") == "_EH4RaisingReprPerception"
+
+    # The fallback explicitly identifies that detailed diagnostics were
+    # unavailable (spec: it must say so, not just be absent).
+    assert "unavailable" in (ev.reason or "").lower()
+    assert "perception" in (ev.reason or "")
+    assert "attempt 1" in (ev.reason or "")
+
+    # No secondary diagnostic exception appears as the reported failure.
+    assert "repr diagnostic failure (EH4)" not in (ev.reason or "")
+    assert "repr diagnostic failure (EH4)" not in str(ev.detail)
+    assert "repr diagnostic failure (EH4)" not in (result.error or "")
+
+    # No fabricated cause/context information.
+    assert "exc_cause" not in ev.detail
+    assert "exc_context" not in ev.detail
+
+
+class _EH4BrokenReprCause(Exception):
+    """Explicit ``__cause__`` whose ``__repr__`` raises."""
+
+    def __repr__(self) -> str:
+        raise RuntimeError("cause repr failure (EH4)")
+
+
+def test_pipeline_broken_cause_repr_does_not_leak(make_loop) -> None:
+    """An explicit ``__cause__`` whose ``__repr__`` raises: the cause
+    formatting inside ``_exception_detail`` is an independent operation and
+    must be contained; routing, evidence, and no-leak guarantees as above.
+    """
+    exc = RuntimeError("perception broke (EH4 cause)")
+    exc.__cause__ = _EH4BrokenReprCause("cause payload")
+    events: list[LoopEvent] = []
+    loop = make_loop(
+        perception=_ScriptedPerception(exc),
+        on_event=events.append,
+        recovery_attempts=2,
+    )
+
+    result = loop.tick()  # must return, not leak the cause-repr failure
+
+    assert result.state is AgentState.RECOVERY
+    assert loop._machine.state is AgentState.RECOVERY
+
+    recovery = _recovery_events(events)
+    assert len(recovery) == 1
+    ev = recovery[0]
+
+    assert ev.detail.get("stage") == "perception"
+    assert ev.detail.get("attempt") == 1
+    assert ev.detail.get("exc_type") == "RuntimeError"
+    assert "unavailable" in (ev.reason or "").lower()
+
+    # No leak, and no fabricated cause field.
+    assert "cause repr failure (EH4)" not in (ev.reason or "")
+    assert "cause repr failure (EH4)" not in str(ev.detail)
+    assert "cause repr failure (EH4)" not in (result.error or "")
+    assert "exc_cause" not in ev.detail
+
+
+class _EH4BrokenReprContext(Exception):
+    """Implicit ``__context__`` whose ``__repr__`` raises."""
+
+    def __repr__(self) -> str:
+        raise RuntimeError("context repr failure (EH4)")
+
+
+def test_pipeline_broken_context_repr_does_not_leak(make_loop) -> None:
+    """An implicit ``__context__`` whose ``__repr__`` raises: the context
+    field is formatted independently of the cause field and must be
+    contained; routing, evidence, and no-leak guarantees as above."""
+    exc = RuntimeError("perception broke (EH4 context)")
+    exc.__context__ = _EH4BrokenReprContext("context payload")
+    events: list[LoopEvent] = []
+    loop = make_loop(
+        perception=_ScriptedPerception(exc),
+        on_event=events.append,
+        recovery_attempts=2,
+    )
+
+    result = loop.tick()  # must return, not leak the context-repr failure
+
+    assert result.state is AgentState.RECOVERY
+    assert loop._machine.state is AgentState.RECOVERY
+
+    recovery = _recovery_events(events)
+    assert len(recovery) == 1
+    ev = recovery[0]
+
+    assert ev.detail.get("stage") == "perception"
+    assert ev.detail.get("attempt") == 1
+    assert ev.detail.get("exc_type") == "RuntimeError"
+    assert "unavailable" in (ev.reason or "").lower()
+
+    # No leak, and no fabricated context field.
+    assert "context repr failure (EH4)" not in (ev.reason or "")
+    assert "context repr failure (EH4)" not in str(ev.detail)
+    assert "context repr failure (EH4)" not in (result.error or "")
+    assert "exc_context" not in ev.detail
+
+
+def test_pipeline_diag_failure_still_exhausts_bounded_recovery(make_loop) -> None:
+    """The bounded-recovery contract must hold even when diagnostics fail:
+    with a single allowed attempt, a diagnostic-failing pipeline failure
+    must still exhaust recovery and land the machine in PAUSED — with the
+    RECOVERY event retained (not lost to the diagnostic failure)."""
+    events: list[LoopEvent] = []
+    loop = make_loop(
+        perception=_ScriptedPerception(_EH4RaisingReprPerception()),
+        on_event=events.append,
+        recovery_attempts=1,  # one attempt: exhausted -> PAUSED
+    )
+
+    result = loop.tick()  # must return, not leak the diagnostic exception
+
+    assert result.state is AgentState.PAUSED
+    assert loop._machine.state is AgentState.PAUSED
+
+    recovery = _recovery_events(events)
+    assert len(recovery) == 1
+    assert recovery[0].detail.get("stage") == "perception"
+    assert recovery[0].detail.get("attempt") == 1
+
+
+def test_pipeline_str_failure_routes_to_recovery_without_leaking(make_loop) -> None:
+    """A perception failure whose exception type raises in ``__str__`` (while
+    ``__repr__`` works): isolates the pipeline's ``str(exc)`` diagnostic seam,
+    which no other EH4 pipeline test covers. ``tick()`` must still *return* the
+    bounded RECOVERY result (never leak the diagnostic exception), the machine
+    must be in RECOVERY (attempts not exhausted), and the RECOVERY event must be
+    retained with the stage, attempt, and the original exception type —
+    explicitly flagging that detailed diagnostics were unavailable, and the
+    diagnostic exception must not appear as the reported failure."""
+    events: list[LoopEvent] = []
+    loop = make_loop(
+        perception=_ScriptedPerception(_EH4RaisingStrPerception()),
+        on_event=events.append,
+        recovery_attempts=2,  # one attempt: stay in RECOVERY, not exhausted
+    )
+
+    result = loop.tick()  # must RETURN, not raise the diagnostic exception
+
+    # Bounded RECOVERY routing preserved.
+    assert result.state is AgentState.RECOVERY
+    assert loop._machine.state is AgentState.RECOVERY
+
+    # Exactly the expected RECOVERY event is retained.
+    recovery = _recovery_events(events)
+    assert len(recovery) == 1
+    ev = recovery[0]
+
+    # Stage/attempt preserved; the ORIGINAL exception type is identifiable.
+    assert ev.detail.get("stage") == "perception"
+    assert ev.detail.get("attempt") == 1
+    assert ev.detail.get("exc_type") == "_EH4RaisingStrPerception"
+
+    # The fallback explicitly identifies that detailed diagnostics were
+    # unavailable (spec: it must say so, not just be absent).
+    assert "unavailable" in (ev.reason or "").lower()
+    assert "perception" in (ev.reason or "")
+    assert "attempt 1" in (ev.reason or "")
+
+    # The diagnostic exception does not appear in the event or result error.
+    assert "str diagnostic failure (EH4)" not in (ev.reason or "")
+    assert "str diagnostic failure (EH4)" not in str(ev.detail)
+    assert "str diagnostic failure (EH4)" not in (result.error or "")
+
+    # No fabricated cause/context information.
+    assert "exc_cause" not in ev.detail
+    assert "exc_context" not in ev.detail
+
+
+def test_pipeline_event_sink_failure_does_not_defeat_recovery(make_loop) -> None:
+    """The implementation guards ``_emit(ev)`` so a failing event sink cannot
+    interrupt recovery. A perception failure with a *normal* exception (the
+    diagnostic path succeeds) plus an ``on_event`` callback that raises when
+    the RECOVERY event is delivered must not leak out of ``tick()``; with a
+    single allowed recovery attempt the attempt is exhausted and the machine
+    reaches PAUSED, while the RECOVERY event remains retained in
+    ``loop._errors`` — the sink failure neither loses the event nor replaces
+    the original pipeline failure."""
+    events: list[LoopEvent] = []
+
+    def _sink_raises(event: LoopEvent) -> None:
+        if event.event is EventType.RECOVERY:
+            raise RuntimeError("sink diagnostic failure (EH4)")
+        events.append(event)
+
+    loop = make_loop(
+        perception=_ScriptedPerception(
+            RuntimeError("perception pipeline failure (EH4 sink test)")
+        ),
+        on_event=_sink_raises,
+        recovery_attempts=1,  # one attempt: exhausted -> PAUSED
+    )
+
+    result = loop.tick()  # must return; the sink exception must not escape
+
+    assert result.state is AgentState.PAUSED
+    assert loop._machine.state is AgentState.PAUSED
+
+    # The RECOVERY event remains retained despite the callback failure.
+    retained = [e for e in loop._errors if e.event is EventType.RECOVERY]
+    assert len(retained) == 1
+    ev = retained[0]
+
+    # It still carries the expected stage/attempt/type information.
+    assert ev.detail.get("stage") == "perception"
+    assert ev.detail.get("attempt") == 1
+    assert ev.detail.get("exc_type") == "RuntimeError"
+
+    # It IS the original pipeline failure (the sink did not replace it).
+    assert "perception pipeline failure (EH4 sink test)" in (ev.reason or "")
+    assert "perception pipeline failure (EH4 sink test)" in (result.error or "")
+
+    # The sink exception does not appear as diagnostic content.
+    assert "sink diagnostic failure (EH4)" not in (ev.reason or "")
+    assert "sink diagnostic failure (EH4)" not in str(ev.detail)
+    assert "sink diagnostic failure (EH4)" not in (result.error or "")
 
