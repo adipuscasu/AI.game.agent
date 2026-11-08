@@ -601,3 +601,57 @@ def test_clean_run_with_failing_cleanup_is_reported_and_delivered(make_loop) -> 
     assert len(delivered) == 2
     assert delivered[0] is disarm_ev
     assert delivered[1] is stop_ev
+
+
+# ---------------------------------------------------------------------------
+# 7. EH3 F1 reds — a cleanup step whose failure is *itself* unstringifiable
+#    must still be recorded best-effort; the diagnostic path must be fully
+#    isolated so it can neither abort the remaining cleanup steps nor mask
+#    the primary exception.
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_step_with_raising_exception_repr_is_recorded_and_primary_propagates(make_loop) -> None:
+    """Primary exception + a failing ``disarm()`` whose exception type
+    raises in ``__str__``/``__repr__``: the diagnostic path must be fully
+    best-effort — the ``capture.stop`` step after it must still run, and
+    the PRIMARY exception must remain the one that propagates (no
+    diagnostic exception may mask it). At least one ERROR event must be
+    retained for the disarm step (best-effort step name)."""
+
+    class _RaisingDisarm(Exception):
+        pass
+
+    def failing_disarm() -> None:
+        raise _RaisingDisarm("disarm blew up (EH3)")
+
+    # Make str()/repr() raise: the EH2 diagnostic does
+    # f"...{exc}" / str(exc) / repr(exc) inside its except block.
+    _RaisingDisarm.__str__ = lambda self: (_ for _ in ()).throw(
+        RuntimeError("diagnostic clock failure (EH3)")
+    )
+    _RaisingDisarm.__repr__ = _RaisingDisarm.__str__
+
+    hotkey = FakeHotkeyListener(on_trigger=lambda: None)
+    hotkey.disarm = failing_disarm  # type: ignore[method-assign]
+    capture = _FakeCapture()  # capture.stop must still run after the failing step
+
+    loop = _primary_failure_loop(make_loop, capture=capture, hotkey=hotkey)
+
+    with pytest.raises(RuntimeError, match=re.escape("simulated decision failure (EH2 primary)")):
+        loop.run()
+
+    # The step AFTER the failing one still ran (the diagnostic could not abort it).
+    assert capture.stopped is True, "capture.stop must run after a raising-diagnostic step"
+    assert capture.stop_call_count == 1
+
+    # At least one ERROR event retained for the failing step (best-effort).
+    errors = _error_events(loop._errors)
+    assert len(errors) >= 1, "a raising diagnostic must still leave a step-named ERROR event"
+    steps = {e.detail.get("step") for e in errors}
+    assert "disarm" in steps, f"the failing step must be identified: {steps!r}"
+
+    # No diagnostic exception leaked into the recorded events.
+    for e in errors:
+        assert "diagnostic clock failure (EH3)" not in (e.reason or "")
+

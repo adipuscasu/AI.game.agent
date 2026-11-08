@@ -967,6 +967,51 @@ class TestOllamaTransport:
         finally:
             server.stop()
 
+    def test_http_error_error_stream_is_closed_not_drained(self):
+        """A non-2xx response stream must be *closed*, not drained.
+
+        Reading the error body pulls it into the process, and it may echo
+        the request payload (prompts can carry base64 screen images) or
+        server internals. The contract is best-effort release via
+        ``close()``; the discriminator is ``HTTPError.closed`` — a drained
+        (``read()``) stream stays ``closed == False``, a closed one is
+        ``closed == True``.
+
+        The failure must still surface as an AIError with the status, and
+        the HTTPError must remain on the ``__cause__`` chain so the
+        release is auditable."""
+        import urllib.error
+
+        from ai_game_agent.ai import AIError, OllamaProvider
+
+        marker = "ECHOED-SECRET-MARKER-EH3"
+        server = _ScriptedOllamaServer(status=502, response=marker.encode("utf-8"))
+        base_url = server.start()
+        try:
+            p = OllamaProvider(model="m", base_url=base_url, timeout=5.0)
+            with pytest.raises(AIError) as exc_info:
+                p.complete("hi")
+            msg = str(exc_info.value)
+            assert "502" in msg
+            assert marker not in msg
+
+            # The HTTPError must remain on the __cause__ chain.
+            http_err = None
+            node = exc_info.value
+            seen = set()
+            while node is not None and id(node) not in seen:
+                seen.add(id(node))
+                if isinstance(node, urllib.error.HTTPError):
+                    http_err = node
+                    break
+                node = node.__cause__
+            assert http_err is not None, "the HTTPError must remain on the __cause__ chain"
+            assert http_err.closed is True, (
+                "the non-2xx error stream must be closed (released), not drained"
+            )
+        finally:
+            server.stop()
+
     def test_timeout_raises_ai_error(self):
         """A server that sleeps longer than the client timeout triggers
         a socket.timeout surfaced as AIError."""

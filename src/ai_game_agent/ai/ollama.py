@@ -208,13 +208,18 @@ class OllamaProvider:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
-            # Read-and-discard the error body: it may echo request content
-            # (prompts can carry base64 screen images) or server internals,
-            # and the message flows into logs, event streams, and recovery
-            # events. The status code + reason are sufficient to diagnose
-            # the failure without surfacing the body.
+            # Best-effort *release* of the error body: it may echo request
+            # content (prompts can carry base64 screen images) or server
+            # internals, and the message flows into logs, event streams,
+            # and recovery events. The status code + reason (already
+            # captured by the HTTPError) are sufficient to diagnose the
+            # failure without surfacing the body.
+            #
+            # `close()` releases the response stream without draining the
+            # body into the process; the status + reason remain available
+            # after close.
             try:
-                exc.read()
+                exc.close()
             except Exception:
                 pass
             raise AIError(

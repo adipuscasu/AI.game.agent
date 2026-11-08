@@ -751,12 +751,29 @@ class AgentLoop:
         try:
             fn()
         except Exception as exc:  # noqa: BLE001 - record, then must not mask
-            ev = self._event(
-                event=EventType.ERROR,
-                ts=self._now(),
-                reason=f"cleanup step '{step}' failed: {type(exc).__name__}: {exc}",
-                detail={"step": step, "error": str(exc), **self._exception_detail(exc)},
-            )
+            # EH3: the diagnostic must be *fully* best-effort. Building it
+            # touches ``self._now()``, ``str(exc)``, and
+            # ``_exception_detail``'s ``repr(exc)`` — a pathological
+            # exception with a broken ``__str__``/``__repr__`` (or a
+            # raising clock) would raise *inside this except block*,
+            # aborting the remaining cleanup steps and masking the
+            # primary exception. A secondary diagnostic failure therefore
+            # falls back to a safe minimal event that never touches the
+            # exception.
+            try:
+                ev = self._event(
+                    event=EventType.ERROR,
+                    ts=self._now(),
+                    reason=f"cleanup step '{step}' failed: {type(exc).__name__}: {exc}",
+                    detail={"step": step, "error": str(exc), **self._exception_detail(exc)},
+                )
+            except Exception:  # noqa: BLE001 - a raising diagnostic must not mask the stop
+                ev = self._event(
+                    event=EventType.ERROR,
+                    ts=0.0,
+                    reason=f"cleanup step '{step}' failed (details unavailable)",
+                    detail={"step": step, "error": type(exc).__name__},
+                )
             self._errors.append(ev)
             try:
                 self._emit(ev)
