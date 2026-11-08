@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import replace as _replace
@@ -567,6 +568,42 @@ class AgentLoop:
 
     # ---- pipeline failure handling -----------------------------------------
 
+    # EH2: bounded, no-locals, length-capped exception metadata for the
+    # audit trail. Adds ``exc_type``/``exc_repr``/``exc_traceback`` (plus
+    # ``exc_cause``/``exc_context`` when present) on top of the existing
+    # stage/error/attempt fields, so operational vs unexpected failures stay
+    # distinguishable and the raise site survives the audit trail.
+    _TB_CAP = 4_000
+    _TB_RESERVE = 500
+
+    def _exception_detail(self, exc: BaseException) -> dict[str, object]:
+        cap = self._TB_CAP
+        res = self._TB_RESERVE
+        tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
+        tb_text = "".join(tb)
+        if len(tb_text) > cap:
+            keep = max(cap - res, 200)
+            tb_text = (
+                "Traceback (most recent call last):\n"
+                "  [... truncated ...]\n"
+                + tb_text[-keep:]
+            )
+        detail: dict[str, object] = {
+            "exc_type": type(exc).__name__,
+            "exc_repr": repr(exc),
+            "exc_traceback": tb_text,
+        }
+        if exc.__cause__ is not None:
+            detail["exc_cause"] = repr(exc.__cause__)
+        # EH2: each chain field mirrors its actual Python attribute
+        # independently. `exc_context` comes only from `__context__` —
+        # never from `__cause__`. An explicit `raise ... from cause`
+        # outside an active handler sets `__cause__` only, so
+        # `exc_context` must stay absent in that case.
+        if exc.__context__ is not None:
+            detail["exc_context"] = repr(exc.__context__)
+        return detail
+
     def _on_pipeline_error(
         self, exc: Exception, stage: str, now: float
     ) -> TickResult:
@@ -575,14 +612,19 @@ class AgentLoop:
         if before is not AgentState.RECOVERY:
             self._machine.enter(AgentState.RECOVERY, reason=f"{stage} failed", now=now)
         attempt = self._machine.note_recovery_attempt()
-        reason = f"{stage} failed (attempt {attempt}): {exc}"
+        reason = f"{stage} failed (attempt {attempt}): {type(exc).__name__}: {exc}"
         ev = self._event(
             event=EventType.RECOVERY,
             ts=now,
             state_before=before,
             state_after=self._machine.state,
             reason=reason,
-            detail={"stage": stage, "error": str(exc), "attempt": attempt},
+            detail={
+                "stage": stage,
+                "error": str(exc),
+                "attempt": attempt,
+                **self._exception_detail(exc),
+            },
         )
         self._errors.append(ev)
         self._emit(ev)
@@ -684,20 +726,42 @@ class AgentLoop:
         mask the original exception (``finally``) or the
         ``capture_start_failed`` report. All three are idempotent on a
         clean state, so calling this on every exit path is safe.
+
+        EH2: a step that *fails* is recorded as an ``ERROR`` event (step
+        name + exception identity + traceback) before it is swallowed, so
+        the audit trail retains which resource release broke. The event is
+        recorded in ``self._errors`` first and emitted best-effort — a
+        broken event sink must never mask the primary exception or skip a
+        remaining cleanup step.
+        """
+        self._cleanup_step("release_all", self._executor.release_all)
+        if self._hotkey is not None:
+            self._cleanup_step("disarm", self._hotkey.disarm)
+        self._cleanup_step("capture.stop", self._capture.stop)
+
+    def _cleanup_step(self, step: str, fn) -> None:
+        """Run one idempotent cleanup step, recording a failing one.
+
+        On success: nothing is recorded (a clean run earns no ERROR event).
+        On failure: an ``ERROR`` event is appended to ``self._errors``
+        (before emit, so a broken sink cannot lose it) and emitted
+        best-effort, then swallowed so the primary exception propagates and
+        the remaining cleanup steps still run.
         """
         try:
-            self._executor.release_all()
-        except Exception:  # noqa: BLE001 - belt-and-braces; must not mask the stop
-            pass
-        if self._hotkey is not None:
+            fn()
+        except Exception as exc:  # noqa: BLE001 - record, then must not mask
+            ev = self._event(
+                event=EventType.ERROR,
+                ts=self._now(),
+                reason=f"cleanup step '{step}' failed: {type(exc).__name__}: {exc}",
+                detail={"step": step, "error": str(exc), **self._exception_detail(exc)},
+            )
+            self._errors.append(ev)
             try:
-                self._hotkey.disarm()
-            except Exception:  # noqa: BLE001 - disarm must not mask capture.stop
+                self._emit(ev)
+            except Exception:  # noqa: BLE001 - a broken sink must not mask the stop
                 pass
-        try:
-            self._capture.stop()
-        except Exception:  # noqa: BLE001 - one cleanup failure must not skip this
-            pass
 
     # ---- report assembly ----------------------------------------------------
 

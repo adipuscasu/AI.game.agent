@@ -942,6 +942,31 @@ class TestOllamaTransport:
         finally:
             server.stop()
 
+    def test_http_error_message_does_not_echo_response_body(self):
+        """A non-2xx response body must not be interpolated into the
+        exception message: a non-trusted endpoint could echo back the
+        request payload (which may contain base64 screen images) and the
+        error text flows into logs, event streams, and recovery events.
+
+        The marker must be sent as raw ``bytes`` so the scripted server
+        actually echoes it back (a ``str`` would be coerced to ``b"{}"``
+        and the echo — and this test — would be vacuous)."""
+        from ai_game_agent.ai import AIError, OllamaProvider
+
+        marker_bytes = b"ECHOED-SECRET-MARKER-EH2"
+        server = _ScriptedOllamaServer(status=502, response=marker_bytes)
+        base_url = server.start()
+        try:
+            p = OllamaProvider(model="m", base_url=base_url, timeout=5.0)
+            with pytest.raises(AIError) as exc_info:
+                p.complete("hi")
+            msg = str(exc_info.value)
+            assert "502" in msg
+            assert marker_bytes.decode("utf-8") not in msg
+            assert repr(marker_bytes) not in msg
+        finally:
+            server.stop()
+
     def test_timeout_raises_ai_error(self):
         """A server that sleeps longer than the client timeout triggers
         a socket.timeout surfaced as AIError."""
