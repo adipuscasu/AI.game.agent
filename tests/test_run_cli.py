@@ -33,6 +33,8 @@ import textwrap
 from pathlib import Path
 
 import ai_game_agent.cli as cli
+from ai_game_agent.actions import InputBackendError
+from ai_game_agent.actions.mock import MockBackend
 from ai_game_agent.cli import main
 
 # A config that (a) uses the mock capture backend and (b) configures the two
@@ -382,3 +384,262 @@ def test_run_once_default_compact_json_single_line(tmp_path, capsys) -> None:
     assert "\n" not in out, "compact JSON should be a single line"
     report = json.loads(out)
     assert report["ticks"] == 1
+
+
+# --- EH5 (resource lifecycle): the --record stream handle must be closed ---
+#
+# ``_run`` opens the ``--record`` .jsonl file once and the loop writes one
+# line per event through the recorder closure — a long-lived handle. That
+# handle must be closed **deterministically by production code** (success,
+# exception, and emergency-stop paths), not left to CPython refcount
+# teardown: teardown is non-deterministic and keeps the file locked on
+# Windows (recordings/*.jsonl undeletable) and leaks fds on POSIX.
+#
+# The spy below makes "closed by production code" observable: the test holds
+# a reference to the underlying file (``spies`` list), so GC can never close
+# it for us — in the buggy tree ``close_calls`` stays 0 while the loop and
+# backend paths otherwise pass (a naive "is the fd closed?" check after
+# ``main()`` returns would false-green via refcount teardown).
+
+
+class _SpyFile:
+    """Wraps a real file: records ``close()`` calls, delegates everything."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self.close_calls = 0
+
+    def write(self, data):  # delegate
+        return self._real.write(data)
+
+    def flush(self) -> None:  # delegate
+        return self._real.flush()
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self._real.close()
+
+    @property
+    def closed(self) -> bool:
+        return self._real.closed
+
+    @property
+    def name(self) -> str:
+        return self._real.name
+
+    def __enter__(self) -> _SpyFile:
+        return self
+
+    def __exit__(self, *exc) -> None:  # ExitStack protocol
+        self.close()
+
+
+def _spy_record_file(monkeypatch, tmp_path: Path) -> list:
+    """Return the list of _SpyFile instances the run path captures."""
+    spies: list = []
+
+    real_open = Path.open
+
+    def spy_open(self, mode="r", *args, **kwargs):
+        if "a" in mode:
+            real = real_open(self, mode, *args, **kwargs)
+            spy = _SpyFile(real)
+            spies.append(spy)
+            return spy
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", spy_open)
+    return spies
+
+
+def _capture_loop(run):
+    """Capture the AgentLoop instance from a patched ``AgentLoop.run``."""
+    captured: list = []
+
+    def _run(self):
+        captured.append(self)
+        return run(self)
+
+    return _run, captured
+
+
+def test_run_record_closes_stream_on_success(tmp_path, capsys, monkeypatch) -> None:
+    """EH5: the --record .jsonl handle is closed by production code after a
+    successful run (not left to refcount teardown)."""
+    spies = _spy_record_file(monkeypatch, tmp_path)
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    rc = main(
+        [
+            "run",
+            "--once",
+            "--backend",
+            "mock",
+            "--mode",
+            "observe_only",
+            "--record",
+            "--record-dir",
+            str(tmp_path / "rec"),
+            "--config",
+            cfg,
+        ]
+    )
+    assert rc == 0
+    _stdout_report(capsys)  # report contract still holds
+    assert spies, "the --record stream was never opened (spy not captured)"
+    spy = spies[0]
+    assert spy._real.name.endswith(".jsonl")
+    # The spy *is* the active recorder (the loop wrote ticks through it).
+    with open(spy._real.name, encoding="utf-8") as f:
+        lines = [ln for ln in f.read().splitlines() if ln.strip()]
+    assert lines, "the recorder never wrote a single event"
+    # Production code closed the handle (close_calls >= 1), and the
+    # underlying file is actually released.
+    assert spy.close_calls >= 1, "the --record handle was never closed by production code (leak)"
+    assert spy.closed, "the --record file is still open after the run (leak)"
+
+
+def test_run_record_closes_stream_when_run_raises(tmp_path, capsys, monkeypatch) -> None:
+    """EH5: an exception from loop.run() still closes the --record stream
+    (cleanup ran despite the failure) and the CLI keeps its error contract."""
+    spies = _spy_record_file(monkeypatch, tmp_path)
+    from ai_game_agent.actions import ActionError
+
+    def _raise(self):
+        raise ActionError("boom")
+
+    monkeypatch.setattr(cli.AgentLoop, "run", _raise)
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    rc = main(
+        [
+            "run",
+            "--once",
+            "--backend",
+            "mock",
+            "--mode",
+            "observe_only",
+            "--record",
+            "--record-dir",
+            str(tmp_path / "rec"),
+            "--config",
+            cfg,
+        ]
+    )
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "error:" in err and "boom" in err
+    assert spies, "the --record stream was never opened (spy not captured)"
+    assert spies[0].close_calls >= 1, "the --record handle leaked across the exception path"
+    assert spies[0].closed
+
+
+def test_run_record_closes_stream_on_emergency_stop(tmp_path, capsys, monkeypatch) -> None:
+    """EH5: an emergency stop (F12) halts the loop AND closes the --record
+    stream — the early-exit path releases every owned resource, not just the
+    input backend."""
+    from ai_game_agent.agent import AgentLoopReport
+    from ai_game_agent.state import AgentState
+
+    spies = _spy_record_file(monkeypatch, tmp_path)
+    backend_spy = MockBackend()
+
+    def spy_create_backend(input_cfg, on_stop=None):
+        backend_spy.set_on_stop(on_stop)
+        return backend_spy
+
+    monkeypatch.setattr(cli, "create_backend", spy_create_backend)
+
+    def _run(self):
+        # Fire the stop the same way the F12 hotkey would.
+        backend_spy.trigger_emergency_stop("f12")
+        return AgentLoopReport(
+            ticks=1,
+            transitions=(),
+            actions_attempted=0,
+            actions_ok=0,
+            actions_failed=0,
+            errors=(),
+            final_state=AgentState.PAUSED,
+            stopped_reason="stop_requested",
+            wall_time_s=0.0,
+        )
+
+    monkeypatch.setattr(cli.AgentLoop, "run", _run)
+
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    rc = main(
+        [
+            "run",
+            "--once",
+            "--backend",
+            "mock",
+            "--mode",
+            "autonomous",
+            "--record",
+            "--record-dir",
+            str(tmp_path / "rec"),
+            "--config",
+            cfg,
+        ]
+    )
+    assert rc == 0
+    # The stop actually fired through the wired callback and the backend is
+    # released (existing contract).
+    assert backend_spy.stopped is True
+    assert backend_spy.opened is False
+    # EH5: the record stream was released too.
+    assert spies, "the --record stream was never opened (spy not captured)"
+    assert spies[0].close_calls >= 1, "the --record handle leaked across the emergency-stop path"
+    assert spies[0].closed
+
+
+class _RaisingCloseBackend(MockBackend):
+    """A backend whose close() fails (e.g. the OS refuses to release a key).
+
+    The rest of the lifecycle is faithful, so the run path's cleanup
+    ordering is exactly what production would exercise.
+    """
+
+    def close(self) -> None:
+        super().close()  # release_all() + opened=False (faithful teardown)
+        raise InputBackendError("backend close failed (simulated OS error)")
+
+
+def test_run_record_closes_even_if_backend_close_raises(tmp_path, capsys, monkeypatch) -> None:
+    """EH5: a failing backend.close() must not defeat the record-stream close.
+
+    Nested-finally guarantee: the record stream's release is registered so it
+    runs *even when* the backend's primary cleanup raises.
+    """
+    spies = _spy_record_file(monkeypatch, tmp_path)
+    backend_spy = _RaisingCloseBackend()
+
+    def spy_create_backend(input_cfg, on_stop=None):
+        backend_spy.set_on_stop(on_stop)
+        return backend_spy
+
+    monkeypatch.setattr(cli, "create_backend", spy_create_backend)
+
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    rc = main(
+        [
+            "run",
+            "--once",
+            "--backend",
+            "mock",
+            "--mode",
+            "autonomous",
+            "--record",
+            "--record-dir",
+            str(tmp_path / "rec"),
+            "--config",
+            cfg,
+        ]
+    )
+    err = capsys.readouterr().err
+    # The backend-close failure surfaces as the CLI's clean error contract
+    # (not a raw traceback) — and the record stream is still closed.
+    assert rc == 1
+    assert "error:" in err
+    assert spies, "the --record stream was never opened (spy not captured)"
+    assert spies[0].close_calls >= 1, "a failing backend.close() defeated the record-stream close"
+    assert spies[0].closed

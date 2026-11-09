@@ -41,6 +41,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import math
@@ -1081,7 +1082,12 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         raise ValueError("--max-ticks must be >= 1")
     # Record events to a .jsonl file when --record is set (one line per
     # LoopEvent, via the loop's recorder hook). The file is named after the
-    # run timestamp so multiple recordings don't collide.
+    # run timestamp so multiple recordings don't collide. EH5: the stream is
+    # a long-lived handle owned by this function — it is registered on an
+    # ExitStack and closed deterministically in the finally below (not left
+    # to refcount teardown, which leaked the fd/file lock on the success,
+    # exception, and emergency-stop paths).
+    stack = contextlib.ExitStack()
     recorder = None
     if getattr(args, "record", False):
         rec_dir = Path(getattr(args, "record_dir", None) or "recordings")
@@ -1089,7 +1095,7 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         import time as _t
         stamp = _t.strftime("%Y%m%d-%H%M%S")
         rec_path = rec_dir / f"run-{stamp}.jsonl"
-        rec_file = rec_path.open("a", encoding="utf-8")
+        rec_file = stack.enter_context(rec_path.open("a", encoding="utf-8"))
         def recorder(event):
             rec_file.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
             rec_file.flush()
@@ -1106,19 +1112,25 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         ai=ai_client,
         approver=approver,
     )
-    # The loop owns only the *capture* facade (start/stop); the *input* backend
-    # lifecycle is the CLI's job, exactly like _act(): open before dispatch and
-    # close in finally. Under OBSERVE_ONLY the gate holds end to end (the loop
-    # dispatches nothing), so the backend is left closed — mirroring _act and
-    # avoiding the real backend's hotkey-listener side effect in observe-only.
+    # The loop owns only the *capture* facade (start/stop); the *input*
+    # backend lifecycle is the CLI's job, exactly like _act(). Under
+    # OBSERVE_ONLY the gate holds end to end (the loop dispatches nothing),
+    # so the backend is left closed — mirroring _act and avoiding the real
+    # backend's hotkey-listener side effect in observe-only. EH5: open() is
+    # inside the protected region so a failing open() can no longer leak the
+    # record stream, and the cleanup is nested (stack in a finally-of-finally)
+    # so the record stream is released even if backend.close() raises.
     open_backend = mode is not OperationMode.OBSERVE_ONLY
-    if open_backend:
-        backend.open()
     try:
+        if open_backend:
+            backend.open()
         report = loop.run()
     finally:
-        if open_backend:
-            backend.close()
+        try:
+            if open_backend:
+                backend.close()
+        finally:
+            stack.close()
     if getattr(args, "pretty", False):
         text = json.dumps(report.to_dict(), indent=2)
     else:
