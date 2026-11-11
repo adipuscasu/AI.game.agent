@@ -253,6 +253,153 @@ def _make_executor(backend: object) -> Executor:
     )
 
 
+# --- F3: partial-init failure must not leak a started listener ---------------
+
+
+class _FailingArmHotkey:
+    """A hotkey decider whose arm() fails after the listener has started.
+
+    Mirrors a real teardown race: the pynput listener thread is up, but the
+    emergency-stop wiring (arm) fails — e.g. a callback registration error.
+    The backend must roll back the *started* listener, not leave it running.
+    """
+
+    def __init__(self) -> None:
+        self.armed = False
+
+    def arm(self) -> None:
+        raise RuntimeError("hotkey arm failed (simulated registration error)")
+
+    def disarm(self) -> None:
+        self.armed = False
+
+    def handle(self, key: object) -> None:
+        raise AssertionError("a disarmed decider must never be routed to")
+
+
+class _SpyListener:
+    """A pynput Listener fake that records start/stop so leaks are visible."""
+
+    def __init__(self, on_press: object = None) -> None:
+        self._on_press = on_press
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def _make_partial_init_backend(
+    fail_at: str,
+) -> tuple[object, _SpyListener, _FailingArmHotkey]:
+    """A WindowsBackend whose open() fails at the requested step.
+
+    fail_at:
+      "arm"    -> listener started, arm() raises (the F3 gap)
+      "binder" -> listener started + armed, binder() raises
+    """
+    from ai_game_agent.actions.windows import WindowsBackend
+
+    listener = _SpyListener()
+    decider = _FailingArmHotkey() if fail_at == "arm" else None
+
+    kb = FakeKeyboardController()
+    mouse = FakeMouseController()
+
+    def _make_kb_controller() -> object:
+        return kb
+
+    def _make_listener(on_press: object = None) -> object:
+        return listener
+
+    def _make_mouse_controller() -> object:
+        return mouse
+
+    class _KbMod:
+        Key = FakeKey
+        Controller = _make_kb_controller
+        Listener = _make_listener
+
+    class _MouseMod:
+        Button = FakeButton
+        Controller = _make_mouse_controller
+
+    pyn = type("Pyn", (), {
+        "keyboard": _KbMod,
+        "mouse": _MouseMod,
+    })()
+
+    if fail_at == "binder":
+        def binder(k: object, m: object, lst: object) -> None:
+            raise RuntimeError("binder failed (simulated OS error)")
+        pyn.bind = binder
+
+    backend = WindowsBackend(pynput_factory=lambda: pyn)
+    if decider is not None:
+        backend._hotkey_listener = decider
+    return backend, listener, (decider or _FailingArmHotkey())
+
+
+def test_open_partial_init_failure_stops_started_listener() -> None:
+    """F3: open() failing after listener.start() must stop that listener.
+
+    The started pynput listener holds a live OS input thread; a failed
+    open() must not leave it running (a leaked global hook). The current
+    code has no rollback, so the listener stays started.
+    """
+    backend, listener, decider = _make_partial_init_backend("arm")
+
+    with pytest.raises(RuntimeError, match="hotkey arm failed"):
+        backend.open()
+
+    # The defect: a started-but-not-armed listener is left running.
+    assert listener.started is True
+    assert "F3-defect" or True  # placeholder removed below
+    assert listener.stopped, (
+        "a started listener was leaked by a failed open(); "
+        "the backend must roll back a partially-opened listener"
+    )
+    assert decider.armed is False, "a failed arm must not leave the decider armed"
+
+
+def test_close_after_failed_open_is_safe_and_stops_listener() -> None:
+    """F3: close() after a failed open() is safe and completes the rollback.
+
+    Even if production code (the CLI cleanup path) calls close() after a
+    failed open(), it must not raise, and it must stop any started listener.
+    """
+    backend, listener, _ = _make_partial_init_backend("arm")
+
+    with pytest.raises(RuntimeError, match="hotkey arm failed"):
+        backend.open()
+
+    # close() must be callable after a failed open() and must complete the
+    # rollback (stop the leaked listener) rather than early-returning.
+    backend.close()  # must not raise
+    assert listener.stopped, (
+        "close() after a failed open() did not stop the started listener"
+    )
+
+
+def test_open_binder_failure_stops_started_listener() -> None:
+    """F3 (binder variant): a binder failure must also roll back the listener.
+
+    The binder is the last step before _opened=True; a failure there must
+    not leak the already-started listener either.
+    """
+    backend, listener, _ = _make_partial_init_backend("binder")
+
+    with pytest.raises(RuntimeError, match="binder failed"):
+        backend.open()
+
+    assert listener.stopped, (
+        "a binder failure leaked the started listener"
+    )
+
+
 # --- Contract ----------------------------------------------------------------
 
 

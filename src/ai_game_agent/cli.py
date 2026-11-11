@@ -568,7 +568,16 @@ def _act(args: argparse.Namespace, cfg: Config) -> int:
         _print_action_log(action_log, args)
         return 0
 
-    backend.open()
+    # F6: open() is inside the try/finally so a failing open() still triggers
+    # close() — a half-open backend (opened=True but no listener armed) must
+    # never be leaked, and any held input is drained.
+    try:
+        backend.open()
+    except BaseException:
+        # F6: open() failed; close the half-open backend before re-raising.
+        # close() is idempotent and safe even when open() never completed.
+        backend.close()
+        raise
     try:
         log.info(
             "act: backend=%s mode=%s actions=%d",
@@ -1099,38 +1108,72 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         def recorder(event):
             rec_file.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
             rec_file.flush()
-    loop = AgentLoop(
-        capture=cap,
-        perception=perception,
-        executor=executor,
-        machine=machine,
-        policy=policy,
-        mode=mode,
-        max_ticks=int(max_ticks) if max_ticks is not None else None,
-        stop_event=stop_event,
-        recorder=recorder,
-        ai=ai_client,
-        approver=approver,
-    )
     # The loop owns only the *capture* facade (start/stop); the *input*
     # backend lifecycle is the CLI's job, exactly like _act(). Under
     # OBSERVE_ONLY the gate holds end to end (the loop dispatches nothing),
     # so the backend is left closed — mirroring _act and avoiding the real
-    # backend's hotkey-listener side effect in observe-only. EH5: open() is
-    # inside the protected region so a failing open() can no longer leak the
-    # record stream, and the cleanup is nested (stack in a finally-of-finally)
-    # so the record stream is released even if backend.close() raises.
+    # backend's hotkey-listener side effect in observe-only.
+    #
+    # EH5 (F2 + F5): loop construction, open(), and run() are all inside the
+    # protected region, and cleanup runs in the *finally* so the record
+    # stream is released on every exit path — a failing construction, a
+    # failing open(), or a failing run() included. The primary (operational)
+    # exception always remains the one that propagates: cleanup failures are
+    # attached to it as notes (``BaseException.add_note``, Python 3.11) so
+    # they are observable in ``__notes__`` and never silently swallowed.
+    # When the operational path succeeded, the first cleanup failure
+    # propagates as the error and any further cleanup failures are attached
+    # to it as notes.
     open_backend = mode is not OperationMode.OBSERVE_ONLY
+    primary_exc: BaseException | None = None
     try:
+        loop = AgentLoop(
+            capture=cap,
+            perception=perception,
+            executor=executor,
+            machine=machine,
+            policy=policy,
+            mode=mode,
+            max_ticks=int(max_ticks) if max_ticks is not None else None,
+            stop_event=stop_event,
+            recorder=recorder,
+            ai=ai_client,
+            approver=approver,
+        )
         if open_backend:
             backend.open()
         report = loop.run()
+    except BaseException as exc:
+        # F5: capture the primary exception so a failing cleanup cannot mask
+        # it. It is re-raised *after* cleanup completes, preserving identity
+        # and traceback; cleanup failures are attached to it as notes below.
+        primary_exc = exc
     finally:
-        try:
-            if open_backend:
+        # F5: every cleanup step runs no matter what — a failing close of
+        # one resource must not skip the close of the next. Failures are
+        # collected and made observable (attached to the primary, or raised
+        # when the operational path succeeded); none are silently swallowed.
+        cleanup_failures: list[BaseException] = []
+        if open_backend:
+            try:
                 backend.close()
-        finally:
+            except BaseException as exc:
+                cleanup_failures.append(exc)
+        try:
             stack.close()
+        except BaseException as exc:
+            cleanup_failures.append(exc)
+        if cleanup_failures:
+            if primary_exc is not None:
+                for exc in cleanup_failures:
+                    primary_exc.add_note(f"cleanup failure: {exc!r}")
+            else:
+                first = cleanup_failures[0]
+                for exc in cleanup_failures[1:]:
+                    first.add_note(f"additional cleanup failure: {exc!r}")
+                raise first
+    if primary_exc is not None:
+        raise primary_exc
     if getattr(args, "pretty", False):
         text = json.dumps(report.to_dict(), indent=2)
     else:

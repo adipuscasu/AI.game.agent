@@ -28,14 +28,18 @@ here, which prove the same start-and-stop contract without a live process.
 
 from __future__ import annotations
 
+import argparse
 import json
 import textwrap
 from pathlib import Path
+
+import pytest
 
 import ai_game_agent.cli as cli
 from ai_game_agent.actions import InputBackendError
 from ai_game_agent.actions.mock import MockBackend
 from ai_game_agent.cli import main
+from ai_game_agent.config import load_config
 
 # A config that (a) uses the mock capture backend and (b) configures the two
 # target UI zones the WoW policy's COMBAT entry depends on (``target`` and
@@ -643,3 +647,467 @@ def test_run_record_closes_even_if_backend_close_raises(tmp_path, capsys, monkey
     assert spies, "the --record stream was never opened (spy not captured)"
     assert spies[0].close_calls >= 1, "a failing backend.close() defeated the record-stream close"
     assert spies[0].closed
+
+
+class _RaisingLoopCtor:
+    """Stand-in for AgentLoop whose constructor raises (F2).
+
+    Mirrors a real construction failure, e.g. an invalid ``max_ticks``
+    (``AgentLoop.__init__`` raises ``ValueError`` for ``max_ticks < 1``).
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise ValueError("simulated AgentLoop construction failure")
+
+
+def test_run_record_closes_when_agentloop_ctor_raises(tmp_path, capsys, monkeypatch) -> None:
+    """F2: a failing AgentLoop constructor must not leak the record stream.
+
+    The ``--record`` .jsonl handle is registered on an ExitStack *before* the
+    loop is built. If ``AgentLoop.__init__`` raises, that handle must still be
+    released by production code — it must not be left open (a leaked fd/file
+    lock). The existing lifecycle tests cover the run/close/exception paths;
+    this one covers the *construction-failure* path, where the loop is never
+    built at all.
+    """
+    spies = _spy_record_file(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "AgentLoop", _RaisingLoopCtor)
+
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    rc = main(
+        [
+            "run",
+            "--once",
+            "--backend",
+            "mock",
+            "--mode",
+            "autonomous",
+            "--record",
+            "--record-dir",
+            str(tmp_path / "rec"),
+            "--config",
+            cfg,
+        ]
+    )
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "error:" in err
+    assert spies, "the --record stream was never opened (spy not captured)"
+    assert spies[0].close_calls >= 1, (
+        "the --record handle leaked when the AgentLoop constructor raised"
+    )
+    assert spies[0].closed
+
+
+# ---------------------------------------------------------------------------
+# F5 — cleanup-failure semantics
+#
+# The requirement: the *primary* (operational) exception always remains the
+# exception that propagates out of the run path, no matter how many cleanup
+# operations (backend.close(), record-stream flush/close) fail in the final
+# region. Every cleanup failure must be observable — attached to the primary
+# exception via ``BaseException.add_note`` (Python 3.11+), never silently
+# swallowed, and never allowed to *replace* the primary. A lone cleanup
+# failure (no operational exception) must still propagate as an error.
+#
+# These tests drive ``cli._run`` directly (not ``main``) so the raw exception
+# object is observable — its type, its message, and any notes added by the
+# cleanup region. Driving through ``main`` would only show the rendered
+# "error:" line, which is what the existing lifecycle tests already check.
+# ---------------------------------------------------------------------------
+
+
+class _RunException(Exception):
+    """The primary operational exception (e.g. a crash mid-run)."""
+
+
+class _FailingCloseBackend(MockBackend):
+    """A backend whose close() fails (e.g. the OS refuses to release a key)."""
+
+    def close(self) -> None:
+        raise InputBackendError("backend close failed (simulated OS error)")
+
+
+class _SpyStream:
+    """A record stream whose write/flush/close can fail independently.
+
+    Implements the context-manager protocol so ``ExitStack.enter_context``
+    and ``stack.close()`` work correctly (``__exit__`` delegates to
+    ``close()``).
+    """
+
+    def __init__(self, fail_write: bool = False, fail_flush: bool = False,
+                 fail_close: bool = False) -> None:
+        self.fail_write = fail_write
+        self.fail_flush = fail_flush
+        self.fail_close = fail_close
+        self.writes = 0
+        self.flushes = 0
+        self.closes = 0
+
+    def __enter__(self) -> _SpyStream:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def write(self, data: str) -> int:
+        self.writes += 1
+        if self.fail_write:
+            raise OSError("record stream write failed (simulated disk full)")
+        return len(data)
+
+    def flush(self) -> None:
+        self.flushes += 1
+        if self.fail_flush:
+            raise OSError("record stream flush failed (simulated disk full)")
+
+    def close(self) -> None:
+        self.closes += 1
+        if self.fail_close:
+            raise OSError("record stream close failed (simulated OS error)")
+
+
+def _f5_args(tmp_path: Path, cfg_path: str) -> argparse.Namespace:
+    """A minimal args namespace for ``cli._run`` (autonomous, --once, --record)."""
+    return argparse.Namespace(
+        record=True,
+        record_dir=str(tmp_path / "rec"),
+        mode="autonomous",
+        backend="mock",
+        confirm=False,
+        config=cfg_path,
+        max_ticks=1,
+        once=True,
+        fps=None,
+        region=None,
+        pretty=False,
+    )
+
+
+def _f5_setup(tmp_path, monkeypatch, *,
+              backend: MockBackend | None = None,
+              run_exc: Exception | None = None,
+              stream: _SpyStream | None = None) -> dict:
+    """Wire _run's collaborators: backend, loop.run, and the record stream."""
+    captured: dict = {"open_calls": 0, "close_calls": 0}
+
+    if backend is None:
+        backend = MockBackend()
+
+    def spy_create_backend(input_cfg, on_stop=None):
+        return backend
+
+    monkeypatch.setattr(cli, "create_backend", spy_create_backend)
+
+    # Replace AgentLoop with a fake whose run() does what we tell it.
+    fake_loop_holder: dict = {"loop": None}
+
+    class _FakeLoop:
+        def __init__(self, *a: object, **kw: object) -> None:
+            fake_loop_holder["loop"] = self
+
+        def run(self) -> object:
+            captured["run_calls"] = captured.get("run_calls", 0) + 1
+            if run_exc is not None:
+                raise run_exc
+            from ai_game_agent.agent.report import AgentLoopReport
+            from ai_game_agent.state import AgentState
+            return AgentLoopReport(
+                ticks=1,
+                transitions=(),
+                actions_attempted=0,
+                actions_ok=0,
+                actions_failed=0,
+                errors=(),
+                final_state=AgentState.IDLE,
+                stopped_reason=None,
+                wall_time_s=0.0,
+            )
+
+    monkeypatch.setattr(cli, "AgentLoop", _FakeLoop)
+
+    if stream is not None:
+        # Intercept the record file open: return our spy stream instead.
+        real_open = Path.open
+
+        def spy_open(self, mode="r", *args: object, **kwargs: object):
+            if "a" in mode:
+                return stream
+            return real_open(self, mode, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", spy_open)
+
+    return {"backend": backend, "captured": captured, "loop": fake_loop_holder}
+
+
+def test_f5_scenario1_operational_ok_cleanup_ok(tmp_path, monkeypatch, capsys) -> None:
+    """F5-1: everything works, cleanup succeeds → normal return, record closed.
+
+    This is the baseline that must not regress: the existing success-path
+    tests already cover the visible surface (report JSON, exit 0). Here we
+    assert the internal guarantee: the record stream was closed by production
+    code (not left to teardown).
+    """
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    stream = _SpyStream()
+    env = _f5_setup(tmp_path, monkeypatch, stream=stream)
+    args = _f5_args(tmp_path, cfg)
+
+    rc = cli._run(args, load_config(cfg))
+
+    assert rc == 0
+    assert env["captured"]["run_calls"] == 1
+    assert stream.closes >= 1, "the record stream was not closed by production code"
+
+
+def test_f5_scenario2_operational_fails_cleanup_ok(tmp_path, monkeypatch) -> None:
+    """F5-2: the operational exception propagates, cleanup succeeds.
+
+    The primary exception must be the one that propagates (not a new exception
+    from the cleanup region). The record stream must still be closed.
+    """
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    stream = _SpyStream()
+    primary = _RunException("agent crashed mid-run")
+    _ = _f5_setup(tmp_path, monkeypatch, run_exc=primary, stream=stream)
+    args = _f5_args(tmp_path, cfg)
+
+    with pytest.raises(_RunException) as exc_info:
+        cli._run(args, load_config(cfg))
+
+    assert exc_info.value is primary, "the primary exception was replaced"
+    assert stream.closes >= 1, "the record stream leaked on the exception path"
+
+
+def test_f5_scenario3_operational_ok_cleanup_fails(tmp_path, monkeypatch) -> None:
+    """F5-3: run succeeds but backend.close() fails in cleanup.
+
+    The close() failure must propagate (it is the only failure), be a clean
+    error (InputBackendError), and the record stream must still be closed
+    (nested finally).
+    """
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    stream = _SpyStream()
+    backend = _FailingCloseBackend()
+    _ = _f5_setup(tmp_path, monkeypatch, backend=backend, stream=stream)
+    args = _f5_args(tmp_path, cfg)
+
+    with pytest.raises(InputBackendError) as exc_info:
+        cli._run(args, load_config(cfg))
+
+    assert "backend close failed" in str(exc_info.value)
+    assert stream.closes >= 1, "a failing backend.close() defeated the record-stream close"
+
+
+def test_f5_scenario4_operational_fails_cleanup_fails(tmp_path, monkeypatch) -> None:
+    """F5-4: BOTH the operational exception and cleanup fail.
+
+    The primary operational exception must be the one that propagates (the
+    cleanup failure must NOT mask it). The cleanup failure must be observable
+    — attached to the primary exception via ``add_note`` (Python 3.11).
+    The record stream must still be closed.
+    """
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    stream = _SpyStream(fail_close=True)
+    backend = _FailingCloseBackend()
+    primary = _RunException("agent crashed mid-run")
+    _ = _f5_setup(tmp_path, monkeypatch, backend=backend, run_exc=primary,
+                    stream=stream)
+    args = _f5_args(tmp_path, cfg)
+
+    with pytest.raises(_RunException) as exc_info:
+        cli._run(args, load_config(cfg))
+
+    assert exc_info.value is primary, (
+        "the primary operational exception was masked by a cleanup failure"
+    )
+    # The cleanup failures must be observable on the primary exception.
+    notes = getattr(exc_info.value, "__notes__", [])
+    notes_text = "\n".join(str(n) for n in notes)
+    assert "backend close failed" in notes_text, (
+        "the backend.close() failure was not made observable on the primary "
+        f"exception (notes: {notes!r})"
+    )
+    assert "record stream close failed" in notes_text or (
+        "record" in notes_text
+    ), "the record-stream close failure was not made observable"
+    assert stream.closes >= 1, "the record stream was never attempted for close"
+
+
+def test_f5_scenario5_multiple_cleanup_failures(tmp_path, monkeypatch) -> None:
+    """F5-5: run succeeds, but EVERY cleanup operation fails.
+
+    Both backend.close() and the record-stream close raise. The first cleanup
+    failure propagates (no primary exists), and the *other* failures must be
+    observable via ``add_note`` — none silently swallowed.
+    """
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    stream = _SpyStream(fail_close=True, fail_flush=True)
+    backend = _FailingCloseBackend()
+    _ = _f5_setup(tmp_path, monkeypatch, backend=backend, stream=stream)
+    args = _f5_args(tmp_path, cfg)
+
+    with pytest.raises(InputBackendError) as exc_info:
+        cli._run(args, load_config(cfg))
+
+    assert "backend close failed" in str(exc_info.value)
+    # The record-stream close failure must be observable on the primary.
+    notes = getattr(exc_info.value, "__notes__", [])
+    notes_text = "\n".join(str(n) for n in notes)
+    assert "record stream close failed" in notes_text or (
+        "record" in notes_text
+    ), (
+        "the record-stream close failure was silently swallowed; expected it "
+        f"on the primary exception's notes (notes: {notes!r})"
+    )
+    assert stream.closes >= 1
+
+
+# ---------------------------------------------------------------------------
+# F6 — _act: a failed backend.open() must not leave a half-open backend
+# ---------------------------------------------------------------------------
+
+
+class _RaisingOpenBackend(MockBackend):
+    """A backend whose open() fails (e.g. a missing or locked OS input hook)."""
+
+    def open(self) -> None:
+        self.opened = True
+        raise InputBackendError("backend open failed (simulated OS error)")
+
+
+def test_act_failing_open_still_closes_backend(tmp_path, capsys, monkeypatch) -> None:
+    """F6: a failing backend.open() must still be closed by the act path.
+
+    The ``act`` subcommand opens the backend, runs actions, and closes it in
+    a ``finally``. If ``open()`` itself fails, the backend is left in a
+    half-open state (``opened == True`` but no listener armed). The current
+    code calls ``backend.open()`` *outside* the ``try/finally`` that calls
+    ``backend.close()`` — so a failing ``open()`` skips the ``close()`` and
+    the half-open backend is leaked. This test catches that.
+    """
+    backend_spy = _RaisingOpenBackend()
+
+    def spy_create_backend(input_cfg, on_stop=None):
+        return backend_spy
+
+    monkeypatch.setattr(cli, "create_backend", spy_create_backend)
+
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    rc = main(
+        [
+            "act",
+            "--backend",
+            "mock",
+            "--mode",
+            "autonomous",
+            "--do",
+            "key:a",
+            "--config",
+            cfg,
+        ]
+    )
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "error:" in err
+    assert "backend open failed" in err, (
+        f"the open() failure must surface as a clean CLI error; got: {err!r}"
+    )
+    # The core F6 assertion: the half-open backend was closed.
+    assert backend_spy.opened is False, (
+        "a failing backend.open() left the backend half-open; the act path "
+        "must call close() even when open() fails"
+    )
+
+
+def test_act_failing_open_releases_held_input(tmp_path, capsys, monkeypatch) -> None:
+    """F6 (safety variant): a failing open() must not leave held input stuck.
+
+    If the backend had held keys/buttons before the failed open() (e.g. a
+    retry path), the close-on-failure must drain them. This mirrors the
+    AGENTS.md safety rule: a half-open backend must never leave a key stuck.
+    """
+    backend_spy = _RaisingOpenBackend()
+    # Simulate a held key that would be leaked if close() is skipped.
+    backend_spy.held_keys.add("a")
+
+    def spy_create_backend(input_cfg, on_stop=None):
+        return backend_spy
+
+    monkeypatch.setattr(cli, "create_backend", spy_create_backend)
+
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    rc = main(
+        [
+            "act",
+            "--backend",
+            "mock",
+            "--mode",
+            "autonomous",
+            "--do",
+            "key:a",
+            "--config",
+            cfg,
+        ]
+    )
+    assert rc == 1
+    # The held key must be drained by close().
+    assert backend_spy.held_keys == set(), (
+        "a failing backend.open() left a held key stuck; the act path must "
+        "release all held input even when open() fails"
+    )
+
+# --- F1: harden the --record filename convention ----------------------------
+#
+# The --record file must be named run-<stamp>.jsonl where <stamp> is
+# %Y%m%d-%H%M%S (8 digits, dash, 6 digits). A bare endswith(".jsonl") check
+# (used by the close-leak tests) is too weak to catch a naming regression —
+# e.g. a "run.txt" or a missing dash. Freeze the clock and assert the full
+# shape.
+
+
+def test_run_record_filename_matches_timestamped_convention(tmp_path, capsys, monkeypatch) -> None:
+    """F1: the --record file name is run-YYYYMMDD-HHMMSS.jsonl exactly."""
+    import re
+    import time as _time
+
+    spies = _spy_record_file(monkeypatch, tmp_path)
+    # Freeze the clock so the stamp is deterministic (2026-11-11 12:00:00).
+    # Only the single-arg call (the CLI's stamp) is intercepted; any other
+    # call shape (e.g. strftime called elsewhere with a struct_time arg) is
+    # delegated to the real function so the global patch stays surgical.
+    _fixed = _time.struct_time((2026, 11, 11, 12, 0, 0, 2, 315, 0))
+    _real_strftime = _time.strftime
+
+    def _frozen_strftime(fmt, *args: object, **kw: object) -> str:
+        if args or kw:
+            return _real_strftime(fmt, *args, **kw)  # type: ignore[arg-type]
+        return _real_strftime(fmt, _fixed)
+
+    monkeypatch.setattr(_time, "strftime", _frozen_strftime)
+    cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
+    rc = main(
+        [
+            "run",
+            "--once",
+            "--backend",
+            "mock",
+            "--mode",
+            "observe_only",
+            "--record",
+            "--record-dir",
+            str(tmp_path / "rec"),
+            "--config",
+            cfg,
+        ]
+    )
+    assert rc == 0
+    assert spies, "the --record stream was never opened (spy not captured)"
+    name = Path(spies[0]._real.name).name
+    assert name == "run-20261111-120000.jsonl", (
+        f"the --record file must be run-YYYYMMDD-HHMMSS.jsonl; got {name!r}"
+    )
+    assert re.fullmatch(r"run-\d{8}-\d{6}\.jsonl", name), (
+        f"the --record file name does not match run-<8digits>-<6digits>.jsonl; got {name!r}"
+    )

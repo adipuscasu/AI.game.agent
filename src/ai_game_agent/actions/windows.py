@@ -200,14 +200,33 @@ class WindowsBackend:
             if getattr(pyn, "listener", None) is not None
             else kb_mod.Listener(on_press=self._on_key_press)
         )
+        # F3: start the listener last-but-one, and roll it back on any
+        # failure so a partially-opened backend never leaks a live OS
+        # input thread. The listener is the only "started" resource in
+        # the open() sequence; controllers are inert until key events.
         self._listener.start()
-        self._hotkey_listener.arm()
-        # Test-injection hook: a fake pynput may expose ``bind`` so the test can
-        # grab the live controllers/listener for assertions. Real pynput has no
-        # such method, so this is a no-op in production.
-        binder = getattr(pyn, "bind", None)
-        if callable(binder):
-            binder(self._kb, self._mouse, self._listener)
+        try:
+            self._hotkey_listener.arm()
+            # Test-injection hook: a fake pynput may expose ``bind`` so
+            # the test can grab the live controllers/listener for
+            # assertions. Real pynput has no such method, so this is a
+            # no-op in production.
+            binder = getattr(pyn, "bind", None)
+            if callable(binder):
+                binder(self._kb, self._mouse, self._listener)
+        except BaseException:
+            # F3: arm/binder failed after listener.start(); roll back the
+            # started listener so a failed open() never leaks it.
+            try:
+                self._listener.stop()
+            except Exception:  # noqa: BLE001 - best-effort rollback
+                pass
+            self._listener = None
+            self._kb = None
+            self._mouse = None
+            self._key = None
+            self._button = None
+            raise
         self._opened = True
 
     def close(self) -> None:
