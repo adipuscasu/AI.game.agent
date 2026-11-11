@@ -214,13 +214,34 @@ class WindowsBackend:
             binder = getattr(pyn, "bind", None)
             if callable(binder):
                 binder(self._kb, self._mouse, self._listener)
-        except BaseException:
-            # F3: arm/binder failed after listener.start(); roll back the
-            # started listener so a failed open() never leaks it.
+        except BaseException as primary:
+            # F3 (strict): arm/binder failed after listener.start(). Roll back
+            # the started listener so a failed open() never leaks a live OS
+            # input thread. If that release ALSO fails, keep the original
+            # exception as the primary (attach the rollback failure as a
+            # diagnostic note) and RETAIN the listener reference so a later
+            # close() can retry it; a successful release clears the reference
+            # so the resource is never released twice.
+            release_exc: Exception | None = None
             try:
                 self._listener.stop()
-            except Exception:  # noqa: BLE001 - best-effort rollback
-                pass
+            except Exception as exc:  # noqa: BLE001 - keep primary
+                release_exc = exc
+            if release_exc is not None:
+                # The listener could not be released: attach the failure to the
+                # original exception, RETAIN the reference for a close() retry,
+                # clear the rest, and re-raise the ORIGINAL exception (with the
+                # release failure as its context) — not the release failure.
+                primary.add_note(
+                    "rollback failed to release the hotkey listener "
+                    f"({release_exc!r}); it is retained for a retry by close()"
+                )
+                self._kb = None
+                self._mouse = None
+                self._key = None
+                self._button = None
+                raise primary from release_exc
+            # stop() succeeded: fully clear the partially-opened state.
             self._listener = None
             self._kb = None
             self._mouse = None
@@ -232,18 +253,30 @@ class WindowsBackend:
     def close(self) -> None:
         """Disarm the hotkey, stop the listener, and release held input.
 
-        Idempotent. Releasing held input on close is the concrete realization of
-        AGENTS.md's "release all held keyboard keys / release mouse buttons": a
-        half-open backend must never leave a key or button stuck.
+        Idempotent and retry-safe. Releasing held input on close is the
+        concrete realization of AGENTS.md's "release all held keyboard keys /
+        release mouse buttons": a half-open backend must never leave a key or
+        button stuck.
+
+        Each cleanup is attempted independently. A listener whose release
+        failed during a failed ``open()`` (retained by the rollback) is
+        retried here; its reference is cleared only on success so it is never
+        released twice. A release failure never blocks the remaining cleanup
+        (held input is still released) and never raises; the failed resource
+        is retained for a subsequent close().
         """
-        if not self._opened:
-            return
+        # Disarm first so a stale stop-request cannot fire mid-cleanup.
         self._hotkey_listener.disarm()
+        # Attempt the listener release independently of ``_opened``: a
+        # retained listener from a failed open() must still be retried here.
         if self._listener is not None:
             try:
                 self._listener.stop()
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 - retain for a later retry
+                pass  # keep self._listener set so a later close() can retry
+            else:
+                # Released: clear the reference so it is never stopped again.
+                self._listener = None
         self.release_all()
         self._opened = False
 

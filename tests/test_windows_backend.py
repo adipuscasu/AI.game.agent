@@ -400,6 +400,183 @@ def test_open_binder_failure_stops_started_listener() -> None:
     )
 
 
+# --- F3 (strict): rollback failures, retry, no double release ----------------
+# The three tests above only cover the *happy* rollback (stop() succeeds). The
+# strict spec additionally requires that a FAILED rollback is preserved (primary
+# exception kept, failure attached as a note), the un-released resource is
+# RETAINED for a later close() retry, released references are CLEARED, and a
+# released resource is never released twice.
+
+
+class _ControllableListener:
+    """A Listener whose stop() fails for the first N attempts, then succeeds.
+
+    Records every stop() attempt so a test can prove retry-after-failure and
+    (the absence of) double-release. ``started``/``stopped`` mirror the pynput
+    surface so existing assertions still read naturally.
+    """
+
+    def __init__(self, on_press: object = None, fail_first_n: int = 0) -> None:
+        self._on_press = on_press
+        self.fail_first_n = fail_first_n
+        self.stop_attempts = 0
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stop_attempts += 1
+        if self.stop_attempts <= self.fail_first_n:
+            raise RuntimeError("listener stop failed (simulated OS error)")
+        self.stopped = True
+
+
+def _make_rollback_fail_backend(
+    fail_first_n: int = 0,
+) -> tuple[object, _ControllableListener]:
+    """A WindowsBackend whose open() fails at arm() and whose listener stop()
+    fails for the first ``fail_first_n`` attempts (then succeeds).
+
+    Drives the F3 rollback-failure + close()-retry lifecycle on the
+    *failed-open* path.
+    """
+    from ai_game_agent.actions.windows import WindowsBackend
+
+    listener = _ControllableListener(fail_first_n=fail_first_n)
+    kb = FakeKeyboardController()
+    mouse = FakeMouseController()
+    decider = _FailingArmHotkey()  # arm() raises -> the open() primary failure
+
+    class _KbMod:
+        Key = FakeKey
+        Controller = staticmethod(lambda: kb)
+        Listener = staticmethod(lambda on_press=None, suppress=False: listener)
+
+    class _MouseMod:
+        Button = FakeButton
+        Controller = staticmethod(lambda: mouse)
+
+    pyn = type("Pyn", (), {"keyboard": _KbMod, "mouse": _MouseMod})()
+
+    backend = WindowsBackend(pynput_factory=lambda: pyn)
+    backend._hotkey_listener = decider
+    return backend, listener
+
+
+def _make_opened_backend_with_controllable_listener(
+    fail_first_n: int = 0,
+) -> tuple[object, _ControllableListener]:
+    """A successfully-opened WindowsBackend whose listener stop() fails for the
+    first ``fail_first_n`` attempts (then succeeds).
+
+    Drives the close() retry + no-double-release lifecycle on the *opened*
+    path (open() succeeded, so ``_opened`` is True).
+    """
+    from ai_game_agent.actions.windows import WindowsBackend
+
+    listener = _ControllableListener(fail_first_n=fail_first_n)
+    kb = FakeKeyboardController()
+    mouse = FakeMouseController()
+
+    class _KbMod:
+        Key = FakeKey
+        Controller = staticmethod(lambda: kb)
+        Listener = staticmethod(lambda on_press=None, suppress=False: listener)
+
+    class _MouseMod:
+        Button = FakeButton
+        Controller = staticmethod(lambda: mouse)
+
+    pyn = type("Pyn", (), {"keyboard": _KbMod, "mouse": _MouseMod})()
+    backend = WindowsBackend(pynput_factory=lambda: pyn)
+    backend.open()  # succeeds -> _opened is True
+    return backend, listener
+
+
+def test_open_rollback_failure_preserves_primary_and_attaches_note() -> None:
+    """F3 (strict): if the rollback stop() also fails, the original open()
+    exception still propagates and the rollback failure is attached as a note
+    (neither swallowed nor replacing the primary).
+    """
+    backend, listener = _make_rollback_fail_backend(fail_first_n=99)
+
+    with pytest.raises(RuntimeError, match="hotkey arm failed") as excinfo:
+        backend.open()
+
+    # The primary (arm) exception is preserved, not replaced by the stop().
+    assert "hotkey arm failed" in str(excinfo.value)
+    # The rollback failure must be attached as a diagnostic note.
+    notes = getattr(excinfo.value, "__notes__", None) or []
+    assert any("listener" in note.lower() for note in notes), (
+        "a rollback failure must be attached to the primary exception as a "
+        f"diagnostic note; notes seen: {notes!r}"
+    )
+    assert listener.stop_attempts == 1, (
+        "the rollback must attempt to stop the started listener"
+    )
+
+
+def test_open_rollback_failure_retains_listener_for_close_retry() -> None:
+    """F3 (strict): a rollback that could not release the listener retains the
+    reference so a later close() can retry it; on success the reference is
+    cleared (never released twice).
+    """
+    backend, listener = _make_rollback_fail_backend(fail_first_n=1)
+
+    with pytest.raises(RuntimeError, match="hotkey arm failed"):
+        backend.open()
+
+    # stop() failed during rollback -> the reference must be RETAINED (not
+    # nulled) so close() can retry.
+    assert backend._listener is not None, (
+        "a listener that could not be released during rollback must be "
+        "retained for a retry by close()"
+    )
+    # Now close() must retry and succeed (stop() no longer failing).
+    backend.close()
+    assert listener.stopped is True, "close() must retry the failed listener release"
+    assert backend._listener is None, (
+        "a successfully-released listener must have its reference cleared"
+    )
+
+
+def test_close_retries_failed_listener_release_and_no_double_release() -> None:
+    """F3 (strict): on the opened path, a listener that fails to stop on the
+    first close() is retained and retried by a second close(); once released it
+    is not stopped again (no double release).
+    """
+    backend, listener = _make_opened_backend_with_controllable_listener(fail_first_n=1)
+
+    backend.close()  # attempt 1 -> stop() fails -> retained
+    assert listener.stop_attempts == 1
+    assert backend._listener is not None, "a failed release must be retained for retry"
+
+    backend.close()  # attempt 2 -> stop() succeeds -> cleared
+    assert listener.stopped is True
+    assert backend._listener is None, "a released listener must have its reference cleared"
+
+    backend.close()  # attempt 3 -> must NOT stop() again
+    assert listener.stop_attempts == 2, (
+        "a successfully-released listener must not be released a second time"
+    )
+
+
+def test_close_releases_held_input_even_if_listener_stop_fails() -> None:
+    """F3 (strict): close() must attempt every cleanup independently — a
+    listener.stop() failure must not prevent held input from being released.
+    """
+    backend, _ = _make_opened_backend_with_controllable_listener(fail_first_n=99)
+    backend.key_down("w")  # hold a key
+    backend.close()  # stop() fails, but held input must still be released
+
+    released = ("up", "w") in backend._kb.events or backend.held_keys == set()
+    assert released, (
+        "close() must release held input even when the listener stop fails"
+    )
+
+
 # --- Contract ----------------------------------------------------------------
 
 
