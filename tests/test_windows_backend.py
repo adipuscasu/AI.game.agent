@@ -577,6 +577,73 @@ def test_close_releases_held_input_even_if_listener_stop_fails() -> None:
     )
 
 
+def test_release_all_survives_controller_up_failure() -> None:
+    """F3 (coverage): a controller ``up()`` failure for one held key must not
+    block the remaining releases, must not raise, and must still clear the
+    held-state (best-effort drain: the held-state bookkeeping is cleared so a
+    later release_all/close is idempotent and never retries a key the OS
+    already saw an ``up`` for).
+    """
+    backend, pyn = make_backend()
+    backend.open()
+    backend.key_down("w")
+    backend.key_down("a")
+    backend.mouse_down("left")
+    assert pyn.kb is not None
+    original_up = pyn.kb.up
+
+    def flaky_up(key: object) -> None:
+        if key == "w":
+            raise RuntimeError("keyboard up failed (simulated OS error)")
+        original_up(key)
+
+    pyn.kb.up = flaky_up  # type: ignore[method-assign]
+
+    backend.release_all()  # must not raise
+
+    assert ("up", "a") in pyn.kb.events, (
+        "a release failure for one held key must not prevent the remaining "
+        "keys from being released"
+    )
+    assert ("up", "left") in (pyn.mouse_ctrl.events if pyn.mouse_ctrl else []), (
+        "a keyboard release failure must not prevent the mouse release"
+    )
+    assert backend.held_keys == set() and backend.held_buttons == set(), (
+        "the held-state must be cleared (best-effort) so cleanup stays "
+        "idempotent even when a release failed"
+    )
+
+
+def test_close_attempts_all_cleanup_when_stop_and_releases_fail() -> None:
+    """F3 (coverage): the worst composite — the listener stop fails AND the
+    controller releases fail — must still attempt every cleanup independently,
+    raise nothing (close() is the CLI's best-effort drain), retain the
+    listener for a later retry, and clear the held-state."""
+    from ai_game_agent.actions.windows import WindowsBackend  # red: module missing
+
+    backend, listener = _make_opened_backend_with_controllable_listener(fail_first_n=99)
+    backend.key_down("w")
+    backend.mouse_down("left")
+    assert backend._kb is not None and backend._mouse is not None
+
+    def _raise_up(key: object) -> None:
+        raise RuntimeError("controller up failed (simulated OS error)")
+
+    backend._kb.up = _raise_up  # type: ignore[method-assign]
+    backend._mouse.up = _raise_up  # type: ignore[method-assign]
+
+    backend.close()  # must not raise — every cleanup is best-effort
+
+    assert listener.stop_attempts == 1, "close() must still attempt the listener stop"
+    assert backend._listener is not None, (
+        "a listener that could not be stopped must be retained for a retry"
+    )
+    assert backend.held_keys == set() and backend.held_buttons == set(), (
+        "the held-state must be cleared (best-effort) even when every "
+        "controller release failed"
+    )
+
+
 # --- Contract ----------------------------------------------------------------
 
 

@@ -568,16 +568,26 @@ def _act(args: argparse.Namespace, cfg: Config) -> int:
         _print_action_log(action_log, args)
         return 0
 
-    # F6: open() is inside the try/finally so a failing open() still triggers
-    # close() — a half-open backend (opened=True but no listener armed) must
-    # never be leaked, and any held input is drained.
+    # F6: open() is in a protected region so a failing open() still closes
+    # the half-open backend (opened=True but no listener armed) — it must
+    # never be leaked, and any held input is drained. close() is idempotent
+    # and safe even when open() never completed. The open failure always
+    # stays the *primary* exception: a close() failure is attached to it as a
+    # note (BaseException.add_note, 3.11+) instead of replacing it. A
+    # KeyboardInterrupt is captured the same way and re-raised — never
+    # swallowed.
+    open_exc: BaseException | None = None
     try:
         backend.open()
-    except BaseException:
-        # F6: open() failed; close the half-open backend before re-raising.
-        # close() is idempotent and safe even when open() never completed.
-        backend.close()
-        raise
+    except BaseException as exc:
+        open_exc = exc
+        try:
+            backend.close()
+        except BaseException as cleanup_exc:
+            open_exc.add_note(f"cleanup failure: {cleanup_exc!r}")
+    if open_exc is not None:
+        raise open_exc
+    primary_exc: BaseException | None = None
     try:
         log.info(
             "act: backend=%s mode=%s actions=%d",
@@ -605,8 +615,22 @@ def _act(args: argparse.Namespace, cfg: Config) -> int:
                 stopped = True
                 stop_reason = f"safety bound: {exc}"
                 break
+    except BaseException as exc:
+        # F6: capture the operational failure so the close() in the finally
+        # cannot mask it; it is re-raised by identity after close() below.
+        primary_exc = exc
     finally:
-        backend.close()
+        # F6: close() runs on every path. With an operational failure its
+        # failure is noted on the primary (never replacing it); with none,
+        # a close() failure propagates as the error (CLI: exit 1).
+        try:
+            backend.close()
+        except BaseException as cleanup_exc:
+            if primary_exc is None:
+                raise
+            primary_exc.add_note(f"cleanup failure: {cleanup_exc!r}")
+    if primary_exc is not None:
+        raise primary_exc
 
     action_log = ActionLog(
         results=tuple(results),
