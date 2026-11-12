@@ -78,14 +78,55 @@ class FakeKey:
     """
 
     _NAMES = (
-        "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11",
-        "f12", "f13", "f14", "f15", "f16", "f17", "f18", "f19", "f20",
-        "f21", "f22", "f23", "f24",
-        "space", "enter", "tab", "backspace", "delete", "esc", "pause",
-        "print_screen", "caps_lock", "num_lock", "scroll_lock",
-        "ctrl", "alt", "shift", "cmd", "win",
-        "up", "down", "left", "right",
-        "page_up", "page_down", "home", "end", "insert",
+        "f1",
+        "f2",
+        "f3",
+        "f4",
+        "f5",
+        "f6",
+        "f7",
+        "f8",
+        "f9",
+        "f10",
+        "f11",
+        "f12",
+        "f13",
+        "f14",
+        "f15",
+        "f16",
+        "f17",
+        "f18",
+        "f19",
+        "f20",
+        "f21",
+        "f22",
+        "f23",
+        "f24",
+        "space",
+        "enter",
+        "tab",
+        "backspace",
+        "delete",
+        "esc",
+        "pause",
+        "print_screen",
+        "caps_lock",
+        "num_lock",
+        "scroll_lock",
+        "ctrl",
+        "alt",
+        "shift",
+        "cmd",
+        "win",
+        "up",
+        "down",
+        "left",
+        "right",
+        "page_up",
+        "page_down",
+        "home",
+        "end",
+        "insert",
     )
 
     @classmethod
@@ -163,8 +204,9 @@ class FakeListener:
     the tests inject; the backend's routing from there is what's under test.
     """
 
-    def __init__(self, on_press: Callable[[object], None] | None = None,
-                 suppress: bool = False) -> None:
+    def __init__(
+        self, on_press: Callable[[object], None] | None = None, suppress: bool = False
+    ) -> None:
         self._on_press = on_press
         self.suppress = suppress
         self.started = False
@@ -178,9 +220,7 @@ class FakeListener:
 
     def simulate_key(self, name: str) -> None:
         if not self.started or self.stopped:
-            raise AssertionError(
-                f"listener must be started (and not stopped) to deliver {name!r}"
-            )
+            raise AssertionError(f"listener must be started (and not stopped) to deliver {name!r}")
         assert self._on_press is not None, "listener created without on_press"
         self._on_press(_FakeKeyEvent(name))
 
@@ -202,22 +242,31 @@ class FakePynput:
     """
 
     def __init__(self) -> None:
-        self.keyboard = type("Keyboard", (), {
-            "Key": FakeKey,
-            "Controller": FakeKeyboardController,
-            "Listener": FakeListener,
-        })
-        self.mouse = type("Mouse", (), {
-            "Button": FakeButton,
-            "Controller": FakeMouseController,
-        })
+        self.keyboard = type(
+            "Keyboard",
+            (),
+            {
+                "Key": FakeKey,
+                "Controller": FakeKeyboardController,
+                "Listener": FakeListener,
+            },
+        )
+        self.mouse = type(
+            "Mouse",
+            (),
+            {
+                "Button": FakeButton,
+                "Controller": FakeMouseController,
+            },
+        )
         # The backend picks up the live objects from here.
         self.kb: FakeKeyboardController | None = None
         self.mouse_ctrl: FakeMouseController | None = None
         self.listener: FakeListener | None = None
 
-    def bind(self, kb: FakeKeyboardController, mouse: FakeMouseController,
-             listener: FakeListener) -> None:
+    def bind(
+        self, kb: FakeKeyboardController, mouse: FakeMouseController, listener: FakeListener
+    ) -> None:
         self.kb = kb
         self.mouse_ctrl = mouse
         self.listener = listener
@@ -327,14 +376,20 @@ def _make_partial_init_backend(
         Button = FakeButton
         Controller = _make_mouse_controller
 
-    pyn = type("Pyn", (), {
-        "keyboard": _KbMod,
-        "mouse": _MouseMod,
-    })()
+    pyn = type(
+        "Pyn",
+        (),
+        {
+            "keyboard": _KbMod,
+            "mouse": _MouseMod,
+        },
+    )()
 
     if fail_at == "binder":
+
         def binder(k: object, m: object, lst: object) -> None:
             raise RuntimeError("binder failed (simulated OS error)")
+
         pyn.bind = binder
 
     backend = WindowsBackend(pynput_factory=lambda: pyn)
@@ -379,9 +434,7 @@ def test_close_after_failed_open_is_safe_and_stops_listener() -> None:
     # close() must be callable after a failed open() and must complete the
     # rollback (stop the leaked listener) rather than early-returning.
     backend.close()  # must not raise
-    assert listener.stopped, (
-        "close() after a failed open() did not stop the started listener"
-    )
+    assert listener.stopped, "close() after a failed open() did not stop the started listener"
 
 
 def test_open_binder_failure_stops_started_listener() -> None:
@@ -395,9 +448,7 @@ def test_open_binder_failure_stops_started_listener() -> None:
     with pytest.raises(RuntimeError, match="binder failed"):
         backend.open()
 
-    assert listener.stopped, (
-        "a binder failure leaked the started listener"
-    )
+    assert listener.stopped, "a binder failure leaked the started listener"
 
 
 # --- F3 (strict): rollback failures, retry, no double release ----------------
@@ -513,9 +564,7 @@ def test_open_rollback_failure_preserves_primary_and_attaches_note() -> None:
         "a rollback failure must be attached to the primary exception as a "
         f"diagnostic note; notes seen: {notes!r}"
     )
-    assert listener.stop_attempts == 1, (
-        "the rollback must attempt to stop the started listener"
-    )
+    assert listener.stop_attempts == 1, "the rollback must attempt to stop the started listener"
 
 
 def test_open_rollback_failure_retains_listener_for_close_retry() -> None:
@@ -572,9 +621,7 @@ def test_close_releases_held_input_even_if_listener_stop_fails() -> None:
     backend.close()  # stop() fails, but held input must still be released
 
     released = ("up", "w") in backend._kb.events or backend.held_keys == set()
-    assert released, (
-        "close() must release held input even when the listener stop fails"
-    )
+    assert released, "close() must release held input even when the listener stop fails"
 
 
 def test_release_all_survives_controller_up_failure() -> None:
@@ -602,8 +649,7 @@ def test_release_all_survives_controller_up_failure() -> None:
     backend.release_all()  # must not raise
 
     assert ("up", "a") in pyn.kb.events, (
-        "a release failure for one held key must not prevent the remaining "
-        "keys from being released"
+        "a release failure for one held key must not prevent the remaining keys from being released"
     )
     assert ("up", "left") in (pyn.mouse_ctrl.events if pyn.mouse_ctrl else []), (
         "a keyboard release failure must not prevent the mouse release"
@@ -619,8 +665,6 @@ def test_close_attempts_all_cleanup_when_stop_and_releases_fail() -> None:
     controller releases fail — must still attempt every cleanup independently,
     raise nothing (close() is the CLI's best-effort drain), retain the
     listener for a later retry, and clear the held-state."""
-    from ai_game_agent.actions.windows import WindowsBackend  # red: module missing
-
     backend, listener = _make_opened_backend_with_controllable_listener(fail_first_n=99)
     backend.key_down("w")
     backend.mouse_down("left")
@@ -639,8 +683,7 @@ def test_close_attempts_all_cleanup_when_stop_and_releases_fail() -> None:
         "a listener that could not be stopped must be retained for a retry"
     )
     assert backend.held_keys == set() and backend.held_buttons == set(), (
-        "the held-state must be cleared (best-effort) even when every "
-        "controller release failed"
+        "the held-state must be cleared (best-effort) even when every controller release failed"
     )
 
 
@@ -1051,9 +1094,7 @@ def test_hotkey_double_delivery_does_not_double_release() -> None:
 
     hits: list[str] = []
     pyn = FakePynput()
-    step7 = FakeHotkeyListener(
-        on_trigger=lambda: hits.append("stop"), triggered_keys=("F12",)
-    )
+    step7 = FakeHotkeyListener(on_trigger=lambda: hits.append("stop"), triggered_keys=("F12",))
     step7.arm()  # the CLI arms the stop-request cycle for this run
 
     def _on_stop() -> None:

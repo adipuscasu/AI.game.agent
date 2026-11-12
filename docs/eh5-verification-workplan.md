@@ -117,12 +117,15 @@ Already-correct behavior: document implementation + test evidence instead.
 
 ## Step 5 — Final verification
 
-- [ ] `uv run pytest -q`
-- [ ] `uv run ruff check .`
-- [ ] `uv run ruff format --check` on changed Python files
-- [ ] `git diff --check`
-- [ ] Branch diff review: ownership, exception precedence, retry safety,
-      double-release prevention, SOLID, unnecessary complexity, regressions
+- [x] `uv run pytest -q` → **909 passed, 4 skipped** (4 skips = the documented
+      env-conditional `skipif`s: 2 pynput-present, 2 live-CONIN$; no regressions)
+- [x] `uv run ruff check .` → **All checks passed** (3 RED-phase dead artifacts
+      fixed: unused `captured` dict, unused `env` assignment, unused `WindowsBackend` import)
+- [x] `uv run ruff format --check` on changed files → clean (cli.py + both test files reformatted)
+- [x] `git diff --check` → clean
+- [x] Branch diff review: ownership (ExitStack single-owner), exception precedence
+      (F6 primary-identity + notes), retry safety (F3 listener retain/retry),
+      double-release prevention (close ×1), no new regressions (909 green)
 
 ## Step 6 — Reporting and publication
 

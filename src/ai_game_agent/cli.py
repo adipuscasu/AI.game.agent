@@ -742,9 +742,7 @@ def _finite_non_negative_timeout(value: str) -> float:
     try:
         result = float(value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"invalid --approve-timeout value: {value!r}"
-        ) from exc
+        raise argparse.ArgumentTypeError(f"invalid --approve-timeout value: {value!r}") from exc
     if not math.isfinite(result) or result < 0:
         raise argparse.ArgumentTypeError(
             f"--approve-timeout must be a finite, non-negative number of "
@@ -934,44 +932,64 @@ def build_parser() -> argparse.ArgumentParser:
         "run",
         help="Run the observe-decide-act loop (Phase 4) and print the report as JSON.",
     )
-    p_run.add_argument("--once", action="store_true",
-                       help="run exactly one tick then stop (== --max-ticks 1)")
-    p_run.add_argument("--max-ticks", type=int, default=None,
-                       help="stop after N ticks (default: run until stop/PAUSED)")
-    p_run.add_argument("--mode", default=None,
-                       choices=["observe_only", "assisted", "semi_autonomous",
-                                "autonomous"],
-                       help="operation mode (default: input.mode from config, "
-                            "observe_only)")
-    p_run.add_argument("--backend", default=None,
-                       help="input backend (mock | windows); capture backend "
-                            "(default: config)")
-    p_run.add_argument("--confirm", action="store_true",
-                       help="required for --backend windows in non-observe_only "
-                            "modes (no-op for mock)")
-    p_run.add_argument("--record", action="store_true",
-                       help="record each frame to --record-dir (default: off)")
-    p_run.add_argument("--record-dir", default=None,
-                       help="directory for recorded frames (default: recordings)")
-    p_run.add_argument("--no-templates", action="store_true",
-                       help="disable template matching AND UI-zone checks")
+    p_run.add_argument(
+        "--once", action="store_true", help="run exactly one tick then stop (== --max-ticks 1)"
+    )
+    p_run.add_argument(
+        "--max-ticks",
+        type=int,
+        default=None,
+        help="stop after N ticks (default: run until stop/PAUSED)",
+    )
+    p_run.add_argument(
+        "--mode",
+        default=None,
+        choices=["observe_only", "assisted", "semi_autonomous", "autonomous"],
+        help="operation mode (default: input.mode from config, observe_only)",
+    )
+    p_run.add_argument(
+        "--backend",
+        default=None,
+        help="input backend (mock | windows); capture backend (default: config)",
+    )
+    p_run.add_argument(
+        "--confirm",
+        action="store_true",
+        help="required for --backend windows in non-observe_only modes (no-op for mock)",
+    )
+    p_run.add_argument(
+        "--record", action="store_true", help="record each frame to --record-dir (default: off)"
+    )
+    p_run.add_argument(
+        "--record-dir", default=None, help="directory for recorded frames (default: recordings)"
+    )
+    p_run.add_argument(
+        "--no-templates", action="store_true", help="disable template matching AND UI-zone checks"
+    )
     p_run.add_argument("--no-ocr", action="store_true", help="disable OCR")
-    p_run.add_argument("--no-objects", action="store_true",
-                       help="disable color-blob object detection")
-    p_run.add_argument("--approve-all", action="store_true",
-                       help="ASSISTED mode only: auto-approve every AI proposal "
-                            "(CI/non-interactive); default is an interactive y/N "
-                            "prompt")
     p_run.add_argument(
-        "--approve-timeout", type=_finite_non_negative_timeout, default=None,
+        "--no-objects", action="store_true", help="disable color-blob object detection"
+    )
+    p_run.add_argument(
+        "--approve-all",
+        action="store_true",
+        help="ASSISTED mode only: auto-approve every AI proposal "
+        "(CI/non-interactive); default is an interactive y/N "
+        "prompt",
+    )
+    p_run.add_argument(
+        "--approve-timeout",
+        type=_finite_non_negative_timeout,
+        default=None,
         help="ASSISTED mode only: seconds to wait for an approval "
-             "answer (default: 30 s when omitted; 0 = non-blocking "
-             "poll; negative or non-finite values are rejected). Fail-safe = "
-             "reject on timeout/EOF/no-input")
-    p_run.add_argument("--pretty", action="store_true",
-                       help="pretty-print the report JSON")
+        "answer (default: 30 s when omitted; 0 = non-blocking "
+        "poll; negative or non-finite values are rejected). Fail-safe = "
+        "reject on timeout/EOF/no-input",
+    )
+    p_run.add_argument("--pretty", action="store_true", help="pretty-print the report JSON")
     p_run.add_argument(
-        "--config", default=None,
+        "--config",
+        default=None,
         help="YAML config file (default: config/default.yaml)",
     )
     p_run.set_defaults(func=_run)
@@ -980,10 +998,10 @@ def build_parser() -> argparse.ArgumentParser:
         "replay",
         help="Replay a recorded .jsonl event log and re-derive the state sequence.",
     )
-    p_replay.add_argument("log_file",
-                          help="path to the .jsonl event log to replay")
-    p_replay.add_argument("--config", default=None,
-                          help="YAML config file (default: config/default.yaml)")
+    p_replay.add_argument("log_file", help="path to the .jsonl event log to replay")
+    p_replay.add_argument(
+        "--config", default=None, help="YAML config file (default: config/default.yaml)"
+    )
     p_replay.set_defaults(func=_replay)
     return parser
 
@@ -1106,9 +1124,7 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
             # cancel_event = the F12 stop signal: a pending approval wait is
             # interrupted promptly ("interrupted" rejection) instead of
             # sitting out the full timeout after an emergency stop.
-            approver = TerminalApprover(
-                timeout_s=timeout_s, cancel_event=approval_cancel
-            )
+            approver = TerminalApprover(timeout_s=timeout_s, cancel_event=approval_cancel)
 
     max_ticks = 1 if getattr(args, "once", False) else getattr(args, "max_ticks", None)
     if max_ticks is not None and int(max_ticks) < 1:
@@ -1126,12 +1142,15 @@ def _run(args: argparse.Namespace, cfg: Config) -> int:
         rec_dir = Path(getattr(args, "record_dir", None) or "recordings")
         rec_dir.mkdir(parents=True, exist_ok=True)
         import time as _t
+
         stamp = _t.strftime("%Y%m%d-%H%M%S")
         rec_path = rec_dir / f"run-{stamp}.jsonl"
         rec_file = stack.enter_context(rec_path.open("a", encoding="utf-8"))
+
         def recorder(event):
             rec_file.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
             rec_file.flush()
+
     # The loop owns only the *capture* facade (start/stop); the *input*
     # backend lifecycle is the CLI's job, exactly like _act(). Under
     # OBSERVE_ONLY the gate holds end to end (the loop dispatches nothing),

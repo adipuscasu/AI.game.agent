@@ -736,8 +736,9 @@ class _SpyStream:
     ``close()``).
     """
 
-    def __init__(self, fail_write: bool = False, fail_flush: bool = False,
-                 fail_close: bool = False) -> None:
+    def __init__(
+        self, fail_write: bool = False, fail_flush: bool = False, fail_close: bool = False
+    ) -> None:
         self.fail_write = fail_write
         self.fail_flush = fail_flush
         self.fail_close = fail_close
@@ -785,10 +786,14 @@ def _f5_args(tmp_path: Path, cfg_path: str) -> argparse.Namespace:
     )
 
 
-def _f5_setup(tmp_path, monkeypatch, *,
-              backend: MockBackend | None = None,
-              run_exc: Exception | None = None,
-              stream: _SpyStream | None = None) -> dict:
+def _f5_setup(
+    tmp_path,
+    monkeypatch,
+    *,
+    backend: MockBackend | None = None,
+    run_exc: Exception | None = None,
+    stream: _SpyStream | None = None,
+) -> dict:
     """Wire _run's collaborators: backend, loop.run, and the record stream."""
     captured: dict = {"open_calls": 0, "close_calls": 0}
 
@@ -813,6 +818,7 @@ def _f5_setup(tmp_path, monkeypatch, *,
                 raise run_exc
             from ai_game_agent.agent.report import AgentLoopReport
             from ai_game_agent.state import AgentState
+
             return AgentLoopReport(
                 ticks=1,
                 transitions=(),
@@ -912,8 +918,7 @@ def test_f5_scenario4_operational_fails_cleanup_fails(tmp_path, monkeypatch) -> 
     stream = _SpyStream(fail_close=True)
     backend = _FailingCloseBackend()
     primary = _RunException("agent crashed mid-run")
-    _ = _f5_setup(tmp_path, monkeypatch, backend=backend, run_exc=primary,
-                    stream=stream)
+    _ = _f5_setup(tmp_path, monkeypatch, backend=backend, run_exc=primary, stream=stream)
     args = _f5_args(tmp_path, cfg)
 
     with pytest.raises(_RunException) as exc_info:
@@ -929,9 +934,9 @@ def test_f5_scenario4_operational_fails_cleanup_fails(tmp_path, monkeypatch) -> 
         "the backend.close() failure was not made observable on the primary "
         f"exception (notes: {notes!r})"
     )
-    assert "record stream close failed" in notes_text or (
-        "record" in notes_text
-    ), "the record-stream close failure was not made observable"
+    assert "record stream close failed" in notes_text or ("record" in notes_text), (
+        "the record-stream close failure was not made observable"
+    )
     assert stream.closes >= 1, "the record stream was never attempted for close"
 
 
@@ -955,9 +960,7 @@ def test_f5_scenario5_multiple_cleanup_failures(tmp_path, monkeypatch) -> None:
     # The record-stream close failure must be observable on the primary.
     notes = getattr(exc_info.value, "__notes__", [])
     notes_text = "\n".join(str(n) for n in notes)
-    assert "record stream close failed" in notes_text or (
-        "record" in notes_text
-    ), (
+    assert "record stream close failed" in notes_text or ("record" in notes_text), (
         "the record-stream close failure was silently swallowed; expected it "
         f"on the primary exception's notes (notes: {notes!r})"
     )
@@ -982,15 +985,13 @@ class _FakeRecordedEvent:
         return {"type": "TICK", "detail": {"zones": {}}}
 
 
-def _f5_setup_recording(tmp_path, monkeypatch, *,
-                        stream: _SpyStream | None = None,
-                        backend: MockBackend | None = None) -> dict:
+def _f5_setup_recording(
+    tmp_path, monkeypatch, *, stream: _SpyStream | None = None, backend: MockBackend | None = None
+) -> dict:
     """Like ``_f5_setup``, but the fake loop *records one event* (drives the
     recorder → ``write()`` + ``flush()``) before returning its report or
     failing. A flush failure therefore propagates out of ``loop.run()`` —
     exactly the F4 path."""
-    captured: dict = {"open_calls": 0, "close_calls": 0}
-
     if backend is None:
         backend = MockBackend()
 
@@ -1008,6 +1009,7 @@ def _f5_setup_recording(tmp_path, monkeypatch, *,
                 self._recorder(_FakeRecordedEvent())
             from ai_game_agent.agent.report import AgentLoopReport
             from ai_game_agent.state import AgentState
+
             return AgentLoopReport(
                 ticks=1,
                 transitions=(),
@@ -1042,16 +1044,14 @@ def test_f4_flush_failure_propagates_as_error(tmp_path, monkeypatch) -> None:
     cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
     stream = _SpyStream(fail_flush=True)
     backend = MockBackend()
-    env = _f5_setup_recording(tmp_path, monkeypatch, stream=stream,
-                              backend=backend)
+    _f5_setup_recording(tmp_path, monkeypatch, stream=stream, backend=backend)
     args = _f5_args(tmp_path, cfg)
 
     with pytest.raises(OSError) as exc_info:
         cli._run(args, load_config(cfg))
 
     assert "flush failed" in str(exc_info.value), (
-        "the flush failure must propagate as the error; "
-        f"got: {exc_info.value!r}"
+        f"the flush failure must propagate as the error; got: {exc_info.value!r}"
     )
     assert exc_info.value.__traceback__ is not None, (
         "the flush exception's traceback must be preserved"
@@ -1059,22 +1059,17 @@ def test_f4_flush_failure_propagates_as_error(tmp_path, monkeypatch) -> None:
     assert stream.writes == 1 and stream.flushes == 1, (
         "the recorder must have written and attempted the flush"
     )
-    assert stream.closes >= 1, (
-        "a flush failure must not defeat the record-stream close"
-    )
+    assert stream.closes >= 1, "a flush failure must not defeat the record-stream close"
 
 
-def test_f4_flush_failure_stays_primary_when_cleanup_fails(
-    tmp_path, monkeypatch
-) -> None:
+def test_f4_flush_failure_stays_primary_when_cleanup_fails(tmp_path, monkeypatch) -> None:
     """F4-2: a flush failure (the run's exception) followed by a cleanup
     failure must keep the flush failure as the primary exception — identity
     preserved, the cleanup failure observable as a note, never replacing it."""
     cfg = _write_config(tmp_path, _OBSERVE_CONFIG)
     stream = _SpyStream(fail_flush=True)
     backend = _FailingCloseBackend()
-    _ = _f5_setup_recording(tmp_path, monkeypatch, stream=stream,
-                            backend=backend)
+    _ = _f5_setup_recording(tmp_path, monkeypatch, stream=stream, backend=backend)
     args = _f5_args(tmp_path, cfg)
 
     with pytest.raises(OSError) as exc_info:
@@ -1090,9 +1085,7 @@ def test_f4_flush_failure_stays_primary_when_cleanup_fails(
         "the backend.close() failure must be observable on the primary "
         f"exception (notes: {notes!r})"
     )
-    assert stream.closes >= 1, (
-        "the record stream must still be closed in cleanup"
-    )
+    assert stream.closes >= 1, "the record stream must still be closed in cleanup"
 
 
 def test_f4_flush_failure_cli_contract(tmp_path, capsys, monkeypatch) -> None:
@@ -1103,17 +1096,23 @@ def test_f4_flush_failure_cli_contract(tmp_path, capsys, monkeypatch) -> None:
     _ = _f5_setup_recording(tmp_path, monkeypatch, stream=stream)
     rc = main(
         [
-            "run", "--backend", "mock", "--mode", "autonomous",
-            "--once", "--record", "--record-dir", str(tmp_path / "rec"),
-            "--config", cfg,
+            "run",
+            "--backend",
+            "mock",
+            "--mode",
+            "autonomous",
+            "--once",
+            "--record",
+            "--record-dir",
+            str(tmp_path / "rec"),
+            "--config",
+            cfg,
         ]
     )
     err = capsys.readouterr().err
     assert rc == 1
     assert "error:" in err
-    assert "flush failed" in err, (
-        f"the CLI must report the flush failure; got: {err!r}"
-    )
+    assert "flush failed" in err, f"the CLI must report the flush failure; got: {err!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -1167,8 +1166,7 @@ def test_f5_ki_propagates_and_cleanup_completes(tmp_path, monkeypatch) -> None:
         return backend
 
     monkeypatch.setattr(cli, "create_backend", spy_create_backend)
-    monkeypatch.setattr(cli, "AgentLoop",
-                        lambda *a, **kw: _KIRecordingLoop(ki, *a, **kw))
+    monkeypatch.setattr(cli, "AgentLoop", lambda *a, **kw: _KIRecordingLoop(ki, *a, **kw))
 
     real_open = Path.open
 
@@ -1186,9 +1184,7 @@ def test_f5_ki_propagates_and_cleanup_completes(tmp_path, monkeypatch) -> None:
     assert exc_info.value is ki, (
         f"the KeyboardInterrupt must propagate by identity; got: {exc_info.value!r}"
     )
-    assert exc_info.value.__traceback__ is not None, (
-        "the KI's traceback must be preserved"
-    )
+    assert exc_info.value.__traceback__ is not None, "the KI's traceback must be preserved"
     assert backend.close_calls == 1, (
         f"the backend must be closed exactly once on Ctrl+C; "
         f"close() ran {backend.close_calls} times"
@@ -1199,9 +1195,7 @@ def test_f5_ki_propagates_and_cleanup_completes(tmp_path, monkeypatch) -> None:
     )
 
 
-def test_f5_ki_plus_cleanup_failure_ki_stays_primary(
-    tmp_path, monkeypatch
-) -> None:
+def test_f5_ki_plus_cleanup_failure_ki_stays_primary(tmp_path, monkeypatch) -> None:
     """F5-KI: a Ctrl+C during run() *and* a failing backend close + record
     stream close — the KI must still propagate by identity with the cleanup
     failures attached as notes (never masking the KI, never swallowed)."""
@@ -1214,8 +1208,7 @@ def test_f5_ki_plus_cleanup_failure_ki_stays_primary(
         return backend
 
     monkeypatch.setattr(cli, "create_backend", spy_create_backend)
-    monkeypatch.setattr(cli, "AgentLoop",
-                        lambda *a, **kw: _KIRecordingLoop(ki, *a, **kw))
+    monkeypatch.setattr(cli, "AgentLoop", lambda *a, **kw: _KIRecordingLoop(ki, *a, **kw))
 
     real_open = Path.open
 
@@ -1231,8 +1224,7 @@ def test_f5_ki_plus_cleanup_failure_ki_stays_primary(
         cli._run(args, load_config(cfg))
 
     assert exc_info.value is ki, (
-        "cleanup failures must not mask the KeyboardInterrupt; "
-        f"got: {exc_info.value!r}"
+        f"cleanup failures must not mask the KeyboardInterrupt; got: {exc_info.value!r}"
     )
     notes = getattr(exc_info.value, "__notes__", [])
     notes_text = "\n".join(str(n) for n in notes)
@@ -1240,8 +1232,7 @@ def test_f5_ki_plus_cleanup_failure_ki_stays_primary(
         f"the backend.close() failure must be noted on the KI (notes: {notes!r})"
     )
     assert "record stream close failed" in notes_text or "record" in notes_text, (
-        "the record-stream close failure must be noted on the KI "
-        f"(notes: {notes!r})"
+        f"the record-stream close failure must be noted on the KI (notes: {notes!r})"
     )
     assert backend.close_calls == 1, "the backend must be closed exactly once"
     assert stream.closes == 1, "the record stream must be closed exactly once"
@@ -1438,9 +1429,7 @@ def test_act_s1_open_and_close_fail_open_stays_primary(tmp_path, monkeypatch) ->
     assert err.value.__traceback__ is not None, (
         "the primary exception's traceback must be preserved"
     )
-    assert backend_spy.close_calls == 1, (
-        "the rollback close() must be attempted exactly once"
-    )
+    assert backend_spy.close_calls == 1, "the rollback close() must be attempted exactly once"
 
 
 def test_act_s1_cli_contract_reports_open_failure(tmp_path, capsys, monkeypatch) -> None:
@@ -1469,14 +1458,11 @@ def test_act_s1_cli_contract_reports_open_failure(tmp_path, capsys, monkeypatch)
     assert rc == 1
     assert "error:" in err
     assert "open failed" in err, (
-        "the CLI must report the open() failure, not the close() failure; "
-        f"got: {err!r}"
+        f"the CLI must report the open() failure, not the close() failure; got: {err!r}"
     )
 
 
-def test_act_s2_execution_and_close_fail_execution_stays_primary(
-    tmp_path, monkeypatch
-) -> None:
+def test_act_s2_execution_and_close_fail_execution_stays_primary(tmp_path, monkeypatch) -> None:
     """F6 scenario 2: execution fails and close() fails.
 
     The execution failure must stay primary (propagated by identity,
@@ -1496,8 +1482,7 @@ def test_act_s2_execution_and_close_fail_execution_stays_primary(
     with pytest.raises(RuntimeError) as err:
         cli._act(_act_namespace(), _act_config(tmp_path))
     assert err.value is primary, (
-        "the execution exception must propagate by identity; "
-        f"got: {err.value!r}"
+        f"the execution exception must propagate by identity; got: {err.value!r}"
     )
     assert any("close failed" in n for n in err.value.__notes__), (
         "the close() failure must be observable on the primary exception; "
@@ -1522,8 +1507,7 @@ def test_act_s3_close_fails_after_success_close_propagates(tmp_path, monkeypatch
     with pytest.raises(InputBackendError) as err:
         cli._act(_act_namespace(), _act_config(tmp_path))
     assert "close failed" in str(err.value), (
-        "with no operational failure the close() failure must propagate; "
-        f"got: {err.value!r}"
+        f"with no operational failure the close() failure must propagate; got: {err.value!r}"
     )
     assert backend_spy.close_calls == 1, "close() must be attempted exactly once"
     assert ("press", "a") in backend_spy.events, (
@@ -1583,13 +1567,10 @@ def test_act_ki_during_open_never_swallowed(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(cli, "create_backend", lambda cfg, on_stop=None: backend_spy)
     with pytest.raises(KeyboardInterrupt) as err:
         cli._act(_act_namespace(), _act_config(tmp_path))
-    assert err.value is ki, (
-        f"the KeyboardInterrupt must propagate by identity; got: {err.value!r}"
-    )
+    assert err.value is ki, f"the KeyboardInterrupt must propagate by identity; got: {err.value!r}"
     assert backend_spy.close_calls == 1, "close() must be attempted even on KI"
     assert any("close failed" in n for n in err.value.__notes__), (
-        "the close() failure must be observable on the KI; "
-        f"notes: {err.value.__notes__!r}"
+        f"the close() failure must be observable on the KI; notes: {err.value.__notes__!r}"
     )
 
 
@@ -1624,8 +1605,7 @@ def test_act_s4_success_closes_exactly_once_and_reports(tmp_path, capsys, monkey
     assert action_log["stopped"] is False
     assert ("press", "a") in backend_spy.events
     assert backend_spy.close_calls == 1, (
-        f"close() must run exactly once on the success path; ran "
-        f"{backend_spy.close_calls} times"
+        f"close() must run exactly once on the success path; ran {backend_spy.close_calls} times"
     )
 
 
