@@ -39,6 +39,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import io
+import sys
 import threading
 
 import pytest
@@ -64,6 +65,19 @@ from ai_game_agent.state import AgentState, EventType, GameStateMachine
 
 TS = datetime.datetime(2026, 10, 14, tzinfo=datetime.UTC)
 _BB = BBox(x=10, y=10, width=20, height=10)
+
+#: The approver's fd input path (deadline-bounded non-blocking ``os.read``)
+#: depends on POSIX ``os.set_blocking`` — which does not exist on Windows,
+#: where the reader correctly fails closed. Interactive input on Windows is
+#: the msvcrt console path (covered by the live-CONIN$ tests near the end of
+#: this file), so the tests that exercise the fd path are POSIX-only.
+fd_input_path = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "fd input path requires POSIX non-blocking I/O (os.set_blocking); "
+        "on Windows the approver's interactive path is msvcrt-based"
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -848,6 +862,7 @@ def test_terminal_approver_keyboard_interrupt_rejects(quiet_stdout, monkeypatch)
     assert not decision.is_approved
 
 
+@fd_input_path
 def test_terminal_approver_timeout_rejects(quiet_stdout, monkeypatch):
     """A timeout on the prompt is a rejection (the configured bound).
 
@@ -895,6 +910,7 @@ def test_terminal_approver_timeout_rejects(quiet_stdout, monkeypatch):
     assert decision.reason == "timeout"
 
 
+@fd_input_path
 def test_terminal_approver_timeout_when_select_rejects_fd(quiet_stdout, monkeypatch):
     """A timeout must still reject when ``select`` refuses the fd.
 
@@ -955,6 +971,7 @@ def test_terminal_approver_timeout_when_select_rejects_fd(quiet_stdout, monkeypa
     assert decision.reason == "timeout"
 
 
+@fd_input_path
 def test_bounded_read_does_not_accumulate_worker_threads(quiet_stdout, monkeypatch):
     """Repeated timed-out prompts on the select-unavailable fallback path
     must not accumulate blocked worker threads.
@@ -1363,6 +1380,7 @@ def _late_reply_stdin(delay: float, reply: bytes = b"y\n"):
     return _PipeStdin()
 
 
+@fd_input_path
 def test_terminal_approver_zero_timeout_is_non_blocking_poll(
     quiet_stdout, monkeypatch
 ):
@@ -1389,6 +1407,7 @@ def test_terminal_approver_zero_timeout_is_non_blocking_poll(
     )
 
 
+@fd_input_path
 def test_terminal_approver_zero_timeout_honours_buffered_reply(
     quiet_stdout, monkeypatch
 ):
@@ -1422,6 +1441,7 @@ def test_terminal_approver_zero_timeout_honours_buffered_reply(
     assert decision.reason == "user-approved"
 
 
+@fd_input_path
 def test_terminal_approver_cancel_event_interrupts_pending_wait(
     quiet_stdout, monkeypatch
 ):
@@ -1501,6 +1521,7 @@ def _straddling_stdin(first: bytes, first_at: float, second: bytes, second_at: f
     return _StraddleStdin()
 
 
+@fd_input_path
 def test_fd_straddling_newline_after_deadline_is_timeout(quiet_stdout, monkeypatch):
     """A reply whose *newline* lands after the deadline is not approved, even
     if its first byte arrived early.
@@ -1520,6 +1541,7 @@ def test_fd_straddling_newline_after_deadline_is_timeout(quiet_stdout, monkeypat
     assert decision.reason == "timeout"
 
 
+@fd_input_path
 def test_fd_lone_byte_without_newline_does_not_hang(quiet_stdout, monkeypatch):
     """A lone ``y`` with no newline and an open writer must not hang.
 
@@ -1563,6 +1585,7 @@ def test_fd_lone_byte_without_newline_does_not_hang(quiet_stdout, monkeypatch):
     assert decision.reason == "timeout"
 
 
+@fd_input_path
 def test_fd_reply_split_across_poll_slices_is_approved(quiet_stdout, monkeypatch):
     """A reply whose bytes arrive in separate poll slices is approved, not lost.
 
@@ -1633,6 +1656,7 @@ def test_fd_eof_is_no_input_channel(quiet_stdout, monkeypatch):
     os.close(r)
 
 
+@fd_input_path
 def test_fd_continuous_stream_timeout_zero_is_bounded(quiet_stdout, monkeypatch):
     """timeout=0 on a *continuously* readable stream must stay bounded.
 
@@ -1686,6 +1710,7 @@ def test_fd_continuous_stream_timeout_zero_is_bounded(quiet_stdout, monkeypatch)
     assert elapsed < 1.0, f"timeout=0 poll was not bounded: {elapsed:.2f}s"
 
 
+@fd_input_path
 def test_fd_continuous_stream_timeout_positive_is_bounded(quiet_stdout, monkeypatch):
     """timeout>0 on a *continuously* readable stream must respect the deadline.
 
@@ -1884,6 +1909,7 @@ def test_fd_timeout_zero_buffered_y_with_cancel_set_is_interrupted(
         assert decision.reason == "interrupted", f"got {decision.reason!r}"
 
 
+@fd_input_path
 def test_fd_timeout_zero_buffered_y_without_cancel_is_approved(
     quiet_stdout, monkeypatch
 ):
@@ -2171,7 +2197,6 @@ def test_prompt_sanitization_does_not_mutate_reasoning(quiet_stdout, monkeypatch
 # required); the live-CONIN$ checks run only on a real Windows console.
 # ---------------------------------------------------------------------------
 
-import sys  # noqa: E402
 import time  # noqa: E402
 
 import ai_game_agent.actions.approver as _approver_mod  # noqa: E402
