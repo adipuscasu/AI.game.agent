@@ -61,3 +61,85 @@ jobs:
 
       - name: Test
         run: uv run pytest
+
+  # ---------------------------------------------------------------------------
+  # EH3 — Windows coverage alongside Linux.
+  #
+  # The project's real target platform is Windows (``Operating System ::
+  # Microsoft :: Windows``). This job validates, on a clean hosted Windows
+  # runner, the exact things Linux cannot: the ``input`` extra (pynput — the
+  # ``windows`` backend's real dependency) installs and imports, and the whole
+  # headless suite + the real CLI entry point run under the Windows target.
+  #
+  # It is a *separate* job (not a matrix) so the Linux job above stays
+  # byte-for-byte untouched — the plan's "existing Linux coverage is not
+  # weakened" requirement is met by construction.
+  #
+  # No live game, no real input device, no interactive console: every test uses
+  # a mock/fake backend. The two pynput-*absent* contract tests are
+  # platform-guarded (they skip on win32 or force absence inside the test), so
+  # installing ``--extra input`` here does not turn them into failures. The
+  # live-CONIN$ tests self-skip (no real console on the hosted runner) and are
+  # reported as skips, not passes, via the suite's ``-ra`` (see pyproject).
+  # ---------------------------------------------------------------------------
+  test-windows:
+    name: Test (Python 3.11) — Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+          enable-cache: false
+
+      - name: Install Python 3.11
+        # Same guarantee as the Linux job: setup-uv's python-version input only
+        # sets UV_PYTHON; install the interpreter explicitly so the find below
+        # and uv sync have a guaranteed interpreter on a clean runner.
+        run: uv python install 3.11
+
+      - name: Install tesseract-ocr
+        # The `ocr` extra installs pytesseract (a pure-Python wrapper that
+        # shells out to the `tesseract` binary). One e2e test
+        # (analyze --fulltest) needs the binary and *self-skips with a
+        # documented reason* when it is absent (tests/e2e/test_e2e_cli.py).
+        # This is a system package, not a pip dependency, and is the only step
+        # in this job that cannot be verified from a Linux dev box — so it is
+        # non-fatal: when the hosted runner provisions it, that e2e runs; when
+        # it cannot, the e2e reports an honest skip rather than turning the
+        # whole Windows job red. (If you want to *enforce* fulltest coverage on
+        # Windows, drop `continue-on-error` — the step is otherwise standard.)
+        continue-on-error: true
+        run: choco install tesseract -y
+
+      - name: Show tool versions
+        run: |
+          uv --version
+          uv python find 3.11
+
+      - name: Install dependencies
+        # Same extras as the Linux job, PLUS `input`: pynput is the windows
+        # backend's real dependency and its Windows wheel is pure-Python
+        # (py3-none-any, no platform build deps), so it installs cleanly here.
+        # Installing it is the point of this job — it exercises the exact import
+        # path the target platform uses, which the Linux (bare) venv never does.
+        run: >-
+          uv sync --extra capture --extra vision --extra ocr --extra dev
+          --extra input --locked
+
+      - name: Check lockfile
+        run: uv lock --check
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Test
+        # -ra is already in pyproject addopts; the Windows-specific skips
+        # (pynput-absent contract tests + live-CONIN$ console tests) each
+        # self-document their reason in the summary, so skips are reported
+        # distinctly from passes — never treated as a product pass.
+        run: uv run pytest
