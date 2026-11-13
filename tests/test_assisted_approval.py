@@ -66,16 +66,22 @@ from ai_game_agent.state import AgentState, EventType, GameStateMachine
 TS = datetime.datetime(2026, 10, 14, tzinfo=datetime.UTC)
 _BB = BBox(x=10, y=10, width=20, height=10)
 
-#: The approver's fd input path (deadline-bounded non-blocking ``os.read``)
-#: depends on POSIX ``os.set_blocking`` — which does not exist on Windows,
-#: where the reader correctly fails closed. Interactive input on Windows is
-#: the msvcrt console path (covered by the live-CONIN$ tests near the end of
-#: this file), so the tests that exercise the fd path are POSIX-only.
+#: These tests drive the approver's **fd input path**, which is a genuinely
+#: POSIX mechanism: it needs non-blocking pipe I/O (``os.get_blocking`` /
+#: ``os.set_blocking``), which do not exist for Windows pipes. It is NOT the
+#: approval contract that is absent on Windows — that contract (timeout,
+#: cancel, late-reply, zero-timeout poll) is fully covered there by the msvcrt
+#: console reader tests (``test_console_reader_*`` above) and by injected
+#: readers. On Windows a redirected pipe reaches the fd path and correctly
+#: fails closed (reject, never approve, never hang); that safe behavior is
+#: pinned by ``test_fd_redirected_pipe_fails_closed_on_windows``.
 fd_input_path = pytest.mark.skipif(
     sys.platform == "win32",
     reason=(
-        "fd input path requires POSIX non-blocking I/O (os.set_blocking); "
-        "on Windows the approver's interactive path is msvcrt-based"
+        "POSIX-only fd path (needs os.get_blocking/os.set_blocking, absent for "
+        "Windows pipes); the approval contract on Windows is covered by the "
+        "msvcrt console reader tests and the fd path fails closed for "
+        "redirected pipes"
     ),
 )
 
@@ -2537,3 +2543,54 @@ def test_console_reader_survives_clock_jump_past_deadline(quiet_stdout):
     # an approval, never a crash).
     assert not decision.is_approved
     assert decision.reason == "timeout"
+
+
+# ---------------------------------------------------------------------------
+# 9) Windows fd path: safe fail-closed (EH3 regression guard)
+#
+# On a Windows redirected pipe the fd path cannot do a bounded, non-blocking
+# read (``os.get_blocking``/``os.set_blocking`` do not exist for pipes there,
+# and the only bounded alternative — a worker thread — is forbidden by the
+# safety contract). The correct, safe behavior is to fail closed: reject with
+# an accurate reason, never approve, and never hang. This test pins that safe
+# behavior on the target platform so a future "fix" that reaches for blocking
+# reads cannot turn the security boundary into a hang. The full approval
+# contract on Windows is covered by the msvcrt console reader tests (section 8).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Windows-specific: the fd path has no non-blocking pipe I/O there",
+)
+def test_fd_redirected_pipe_fails_closed_on_windows(quiet_stdout, monkeypatch):
+    """A redirected-pipe stdin on Windows must fail closed: reject with an
+    accurate ``no-input-channel`` reason — never approve, never hang."""
+    import os
+    import time
+
+    r, w = os.pipe()
+    try:
+
+        class _RedirectedPipeStdin:
+            def fileno(self):
+                return r
+
+        monkeypatch.setattr("sys.stdin", _RedirectedPipeStdin())
+        t0 = time.monotonic()
+        decision = TerminalApprover(timeout_s=0.5).request_approval(
+            _action(), reasoning="r", confidence=0.5
+        )
+        elapsed = time.monotonic() - t0
+        assert not decision.is_approved, (
+            f"a redirected pipe must never approve on Windows, got {decision!r}"
+        )
+        assert decision.reason == "no-input-channel", (
+            f"expected an accurate no-channel reason, got {decision.reason!r}"
+        )
+        assert elapsed < 1.0, (
+            f"the fd path must fail closed promptly, not hang: {elapsed:.2f}s"
+        )
+    finally:
+        os.close(r)
+        os.close(w)
