@@ -262,6 +262,17 @@ def test_assisted_approval_allows_ai_action():
     assert approvals[0].detail["kind"] == "key_press"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "the real-stdin pending wait this test drives is the fd path, a "
+        "POSIX mechanism (it needs os.get_blocking/os.set_blocking, absent "
+        "for Windows pipes, where the fd path fails closed by design — "
+        "pinned by test_fd_redirected_pipe_fails_closed_on_windows). The "
+        "platform-agnostic loop-level contract is pinned by "
+        "test_f12_interrupts_real_approver_pending_wait_in_loop_console_reader"
+    ),
+)
 def test_f12_interrupts_real_approver_pending_wait_in_loop(quiet_stdout, monkeypatch):
     """F12 must interrupt the *real* ``TerminalApprover`` pending wait at the
     loop level — not merely the executor's refusal to dispatch afterwards.
@@ -275,6 +286,12 @@ def test_f12_interrupts_real_approver_pending_wait_in_loop(quiet_stdout, monkeyp
     handler sets the approver's cancel event *and* triggers the executor
     stop), over a stdin that will never answer, and fires the stop while the
     wait is pending — with no manual release of any kind.
+
+    POSIX-only: the pending wait over a real stdin is the fd path, which
+    actually waits on POSIX but fails closed (by design) on Windows. On
+    Windows this test would pass only by scheduling luck (cancel racing the
+    prompt's immediate fail-closed return), so the same contract is pinned
+    platform-agnostically by the console-reader sibling below.
     """
     import os
 
@@ -352,6 +369,86 @@ def test_f12_interrupts_real_approver_pending_wait_in_loop(quiet_stdout, monkeyp
     assert ("press", "e") not in [ev[:2] for ev in backend.events]
     os.close(w)
     os.close(r)
+
+
+def test_f12_interrupts_real_approver_pending_wait_in_loop_console_reader(quiet_stdout):
+    """F12 must interrupt the *real* ``TerminalApprover`` pending wait at the
+    loop level — the platform-agnostic version of the test above.
+
+    The sibling above pins the same contract over a real never-answering
+    stdin; its pending wait is the fd path, which only genuinely waits on
+    POSIX. On Windows the fd path cannot wait (no non-blocking pipe I/O; it
+    fails closed by design — pinned by
+    ``test_fd_redirected_pipe_fails_closed_on_windows``). This test pins the
+    identical loop-level contract through the approver's *reader* polling
+    loop, where the pending wait is real on every platform: an injected
+    never-answering reader (``kbhit()`` always False) holds the wait inside
+    the real ``_read_line_console`` deadline loop. Same production object,
+    same F12 ordering (cancel event, then executor stop), no manual release
+    of any kind — only the input source is faked, and deterministically.
+    """
+    cancel = threading.Event()
+    approver = TerminalApprover(
+        timeout_s=10.0, cancel_event=cancel, reader=_FakeConsoleReader()
+    )
+
+    entered = threading.Event()
+    _orig = approver.request_approval
+
+    def _mark(action, **kwargs):
+        entered.set()
+        return _orig(action, **kwargs)
+
+    approver.request_approval = _mark
+
+    backend = MockBackend()
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[object] = []
+    loop = _loop(
+        mode=OperationMode.ASSISTED,
+        approver=approver,
+        backend=backend,
+        ai=ai,
+        max_ticks=10,
+        on_event=events.append,
+    )
+    executor = loop._executor
+
+    result_box: dict[str, object] = {}
+
+    def _run() -> None:
+        try:
+            result_box["report"] = loop.run()
+        except BaseException as exc:  # pragma: no cover - surface test failures
+            result_box["exc"] = exc
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    assert entered.wait(timeout=3.0), (
+        "approver never entered (loop not in the ASSISTED AI path)"
+    )
+    # The prompt is pending inside the real approver's reader loop; nothing
+    # dispatched yet.
+    assert ("press", "e") not in [ev[:2] for ev in backend.events]
+    # Fire the emergency stop in the production order (__main__._f12):
+    # set the approver's cancel event, then trigger the executor stop.
+    cancel.set()
+    executor.trigger_emergency_stop("f12")
+    t.join(timeout=3.0)
+    assert not t.is_alive(), (
+        "run did not exit after F12 — the real approver's pending wait was not interrupted"
+    )
+    assert "exc" not in result_box, f"run raised: {result_box.get('exc')!r}"
+    report = result_box["report"]
+    assert executor.stopped
+    assert report.stopped_reason == "emergency_stop", f"got {report.stopped_reason!r}"
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert approvals, "expected an APPROVAL audit event"
+    assert approvals[0].detail["approved"] is False
+    assert approvals[0].detail["reason"] == "interrupted"
+    # The AI action must NOT have been dispatched (stop wins over approval).
+    assert report.actions_attempted == 0
+    assert ("press", "e") not in [ev[:2] for ev in backend.events]
 
 
 def test_assisted_rejection_halts_episode_and_blocks_dispatch():
