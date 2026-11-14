@@ -104,17 +104,51 @@ jobs:
 
       - name: Install tesseract-ocr
         # The `ocr` extra installs pytesseract (a pure-Python wrapper that
-        # shells out to the `tesseract` binary). One e2e test
-        # (analyze --fulltest) needs the binary and *self-skips with a
-        # documented reason* when it is absent (tests/e2e/test_e2e_cli.py).
-        # This is a system package, not a pip dependency, and is the only step
-        # in this job that cannot be verified from a Linux dev box — so it is
-        # non-fatal: when the hosted runner provisions it, that e2e runs; when
-        # it cannot, the e2e reports an honest skip rather than turning the
-        # whole Windows job red. (If you want to *enforce* fulltest coverage on
-        # Windows, drop `continue-on-error` — the step is otherwise standard.)
-        continue-on-error: true
+        # shells out to the `tesseract` binary), and the analyze --fulltest e2e
+        # (tests/e2e/test_e2e_cli.py) needs it to *execute* — the same coverage
+        # the Linux job gets from apt. This step is mandatory: a failure here
+        # (or in the two steps below) fails the job instead of hiding behind a
+        # self-skip.
         run: choco install tesseract -y
+
+      - name: Propagate tesseract to PATH
+        # The tesseract Chocolatey package installs to
+        # ``%ProgramFiles%\Tesseract-OCR`` and registers it on the *machine*
+        # PATH. Machine-PATH edits do not reach subsequent GitHub Actions
+        # steps, so the test's ``shutil.which("tesseract")`` would still miss
+        # the binary and the e2e would self-skip (the F2 finding). Resolve the
+        # executable (verified with Test-Path, with Get-Command as fallback)
+        # and hand its directory to every later step via GITHUB_PATH.
+        run: |
+          $exe = $null
+          $knownPath = Join-Path $env:ProgramFiles "Tesseract-OCR\tesseract.exe"
+
+          if (Test-Path -LiteralPath $knownPath -PathType Leaf) {
+            $exe = $knownPath
+          }
+          else {
+            $cmd = Get-Command tesseract.exe `
+                -CommandType Application -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($cmd) { $exe = $cmd.Path }
+          }
+
+          if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "tesseract.exe not found after choco install"
+          }
+
+          Write-Host "tesseract install location: $exe"
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $exe)
+
+      - name: Verify tesseract is discoverable
+        # Separate step on purpose: it can only see the binary through the
+        # GITHUB_PATH propagation above, so this proves the PATH update
+        # survives the step boundary. Fails the job if resolution or launch
+        # fails — no continue-on-error, no conditional skip.
+        run: |
+          $cmd = Get-Command tesseract.exe -CommandType Application -ErrorAction Stop
+          Write-Host "tesseract resolves to: $($cmd.Path)"
+          tesseract --version
 
       - name: Show tool versions
         run: |
