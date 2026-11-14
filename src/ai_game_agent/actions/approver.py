@@ -614,8 +614,17 @@ class TerminalApprover:
 
         prev = _blocking_mode(fd)
         if prev is None:
-            # The fd cannot even be probed: no usable channel — the caller
-            # classifies this as a rejection (fail-safe).
+            # The fd cannot be put into non-blocking mode. This is the
+            # Windows case: ``os.get_blocking`` / ``os.set_blocking`` do not
+            # exist for pipes there, so a bounded, non-blocking read of a
+            # redirected pipe is impossible without worker threads (which the
+            # safety contract forbids). This is therefore a *genuinely
+            # POSIX* mechanism, not a defect. The fail-safe direction is the
+            # only correct one: reject (``no-input-channel``), never approve,
+            # never hang. On Windows the approval *contract* (timeout, cancel,
+            # late-reply, zero-timeout poll) is instead provided by the msvcrt
+            # console path (:meth:`_read_line_console`) and injected readers;
+            # a redirected pipe simply fails closed.
             return (None, False)
         try:
             os.set_blocking(fd, False)

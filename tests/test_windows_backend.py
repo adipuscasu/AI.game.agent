@@ -2,13 +2,16 @@
 
 TDD: red first (``windows.py`` missing → ``ImportError``), then green.
 
-This file never imports ``pynput``. The :class:`WindowsBackend` is driven
-through an injectable pynput-like object (``pynput_factory``), exactly the
-pattern :class:`ai_game_agent.capture.MssBackend` uses with
-``mss_factory`` (see ``tests/test_mss_backend.py``). The real ``pynput``
-import is therefore confined to ``windows.py`` itself, and this suite runs
-headless on a bare venv — the same guarantee the rest of steps 1–7 already
-have, now extended to the only backend that emits real OS input.
+The :class:`WindowsBackend` is driven through an injectable pynput-like
+object (``pynput_factory``), exactly the pattern
+:class:`ai_game_agent.capture.MssBackend` uses with ``mss_factory`` (see
+``tests/test_mss_backend.py``), so the suite runs headless on a bare venv —
+the same guarantee the rest of steps 1–7 already have, now extended to the
+only backend that emits real OS input. The single exception is the F3
+smoke test at the end of this file, which lazily imports the *real*
+``pynput`` inside the function body (and only when it is installed,
+skipping otherwise) to exercise the actual dependency import and factory
+construction — it never calls ``open()``, so it stays headless.
 
 Windows-specific behavior (actual key scancodes, the physical F12 binding on
 a live desktop, ``pynput.keyboard.Listener`` thread semantics) is
@@ -35,9 +38,12 @@ covers the Windows-side run. This file verifies the adapter's *contract*:
   end-to-end wiring through a real :class:`Executor` proves the stop
   releases held input and blocks subsequent dispatch.
 
-The one assertion this file makes about :mod:`pynput` is the absence: the
-``input`` extra must *not* be installed in the shared dev venv (see
-``tests/test_actions_bare.py``).
+Together with ``tests/test_actions_bare.py`` (the absence contract: the
+``input`` extra must *not* be installed in the shared dev venv) and
+``tests/test_actions_base.py`` (the fail-fast error path, exercised with the
+dependency forced absent), the F3 smoke test here closes the presence
+branch: on the job where ``pynput`` *is* installed, the real import and
+factory construction work; everywhere else it skips.
 """
 
 from __future__ import annotations
@@ -1119,3 +1125,58 @@ def test_hotkey_double_delivery_does_not_double_release() -> None:
     assert hits == ["stop"]
     assert ex.stopped is True
     backend.close()
+
+
+# --- F3: real pynput import + construction (Windows CI smoke) --------------
+# The fake-based tests above never import the real ``pynput`` library (the
+# adapter is driven through an injectable factory). This smoke test is the
+# one CI path that exercises the *actual* dependency import and the factory's
+# construction of the Windows backend — the exact code path the target
+# platform uses. It deliberately does NOT call ``open()``: no physical
+# keyboard/mouse listeners, no interaction with input devices, and no
+# interactive desktop session are required (CI must stay headless).
+
+
+def test_real_pynput_imports_and_backend_construction() -> None:
+    """F3 (Windows CI smoke): real ``pynput`` imports cleanly and the factory
+    constructs the Windows backend — without calling ``open()``.
+
+    Runs on the job where the ``input`` extra is installed (the Windows
+    runner) and skips on a bare venv (the Linux runner, where ``pynput`` is
+    intentionally absent and the fail-fast error path is the contract under
+    test). Together with
+    ``test_create_backend_windows_without_pynput_fails_fast`` the two cover
+    both the dependency-present and dependency-absent branches on every
+    platform, without relying on the host's installed packages.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("pynput") is None:
+        pytest.skip(
+            "pynput not installed (bare-venv job); the real import path is "
+            "exercised on the Windows job where the `input` extra is installed"
+        )
+
+    import pynput
+    import pynput.keyboard
+    import pynput.mouse
+
+    from ai_game_agent.actions.base import InputBackend, create_backend
+    from ai_game_agent.actions.windows import WindowsBackend
+    from ai_game_agent.config import InputConfig
+
+    # The real submodules import cleanly and expose the documented surface
+    # the adapter relies on (``Key`` / ``Button`` symbols).
+    assert pynput.keyboard.Key is not None
+    assert pynput.mouse.Button is not None
+
+    # The factory constructs the Windows backend WITHOUT opening it — no
+    # real input listeners, no physical devices, no desktop session.
+    backend = create_backend(InputConfig(backend="windows"))
+    assert isinstance(backend, WindowsBackend)
+    assert isinstance(backend, InputBackend)
+    assert backend.name == "windows"
+    # ``open()`` was deliberately NOT called: nothing opened, nothing held.
+    assert backend._opened is False
+    assert backend.held_keys == set()
+    assert backend.held_buttons == set()

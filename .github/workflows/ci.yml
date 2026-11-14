@@ -61,3 +61,119 @@ jobs:
 
       - name: Test
         run: uv run pytest
+
+  # ---------------------------------------------------------------------------
+  # EH3 — Windows coverage alongside Linux.
+  #
+  # The project's real target platform is Windows (``Operating System ::
+  # Microsoft :: Windows``). This job validates, on a clean hosted Windows
+  # runner, the exact things Linux cannot: the ``input`` extra (pynput — the
+  # ``windows`` backend's real dependency) installs and imports, and the whole
+  # headless suite + the real CLI entry point run under the Windows target.
+  #
+  # It is a *separate* job (not a matrix) so the Linux job above stays
+  # byte-for-byte untouched — the plan's "existing Linux coverage is not
+  # weakened" requirement is met by construction.
+  #
+  # No live game, no real input device, no interactive console: every test uses
+  # a mock/fake backend. The two pynput-*absent* contract tests are
+  # platform-guarded (they skip on win32 or force absence inside the test), so
+  # installing ``--extra input`` here does not turn them into failures. The
+  # live-CONIN$ tests self-skip (no real console on the hosted runner) and are
+  # reported as skips, not passes, via the suite's ``-ra`` (see pyproject).
+  # ---------------------------------------------------------------------------
+  test-windows:
+    name: Test (Python 3.11) — Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+          enable-cache: false
+
+      - name: Install Python 3.11
+        # Same guarantee as the Linux job: setup-uv's python-version input only
+        # sets UV_PYTHON; install the interpreter explicitly so the find below
+        # and uv sync have a guaranteed interpreter on a clean runner.
+        run: uv python install 3.11
+
+      - name: Install tesseract-ocr
+        # The `ocr` extra installs pytesseract (a pure-Python wrapper that
+        # shells out to the `tesseract` binary), and the analyze --fulltest e2e
+        # (tests/e2e/test_e2e_cli.py) needs it to *execute* — the same coverage
+        # the Linux job gets from apt. This step is mandatory: a failure here
+        # (or in the two steps below) fails the job instead of hiding behind a
+        # self-skip.
+        run: choco install tesseract -y
+
+      - name: Propagate tesseract to PATH
+        # The tesseract Chocolatey package installs to
+        # ``%ProgramFiles%\Tesseract-OCR`` and registers it on the *machine*
+        # PATH. Machine-PATH edits do not reach subsequent GitHub Actions
+        # steps, so the test's ``shutil.which("tesseract")`` would still miss
+        # the binary and the e2e would self-skip (the F2 finding). Resolve the
+        # executable (verified with Test-Path, with Get-Command as fallback)
+        # and hand its directory to every later step via GITHUB_PATH.
+        run: |
+          $exe = $null
+          $knownPath = Join-Path $env:ProgramFiles "Tesseract-OCR\tesseract.exe"
+
+          if (Test-Path -LiteralPath $knownPath -PathType Leaf) {
+            $exe = $knownPath
+          }
+          else {
+            $cmd = Get-Command tesseract.exe `
+                -CommandType Application -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($cmd) { $exe = $cmd.Path }
+          }
+
+          if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "tesseract.exe not found after choco install"
+          }
+
+          Write-Host "tesseract install location: $exe"
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $exe)
+
+      - name: Verify tesseract is discoverable
+        # Separate step on purpose: it can only see the binary through the
+        # GITHUB_PATH propagation above, so this proves the PATH update
+        # survives the step boundary. Fails the job if resolution or launch
+        # fails — no continue-on-error, no conditional skip.
+        run: |
+          $cmd = Get-Command tesseract.exe -CommandType Application -ErrorAction Stop
+          Write-Host "tesseract resolves to: $($cmd.Path)"
+          tesseract --version
+
+      - name: Show tool versions
+        run: |
+          uv --version
+          uv python find 3.11
+
+      - name: Install dependencies
+        # Same extras as the Linux job, PLUS `input`: pynput is the windows
+        # backend's real dependency and its Windows wheel is pure-Python
+        # (py3-none-any, no platform build deps), so it installs cleanly here.
+        # Installing it is the point of this job — it exercises the exact import
+        # path the target platform uses, which the Linux (bare) venv never does.
+        run: >-
+          uv sync --extra capture --extra vision --extra ocr --extra dev
+          --extra input --locked
+
+      - name: Check lockfile
+        run: uv lock --check
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Test
+        # -ra is already in pyproject addopts; the Windows-specific skips
+        # (pynput-absent contract tests + live-CONIN$ console tests) each
+        # self-document their reason in the summary, so skips are reported
+        # distinctly from passes — never treated as a product pass.
+        run: uv run pytest

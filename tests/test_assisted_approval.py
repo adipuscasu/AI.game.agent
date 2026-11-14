@@ -39,6 +39,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import io
+import sys
 import threading
 
 import pytest
@@ -64,6 +65,25 @@ from ai_game_agent.state import AgentState, EventType, GameStateMachine
 
 TS = datetime.datetime(2026, 10, 14, tzinfo=datetime.UTC)
 _BB = BBox(x=10, y=10, width=20, height=10)
+
+#: These tests drive the approver's **fd input path**, which is a genuinely
+#: POSIX mechanism: it needs non-blocking pipe I/O (``os.get_blocking`` /
+#: ``os.set_blocking``), which do not exist for Windows pipes. It is NOT the
+#: approval contract that is absent on Windows — that contract (timeout,
+#: cancel, late-reply, zero-timeout poll) is fully covered there by the msvcrt
+#: console reader tests (``test_console_reader_*`` above) and by injected
+#: readers. On Windows a redirected pipe reaches the fd path and correctly
+#: fails closed (reject, never approve, never hang); that safe behavior is
+#: pinned by ``test_fd_redirected_pipe_fails_closed_on_windows``.
+fd_input_path = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "POSIX-only fd path (needs os.get_blocking/os.set_blocking, absent for "
+        "Windows pipes); the approval contract on Windows is covered by the "
+        "msvcrt console reader tests and the fd path fails closed for "
+        "redirected pipes"
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +262,17 @@ def test_assisted_approval_allows_ai_action():
     assert approvals[0].detail["kind"] == "key_press"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "the real-stdin pending wait this test drives is the fd path, a "
+        "POSIX mechanism (it needs os.get_blocking/os.set_blocking, absent "
+        "for Windows pipes, where the fd path fails closed by design — "
+        "pinned by test_fd_redirected_pipe_fails_closed_on_windows). The "
+        "platform-agnostic loop-level contract is pinned by "
+        "test_f12_interrupts_real_approver_pending_wait_in_loop_console_reader"
+    ),
+)
 def test_f12_interrupts_real_approver_pending_wait_in_loop(quiet_stdout, monkeypatch):
     """F12 must interrupt the *real* ``TerminalApprover`` pending wait at the
     loop level — not merely the executor's refusal to dispatch afterwards.
@@ -255,6 +286,12 @@ def test_f12_interrupts_real_approver_pending_wait_in_loop(quiet_stdout, monkeyp
     handler sets the approver's cancel event *and* triggers the executor
     stop), over a stdin that will never answer, and fires the stop while the
     wait is pending — with no manual release of any kind.
+
+    POSIX-only: the pending wait over a real stdin is the fd path, which
+    actually waits on POSIX but fails closed (by design) on Windows. On
+    Windows this test would pass only by scheduling luck (cancel racing the
+    prompt's immediate fail-closed return), so the same contract is pinned
+    platform-agnostically by the console-reader sibling below.
     """
     import os
 
@@ -332,6 +369,86 @@ def test_f12_interrupts_real_approver_pending_wait_in_loop(quiet_stdout, monkeyp
     assert ("press", "e") not in [ev[:2] for ev in backend.events]
     os.close(w)
     os.close(r)
+
+
+def test_f12_interrupts_real_approver_pending_wait_in_loop_console_reader(quiet_stdout):
+    """F12 must interrupt the *real* ``TerminalApprover`` pending wait at the
+    loop level — the platform-agnostic version of the test above.
+
+    The sibling above pins the same contract over a real never-answering
+    stdin; its pending wait is the fd path, which only genuinely waits on
+    POSIX. On Windows the fd path cannot wait (no non-blocking pipe I/O; it
+    fails closed by design — pinned by
+    ``test_fd_redirected_pipe_fails_closed_on_windows``). This test pins the
+    identical loop-level contract through the approver's *reader* polling
+    loop, where the pending wait is real on every platform: an injected
+    never-answering reader (``kbhit()`` always False) holds the wait inside
+    the real ``_read_line_console`` deadline loop. Same production object,
+    same F12 ordering (cancel event, then executor stop), no manual release
+    of any kind — only the input source is faked, and deterministically.
+    """
+    cancel = threading.Event()
+    approver = TerminalApprover(
+        timeout_s=10.0, cancel_event=cancel, reader=_FakeConsoleReader()
+    )
+
+    entered = threading.Event()
+    _orig = approver.request_approval
+
+    def _mark(action, **kwargs):
+        entered.set()
+        return _orig(action, **kwargs)
+
+    approver.request_approval = _mark
+
+    backend = MockBackend()
+    ai = _FakeAI(decision=_ai_decision())
+    events: list[object] = []
+    loop = _loop(
+        mode=OperationMode.ASSISTED,
+        approver=approver,
+        backend=backend,
+        ai=ai,
+        max_ticks=10,
+        on_event=events.append,
+    )
+    executor = loop._executor
+
+    result_box: dict[str, object] = {}
+
+    def _run() -> None:
+        try:
+            result_box["report"] = loop.run()
+        except BaseException as exc:  # pragma: no cover - surface test failures
+            result_box["exc"] = exc
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    assert entered.wait(timeout=3.0), (
+        "approver never entered (loop not in the ASSISTED AI path)"
+    )
+    # The prompt is pending inside the real approver's reader loop; nothing
+    # dispatched yet.
+    assert ("press", "e") not in [ev[:2] for ev in backend.events]
+    # Fire the emergency stop in the production order (__main__._f12):
+    # set the approver's cancel event, then trigger the executor stop.
+    cancel.set()
+    executor.trigger_emergency_stop("f12")
+    t.join(timeout=3.0)
+    assert not t.is_alive(), (
+        "run did not exit after F12 — the real approver's pending wait was not interrupted"
+    )
+    assert "exc" not in result_box, f"run raised: {result_box.get('exc')!r}"
+    report = result_box["report"]
+    assert executor.stopped
+    assert report.stopped_reason == "emergency_stop", f"got {report.stopped_reason!r}"
+    approvals = [e for e in events if e.event is EventType.APPROVAL]
+    assert approvals, "expected an APPROVAL audit event"
+    assert approvals[0].detail["approved"] is False
+    assert approvals[0].detail["reason"] == "interrupted"
+    # The AI action must NOT have been dispatched (stop wins over approval).
+    assert report.actions_attempted == 0
+    assert ("press", "e") not in [ev[:2] for ev in backend.events]
 
 
 def test_assisted_rejection_halts_episode_and_blocks_dispatch():
@@ -848,6 +965,7 @@ def test_terminal_approver_keyboard_interrupt_rejects(quiet_stdout, monkeypatch)
     assert not decision.is_approved
 
 
+@fd_input_path
 def test_terminal_approver_timeout_rejects(quiet_stdout, monkeypatch):
     """A timeout on the prompt is a rejection (the configured bound).
 
@@ -895,6 +1013,7 @@ def test_terminal_approver_timeout_rejects(quiet_stdout, monkeypatch):
     assert decision.reason == "timeout"
 
 
+@fd_input_path
 def test_terminal_approver_timeout_when_select_rejects_fd(quiet_stdout, monkeypatch):
     """A timeout must still reject when ``select`` refuses the fd.
 
@@ -955,6 +1074,7 @@ def test_terminal_approver_timeout_when_select_rejects_fd(quiet_stdout, monkeypa
     assert decision.reason == "timeout"
 
 
+@fd_input_path
 def test_bounded_read_does_not_accumulate_worker_threads(quiet_stdout, monkeypatch):
     """Repeated timed-out prompts on the select-unavailable fallback path
     must not accumulate blocked worker threads.
@@ -1363,6 +1483,7 @@ def _late_reply_stdin(delay: float, reply: bytes = b"y\n"):
     return _PipeStdin()
 
 
+@fd_input_path
 def test_terminal_approver_zero_timeout_is_non_blocking_poll(
     quiet_stdout, monkeypatch
 ):
@@ -1389,6 +1510,7 @@ def test_terminal_approver_zero_timeout_is_non_blocking_poll(
     )
 
 
+@fd_input_path
 def test_terminal_approver_zero_timeout_honours_buffered_reply(
     quiet_stdout, monkeypatch
 ):
@@ -1422,6 +1544,7 @@ def test_terminal_approver_zero_timeout_honours_buffered_reply(
     assert decision.reason == "user-approved"
 
 
+@fd_input_path
 def test_terminal_approver_cancel_event_interrupts_pending_wait(
     quiet_stdout, monkeypatch
 ):
@@ -1501,6 +1624,7 @@ def _straddling_stdin(first: bytes, first_at: float, second: bytes, second_at: f
     return _StraddleStdin()
 
 
+@fd_input_path
 def test_fd_straddling_newline_after_deadline_is_timeout(quiet_stdout, monkeypatch):
     """A reply whose *newline* lands after the deadline is not approved, even
     if its first byte arrived early.
@@ -1520,6 +1644,7 @@ def test_fd_straddling_newline_after_deadline_is_timeout(quiet_stdout, monkeypat
     assert decision.reason == "timeout"
 
 
+@fd_input_path
 def test_fd_lone_byte_without_newline_does_not_hang(quiet_stdout, monkeypatch):
     """A lone ``y`` with no newline and an open writer must not hang.
 
@@ -1563,6 +1688,7 @@ def test_fd_lone_byte_without_newline_does_not_hang(quiet_stdout, monkeypatch):
     assert decision.reason == "timeout"
 
 
+@fd_input_path
 def test_fd_reply_split_across_poll_slices_is_approved(quiet_stdout, monkeypatch):
     """A reply whose bytes arrive in separate poll slices is approved, not lost.
 
@@ -1633,6 +1759,7 @@ def test_fd_eof_is_no_input_channel(quiet_stdout, monkeypatch):
     os.close(r)
 
 
+@fd_input_path
 def test_fd_continuous_stream_timeout_zero_is_bounded(quiet_stdout, monkeypatch):
     """timeout=0 on a *continuously* readable stream must stay bounded.
 
@@ -1686,6 +1813,7 @@ def test_fd_continuous_stream_timeout_zero_is_bounded(quiet_stdout, monkeypatch)
     assert elapsed < 1.0, f"timeout=0 poll was not bounded: {elapsed:.2f}s"
 
 
+@fd_input_path
 def test_fd_continuous_stream_timeout_positive_is_bounded(quiet_stdout, monkeypatch):
     """timeout>0 on a *continuously* readable stream must respect the deadline.
 
@@ -1884,6 +2012,7 @@ def test_fd_timeout_zero_buffered_y_with_cancel_set_is_interrupted(
         assert decision.reason == "interrupted", f"got {decision.reason!r}"
 
 
+@fd_input_path
 def test_fd_timeout_zero_buffered_y_without_cancel_is_approved(
     quiet_stdout, monkeypatch
 ):
@@ -2171,7 +2300,6 @@ def test_prompt_sanitization_does_not_mutate_reasoning(quiet_stdout, monkeypatch
 # required); the live-CONIN$ checks run only on a real Windows console.
 # ---------------------------------------------------------------------------
 
-import sys  # noqa: E402
 import time  # noqa: E402
 
 import ai_game_agent.actions.approver as _approver_mod  # noqa: E402
@@ -2512,3 +2640,54 @@ def test_console_reader_survives_clock_jump_past_deadline(quiet_stdout):
     # an approval, never a crash).
     assert not decision.is_approved
     assert decision.reason == "timeout"
+
+
+# ---------------------------------------------------------------------------
+# 9) Windows fd path: safe fail-closed (EH3 regression guard)
+#
+# On a Windows redirected pipe the fd path cannot do a bounded, non-blocking
+# read (``os.get_blocking``/``os.set_blocking`` do not exist for pipes there,
+# and the only bounded alternative — a worker thread — is forbidden by the
+# safety contract). The correct, safe behavior is to fail closed: reject with
+# an accurate reason, never approve, and never hang. This test pins that safe
+# behavior on the target platform so a future "fix" that reaches for blocking
+# reads cannot turn the security boundary into a hang. The full approval
+# contract on Windows is covered by the msvcrt console reader tests (section 8).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Windows-specific: the fd path has no non-blocking pipe I/O there",
+)
+def test_fd_redirected_pipe_fails_closed_on_windows(quiet_stdout, monkeypatch):
+    """A redirected-pipe stdin on Windows must fail closed: reject with an
+    accurate ``no-input-channel`` reason — never approve, never hang."""
+    import os
+    import time
+
+    r, w = os.pipe()
+    try:
+
+        class _RedirectedPipeStdin:
+            def fileno(self):
+                return r
+
+        monkeypatch.setattr("sys.stdin", _RedirectedPipeStdin())
+        t0 = time.monotonic()
+        decision = TerminalApprover(timeout_s=0.5).request_approval(
+            _action(), reasoning="r", confidence=0.5
+        )
+        elapsed = time.monotonic() - t0
+        assert not decision.is_approved, (
+            f"a redirected pipe must never approve on Windows, got {decision!r}"
+        )
+        assert decision.reason == "no-input-channel", (
+            f"expected an accurate no-channel reason, got {decision.reason!r}"
+        )
+        assert elapsed < 1.0, (
+            f"the fd path must fail closed promptly, not hang: {elapsed:.2f}s"
+        )
+    finally:
+        os.close(r)
+        os.close(w)

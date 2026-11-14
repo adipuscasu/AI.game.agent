@@ -9,8 +9,6 @@ naming the missing extra, not a traceback. This mirrors Phase 1's
 
 from __future__ import annotations
 
-import importlib.util
-
 import pytest
 
 from ai_game_agent.actions.base import (
@@ -81,9 +79,23 @@ def test_create_backend_unknown_raises_action_error():
     assert "doesnotexist" in str(excinfo.value)
 
 
-def test_create_backend_windows_without_pynput_fails_fast():
-    if importlib.util.find_spec("pynput") is not None:
-        pytest.skip("pynput present; windows path is covered by Windows manual testing")
+def test_create_backend_windows_without_pynput_fails_fast(monkeypatch):
+    """Selecting the ``windows`` backend without ``pynput`` must fail fast
+    with a clean ``InputBackendError`` naming the ``input`` extra and
+    ``pynput`` — never a bare ``ImportError`` traceback.
+
+    pynput availability is forced to *absent* here (regardless of the host's
+    installed packages) so this fail-fast contract is exercised on every
+    platform: on the bare-venv job ``pynput`` is genuinely absent, and on the
+    Windows job it is *installed* — so without forcing absence this test would
+    skip there and the error path would be untested. Mocking the availability
+    check is an isolated, deterministic stand-in for a host without the
+    ``input`` extra (the real-import path is covered separately by
+    ``test_real_pynput_imports_and_backend_construction``).
+    """
+    import ai_game_agent.actions.base as base_mod
+
+    monkeypatch.setattr(base_mod, "_pynput_available", lambda: False)
     with pytest.raises(InputBackendError) as excinfo:
         create_backend(InputConfig(backend="windows"))
     msg = str(excinfo.value).lower()
