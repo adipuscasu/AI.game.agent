@@ -114,6 +114,16 @@ def test_load_valid_manifest(tmp_path: Path) -> None:
     }
 
 
+def test_state_signals_mapping_is_immutable(tmp_path: Path) -> None:
+    # Signals are the evaluation ground truth — mutating them after loading
+    # would silently change the expected outcome, so the mapping itself
+    # must be read-only, not just the dataclass wrapper.
+    manifest = load_manifest(_write_dataset(tmp_path))
+    signals = manifest.samples[1].state.signals
+    with pytest.raises(TypeError):
+        signals["target_present"] = False  # type: ignore[index]
+
+
 def test_state_reason_is_optional(tmp_path: Path) -> None:
     raw = _valid_raw()
     del raw["samples"][1]["state"]["reason"]
@@ -150,6 +160,15 @@ def test_schema_version_wrong_type_rejected(tmp_path: Path, bad: object) -> None
 def test_non_finite_ui_scale_rejected(tmp_path: Path, bad: float) -> None:
     raw = _valid_raw()
     raw["capture"]["ui_scale"] = bad
+    with pytest.raises(ManifestError, match="ui_scale"):
+        load_manifest(_write_dataset(tmp_path, raw))
+
+
+def test_huge_integer_ui_scale_rejected(tmp_path: Path) -> None:
+    # ``math.isfinite(10**400)`` itself raises OverflowError — it must
+    # surface as a ManifestError, never as a leaked exception.
+    raw = _valid_raw()
+    raw["capture"]["ui_scale"] = 10**400
     with pytest.raises(ManifestError, match="ui_scale"):
         load_manifest(_write_dataset(tmp_path, raw))
 

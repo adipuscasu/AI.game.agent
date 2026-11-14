@@ -23,6 +23,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
+from types import MappingProxyType
 from typing import Any
 
 from ai_game_agent.perception.observation import Observation
@@ -137,15 +138,20 @@ def _parse_capture(raw: Any, errors: list[str]) -> CaptureMetadata:
         # ``math.isfinite`` after the type check: ``float("nan") <= 0`` is
         # False and ``float("inf") > 0``, so the positivity check alone would
         # accept both (``1e309`` parses to infinity straight from JSON text).
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value <= 0
-        ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             errors.append(f"capture.{key}: must be a positive finite number")
             return 0.0
-        return float(value)
+        try:
+            value = float(value)
+        except OverflowError:
+            # ``math.isfinite(10**400)`` itself raises — normalize it into
+            # the same validation error as any other unusable value.
+            errors.append(f"capture.{key}: must be a finite number")
+            return 0.0
+        if not math.isfinite(value) or value <= 0:
+            errors.append(f"capture.{key}: must be a positive finite number")
+            return 0.0
+        return value
 
     window_mode = raw.get("window_mode")
     if not _is_str(window_mode) or not window_mode:
@@ -189,8 +195,11 @@ def _parse_state(raw: Any, label: str, errors: list[str]) -> StateExpectation | 
         errors.append(f"{label}: state.reason must be a non-empty string")
         reason = None
 
+    # ``MappingProxyType``: a frozen dataclass alone would still expose the
+    # raw dict — mutating ``signals`` after loading would silently rewrite
+    # the evaluation ground truth.
     return StateExpectation(
-        signals=signals,
+        signals=MappingProxyType(signals),
         state=state,
         reason=reason if _is_str(reason) else None,
     )
@@ -224,7 +233,7 @@ def _parse_sample(entry: Any, index: int, errors: list[str]) -> Sample | None:
     else:
         try:
             detections = Observation.from_dict(detections_raw)
-        except (TypeError, ValueError) as exc:
+        except (OverflowError, TypeError, ValueError) as exc:
             # TypeError is caught as well: a malformed dataset must never
             # escape the ManifestError interface as a raw exception.
             errors.append(f"{label}: detections: {exc}")

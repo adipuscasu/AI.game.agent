@@ -79,7 +79,12 @@ def _from_float_field(d: dict, key: str, label: str) -> float:
     value = d[key]
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{label} '{key}' must be a number, got {value!r}")
-    return float(value)
+    try:
+        return float(value)
+    except OverflowError as exc:
+        # ``float(10**400)`` overflows — normalize it to ValueError like
+        # every other malformed numeric instead of leaking the exception.
+        raise ValueError(f"{label} '{key}' must be a finite number, got {value!r}") from exc
 
 
 def _from_bbox(d: object, label: str) -> BBox:

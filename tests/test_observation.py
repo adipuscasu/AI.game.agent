@@ -274,6 +274,14 @@ class TestFromDict:
         with pytest.raises(ValueError, match="detector_errors"):
             Observation.from_dict(d)
 
+    def test_huge_int_confidence_raises_value_error(self) -> None:
+        # ``float(10**400)`` raises OverflowError — like every other
+        # malformed numeric it must normalize to ValueError, never escape.
+        d = _full().to_dict()
+        d["templates"][0]["confidence"] = 10**400
+        with pytest.raises(ValueError, match="confidence"):
+            Observation.from_dict(d)
+
     @pytest.mark.parametrize("bad_entry", [5, None, ["nested"], {"error": "OCR failed"}])
     def test_detector_errors_non_string_entry_rejected(self, bad_entry: object) -> None:
         d = _full().to_dict()
