@@ -36,6 +36,75 @@ __all__ = [
     "UiZoneHit",
 ]
 
+_TOP_LEVEL_KEYS = frozenset(
+    {
+        "schema_version",
+        "frame_width",
+        "frame_height",
+        "captured_at",
+        "source",
+        "templates",
+        "ui_zones",
+        "text_regions",
+        "objects",
+        "detector_errors",
+    }
+)
+
+
+def _require_keys(d: object, allowed: frozenset[str], label: str) -> None:
+    """Reject shape drift in authored data: unknown *and* missing keys."""
+    if not isinstance(d, dict):
+        raise ValueError(f"{label} must be an object, got {type(d).__name__}")
+    unknown = set(d) - allowed
+    if unknown:
+        raise ValueError(f"{label} has unknown keys: {sorted(unknown)}")
+    missing = allowed - set(d)
+    if missing:
+        raise ValueError(f"{label} is missing keys: {sorted(missing)}")
+
+
+def _from_int_field(d: dict, key: str, label: str) -> int:
+    """Strict JSON-integer read: real ints only — bool and string are
+    distinct JSON types and must not coerce (``int(True) == 1`` would hide
+    label drift)."""
+    value = d[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} '{key}' must be an integer, got {value!r}")
+    return value
+
+
+def _from_float_field(d: dict, key: str, label: str) -> float:
+    """Strict JSON-number read: int or float, never bool or string."""
+    value = d[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} '{key}' must be a number, got {value!r}")
+    try:
+        return float(value)
+    except OverflowError as exc:
+        # ``float(10**400)`` overflows — normalize it to ValueError like
+        # every other malformed numeric instead of leaking the exception.
+        raise ValueError(f"{label} '{key}' must be a finite number, got {value!r}") from exc
+
+
+def _from_bbox(d: object, label: str) -> BBox:
+    _require_keys(d, frozenset({"x", "y", "width", "height"}), f"{label} bbox")
+    assert isinstance(d, dict)
+    return BBox(
+        x=_from_int_field(d, "x", f"{label} bbox"),
+        y=_from_int_field(d, "y", f"{label} bbox"),
+        width=_from_int_field(d, "width", f"{label} bbox"),
+        height=_from_int_field(d, "height", f"{label} bbox"),
+    )
+
+
+def _from_str_field(d: dict, key: str, label: str) -> str:
+    value = d[key]
+    if not isinstance(value, str):
+        raise ValueError(f"{label} '{key}' must be a string, got {value!r}")
+    return value
+
+
 # Bump if the serialized shape below changes in a way consumers must handle.
 # v2: UI-zone detections moved out of ``templates`` into their own ``ui_zones``
 # collection (see ``UiZoneHit``) — template matches and semantic UI state are
@@ -201,3 +270,109 @@ class Observation:
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict())
+
+    @classmethod
+    def _from_hit_collection(cls, d: object, allowed: frozenset[str], label: str, factory) -> tuple:
+        """Parse one hit collection, delegating each entry's invariants to
+        the hit dataclass itself (confidence range, bbox extents)."""
+        if not isinstance(d, list):
+            raise ValueError(f"{label} must be a list, got {type(d).__name__}")
+        hits = []
+        for entry in d:
+            _require_keys(entry, allowed, f"{label} entry")
+            assert isinstance(entry, dict)
+            hits.append(factory(entry))
+        return tuple(hits)
+
+    @classmethod
+    def from_dict(cls, d: object) -> Observation:
+        """The inverse of :meth:`to_dict`.
+
+        Strict by design: this is the deserialization path for *authored*
+        data (dataset labels, replay logs), so unknown or missing keys are
+        shape drift and raise ``ValueError`` rather than being absorbed.
+        ``detector_errors`` and ``schema_version`` default to the contract
+        defaults, matching their optionality on the dataclass. When supplied,
+        ``schema_version`` must be the current integer version — an unknown
+        version means the payload was authored against a different shape and
+        must not be interpreted as the current one.
+        """
+        if not isinstance(d, dict):
+            raise ValueError(f"observation must be an object, got {type(d).__name__}")
+        d = dict(d)
+        schema_version = d.pop("schema_version", SCHEMA_VERSION)
+        if (
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version != SCHEMA_VERSION
+        ):
+            raise ValueError(
+                f"observation schema_version {schema_version!r} not supported "
+                f"(expected {SCHEMA_VERSION})"
+            )
+        detector_errors = d.pop("detector_errors", [])
+        if not isinstance(detector_errors, list):
+            raise ValueError(
+                "observation detector_errors must be a list of strings, "
+                f"got {type(detector_errors).__name__}"
+            )
+        for entry in detector_errors:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    f"observation detector_errors entries must be strings, got {entry!r}"
+                )
+        _require_keys(d, _TOP_LEVEL_KEYS - {"schema_version", "detector_errors"}, "observation")
+
+        try:
+            captured_at = datetime.datetime.fromisoformat(d["captured_at"])
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"invalid observation captured_at: {d['captured_at']!r}") from exc
+
+        return cls(
+            frame_width=_from_int_field(d, "frame_width", "observation"),
+            frame_height=_from_int_field(d, "frame_height", "observation"),
+            captured_at=captured_at,
+            source=_from_str_field(d, "source", "observation"),
+            templates=cls._from_hit_collection(
+                d["templates"],
+                frozenset({"template", "bbox", "confidence"}),
+                "template",
+                lambda e: TemplateHit(
+                    template=_from_str_field(e, "template", "template"),
+                    bbox=_from_bbox(e["bbox"], "template"),
+                    confidence=_from_float_field(e, "confidence", "template"),
+                ),
+            ),
+            ui_zones=cls._from_hit_collection(
+                d["ui_zones"],
+                frozenset({"zone", "check", "bbox", "value"}),
+                "ui zone",
+                lambda e: UiZoneHit(
+                    zone=_from_str_field(e, "zone", "ui zone"),
+                    check=_from_str_field(e, "check", "ui zone"),
+                    bbox=_from_bbox(e["bbox"], "ui zone"),
+                    value=_from_float_field(e, "value", "ui zone"),
+                ),
+            ),
+            text_regions=cls._from_hit_collection(
+                d["text_regions"],
+                frozenset({"text", "bbox", "confidence"}),
+                "text region",
+                lambda e: TextRegion(
+                    text=_from_str_field(e, "text", "text region"),
+                    bbox=_from_bbox(e["bbox"], "text region"),
+                    confidence=_from_float_field(e, "confidence", "text region"),
+                ),
+            ),
+            objects=cls._from_hit_collection(
+                d["objects"],
+                frozenset({"kind", "bbox", "confidence"}),
+                "object",
+                lambda e: ObjectHit(
+                    kind=_from_str_field(e, "kind", "object"),
+                    bbox=_from_bbox(e["bbox"], "object"),
+                    confidence=_from_float_field(e, "confidence", "object"),
+                ),
+            ),
+            detector_errors=tuple(detector_errors),
+        )

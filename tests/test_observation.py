@@ -176,3 +176,176 @@ class TestSerialization:
         payload = json.loads(empty.to_json())
         assert payload["templates"] == []
         assert payload["ui_zones"] == []
+
+
+class TestFromDict:
+    """``from_dict`` is the inverse of ``to_dict`` — the label-deserialization
+    path used by the EH4 dataset manifest. It must be strict: the manifest
+    is data authored outside this codebase, so unknown keys and missing keys
+    are shape drift and must be rejected, not silently absorbed."""
+
+    def test_round_trips_full(self) -> None:
+        assert Observation.from_dict(_full().to_dict()) == _full()
+
+    def test_round_trips_empty(self) -> None:
+        empty = Observation(
+            frame_width=1,
+            frame_height=1,
+            captured_at=_ts(),
+            source="synthetic",
+            templates=(),
+            ui_zones=(),
+            text_regions=(),
+            objects=(),
+            detector_errors=(),
+        )
+        assert Observation.from_dict(empty.to_dict()) == empty
+
+    def test_detector_errors_and_schema_version_have_defaults(self) -> None:
+        d = _full().to_dict()
+        del d["detector_errors"]
+        del d["schema_version"]
+        obs = Observation.from_dict(d)
+        assert obs.detector_errors == ()
+        assert obs.schema_version == _full().schema_version
+
+    def test_unknown_top_level_key_rejected(self) -> None:
+        d = _full().to_dict()
+        d["bogus"] = 1
+        with pytest.raises(ValueError, match="unknown"):
+            Observation.from_dict(d)
+
+    def test_unknown_nested_key_rejected(self) -> None:
+        d = _full().to_dict()
+        d["templates"][0]["bogus"] = 1
+        with pytest.raises(ValueError, match="unknown"):
+            Observation.from_dict(d)
+
+    def test_missing_required_key_rejected(self) -> None:
+        d = _full().to_dict()
+        del d["source"]
+        with pytest.raises(ValueError, match="missing"):
+            Observation.from_dict(d)
+
+    def test_out_of_range_confidence_rejected(self) -> None:
+        d = _full().to_dict()
+        d["templates"][0]["confidence"] = 1.5
+        with pytest.raises(ValueError):
+            Observation.from_dict(d)
+
+    def test_negative_bbox_extents_rejected(self) -> None:
+        d = _full().to_dict()
+        d["objects"][0]["bbox"]["width"] = -5
+        with pytest.raises(ValueError):
+            Observation.from_dict(d)
+
+    def test_invalid_timestamp_rejected(self) -> None:
+        d = _full().to_dict()
+        d["captured_at"] = "not-a-timestamp"
+        with pytest.raises(ValueError, match="captured_at"):
+            Observation.from_dict(d)
+
+    # -- schema_version guard (F1) -----------------------------------------
+
+    def test_explicit_current_schema_version_accepted(self) -> None:
+        d = _full().to_dict()
+        d["schema_version"] = 2
+        assert Observation.from_dict(d) == _full()
+
+    @pytest.mark.parametrize("bad", [1, 999, None, True, "2", 2.0])
+    def test_invalid_schema_version_rejected(self, bad: object) -> None:
+        d = _full().to_dict()
+        d["schema_version"] = bad
+        with pytest.raises(ValueError, match="schema_version"):
+            Observation.from_dict(d)
+
+    # -- detector_errors validation (F2) -----------------------------------
+
+    def test_detector_errors_list_of_strings_accepted(self) -> None:
+        d = _full().to_dict()
+        d["detector_errors"] = ["ocr: tesseract not installed", "ui:zone_a: timeout"]
+        obs = Observation.from_dict(d)
+        assert obs.detector_errors == ("ocr: tesseract not installed", "ui:zone_a: timeout")
+
+    @pytest.mark.parametrize("bad", [None, "disk error", {"error": "OCR failed"}, 5])
+    def test_detector_errors_wrong_container_rejected(self, bad: object) -> None:
+        d = _full().to_dict()
+        d["detector_errors"] = bad
+        with pytest.raises(ValueError, match="detector_errors"):
+            Observation.from_dict(d)
+
+    def test_huge_int_confidence_raises_value_error(self) -> None:
+        # ``float(10**400)`` raises OverflowError — like every other
+        # malformed numeric it must normalize to ValueError, never escape.
+        d = _full().to_dict()
+        d["templates"][0]["confidence"] = 10**400
+        with pytest.raises(ValueError, match="confidence"):
+            Observation.from_dict(d)
+
+    @pytest.mark.parametrize("bad_entry", [5, None, ["nested"], {"error": "OCR failed"}])
+    def test_detector_errors_non_string_entry_rejected(self, bad_entry: object) -> None:
+        d = _full().to_dict()
+        d["detector_errors"] = ["ok", bad_entry]
+        with pytest.raises(ValueError, match="detector_errors"):
+            Observation.from_dict(d)
+
+    # --- strict numeric coercion (EH4 audit B1/B2) -------------------------
+    # ``from_dict`` is the deserializer for *authored* JSON: it must raise
+    # ValueError for every non-numeric value (never leak TypeError) and must
+    # not accept JSON types the serializer never emits — bool is a distinct
+    # JSON type, not a number, and neither is a string.
+
+    def test_none_frame_dimensions_rejected(self) -> None:
+        d = _full().to_dict()
+        d["frame_width"] = None
+        with pytest.raises(ValueError, match="frame_width"):
+            Observation.from_dict(d)
+        d = _full().to_dict()
+        d["frame_height"] = None
+        with pytest.raises(ValueError, match="frame_height"):
+            Observation.from_dict(d)
+
+    def test_none_confidence_and_value_rejected(self) -> None:
+        d = _full().to_dict()
+        d["templates"][0]["confidence"] = None
+        with pytest.raises(ValueError, match="confidence"):
+            Observation.from_dict(d)
+        d = _full().to_dict()
+        d["ui_zones"][0]["value"] = None
+        with pytest.raises(ValueError, match="value"):
+            Observation.from_dict(d)
+
+    def test_none_bbox_extents_rejected(self) -> None:
+        d = _full().to_dict()
+        d["objects"][0]["bbox"]["x"] = None
+        with pytest.raises(ValueError, match="bbox"):
+            Observation.from_dict(d)
+
+    def test_bool_frame_dimensions_rejected(self) -> None:
+        d = _full().to_dict()
+        d["frame_width"] = True
+        with pytest.raises(ValueError, match="frame_width"):
+            Observation.from_dict(d)
+
+    def test_bool_bbox_extents_rejected(self) -> None:
+        d = _full().to_dict()
+        d["objects"][0]["bbox"]["width"] = True
+        with pytest.raises(ValueError, match="bbox"):
+            Observation.from_dict(d)
+
+    def test_bool_confidence_rejected(self) -> None:
+        d = _full().to_dict()
+        d["templates"][0]["confidence"] = True
+        with pytest.raises(ValueError, match="confidence"):
+            Observation.from_dict(d)
+
+    def test_string_numeric_rejected(self) -> None:
+        # JSON strings are a different type; ``int("128")`` must not coerce.
+        d = _full().to_dict()
+        d["frame_width"] = "128"
+        with pytest.raises(ValueError, match="frame_width"):
+            Observation.from_dict(d)
+        d = _full().to_dict()
+        d["templates"][0]["confidence"] = "0.94"
+        with pytest.raises(ValueError, match="confidence"):
+            Observation.from_dict(d)
