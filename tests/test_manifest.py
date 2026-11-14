@@ -74,12 +74,22 @@ def _valid_raw() -> dict:
 
 
 def _write_dataset(tmp_path: Path, raw: dict | None = None) -> Path:
-    """Write a dataset directory (manifest + referenced frame files)."""
+    """Write a dataset directory (manifest + referenced frame files).
+
+    Frames whose path does not resolve inside ``tmp_path`` are deliberately
+    *not* created: those tests assert that the loader rejects them. On POSIX
+    an absolute sample path (e.g. ``/etc/passwd``) would join to the
+    filesystem root and the write would fail (or leak an artifact), so the
+    helper confines itself to the dataset directory.
+    """
     raw = _valid_raw() if raw is None else raw
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+    root = tmp_path.resolve()
     for sample in raw["samples"]:
         frame = tmp_path / sample["image"]
+        if not frame.resolve().is_relative_to(root):
+            continue
         frame.parent.mkdir(parents=True, exist_ok=True)
         frame.write_bytes(b"\x89PNG fake")
     return manifest_path
