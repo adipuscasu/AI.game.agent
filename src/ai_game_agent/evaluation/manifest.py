@@ -18,6 +18,7 @@ manifest with ten problems should not need ten load attempts.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -133,8 +134,16 @@ def _parse_capture(raw: Any, errors: list[str]) -> CaptureMetadata:
 
     def _float(key: str) -> float:
         value = raw.get(key)
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
-            errors.append(f"capture.{key}: must be a positive number")
+        # ``math.isfinite`` after the type check: ``float("nan") <= 0`` is
+        # False and ``float("inf") > 0``, so the positivity check alone would
+        # accept both (``1e309`` parses to infinity straight from JSON text).
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            errors.append(f"capture.{key}: must be a positive finite number")
             return 0.0
         return float(value)
 
@@ -211,14 +220,22 @@ def _parse_sample(entry: Any, index: int, errors: list[str]) -> Sample | None:
     detections_raw = entry.get("detections")
     if detections_raw is None:
         errors.append(f"{label}: 'detections' is required")
-        return None
-    try:
-        detections = Observation.from_dict(detections_raw)
-    except ValueError as exc:
-        errors.append(f"{label}: detections: {exc}")
-        return None
+        detections: Observation | None = None
+    else:
+        try:
+            detections = Observation.from_dict(detections_raw)
+        except (TypeError, ValueError) as exc:
+            # TypeError is caught as well: a malformed dataset must never
+            # escape the ManifestError interface as a raw exception.
+            errors.append(f"{label}: detections: {exc}")
+            detections = None
 
+    # Validated even when detections are broken, so all of a sample's
+    # problems are reported in one pass.
     state = _parse_state(entry.get("state"), label, errors) if "state" in entry else None
+
+    if detections is None:
+        return None
 
     return Sample(
         id=sample_id if _is_str(sample_id) else "",
@@ -238,13 +255,21 @@ def _parse(raw: Any) -> tuple[DatasetManifest | None, list[str]]:
     if unknown:
         errors.append(f"unknown top-level keys: {sorted(unknown)}")
     if missing:
+        # Report but do *not* stop: a manifest with ten problems should not
+        # need ten load attempts, so every field that is present still gets
+        # validated below (missing keys are read with ``.get``).
         errors.append(f"missing top-level keys: {sorted(missing)}")
-        return None, errors
 
-    if raw["schema_version"] != MANIFEST_SCHEMA_VERSION:
+    # Type before value: ``True == 1.0 == MANIFEST_SCHEMA_VERSION`` in
+    # Python, so a bool/float/string version would otherwise validate and
+    # then land in the dataclass as a different (0) value.
+    version = raw.get("schema_version")
+    if not isinstance(version, int) or isinstance(version, bool):
+        if "schema_version" in raw:
+            errors.append(f"schema_version: must be an integer, got {version!r}")
+    elif version != MANIFEST_SCHEMA_VERSION:
         errors.append(
-            f"schema_version {raw['schema_version']!r} not supported "
-            f"(expected {MANIFEST_SCHEMA_VERSION})"
+            f"schema_version {version!r} not supported (expected {MANIFEST_SCHEMA_VERSION})"
         )
 
     dataset = raw.get("dataset")
@@ -273,7 +298,9 @@ def _parse(raw: Any) -> tuple[DatasetManifest | None, list[str]]:
         created=created if _is_str(created) else "",
         capture=capture,
         samples=samples,
-        schema_version=raw["schema_version"] if isinstance(raw["schema_version"], int) else 0,
+        # A non-integer version is already reported as an error above, so a
+        # validated manifest always carries the real version it declared.
+        schema_version=version if isinstance(version, int) and not isinstance(version, bool) else 0,
     )
     return manifest, errors
 

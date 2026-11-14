@@ -245,6 +245,42 @@ class TestFromDict:
         with pytest.raises(ValueError, match="captured_at"):
             Observation.from_dict(d)
 
+    # -- schema_version guard (F1) -----------------------------------------
+
+    def test_explicit_current_schema_version_accepted(self) -> None:
+        d = _full().to_dict()
+        d["schema_version"] = 2
+        assert Observation.from_dict(d) == _full()
+
+    @pytest.mark.parametrize("bad", [1, 999, None, True, "2", 2.0])
+    def test_invalid_schema_version_rejected(self, bad: object) -> None:
+        d = _full().to_dict()
+        d["schema_version"] = bad
+        with pytest.raises(ValueError, match="schema_version"):
+            Observation.from_dict(d)
+
+    # -- detector_errors validation (F2) -----------------------------------
+
+    def test_detector_errors_list_of_strings_accepted(self) -> None:
+        d = _full().to_dict()
+        d["detector_errors"] = ["ocr: tesseract not installed", "ui:zone_a: timeout"]
+        obs = Observation.from_dict(d)
+        assert obs.detector_errors == ("ocr: tesseract not installed", "ui:zone_a: timeout")
+
+    @pytest.mark.parametrize("bad", [None, "disk error", {"error": "OCR failed"}, 5])
+    def test_detector_errors_wrong_container_rejected(self, bad: object) -> None:
+        d = _full().to_dict()
+        d["detector_errors"] = bad
+        with pytest.raises(ValueError, match="detector_errors"):
+            Observation.from_dict(d)
+
+    @pytest.mark.parametrize("bad_entry", [5, None, ["nested"], {"error": "OCR failed"}])
+    def test_detector_errors_non_string_entry_rejected(self, bad_entry: object) -> None:
+        d = _full().to_dict()
+        d["detector_errors"] = ["ok", bad_entry]
+        with pytest.raises(ValueError, match="detector_errors"):
+            Observation.from_dict(d)
+
     # --- strict numeric coercion (EH4 audit B1/B2) -------------------------
     # ``from_dict`` is the deserializer for *authored* JSON: it must raise
     # ValueError for every non-numeric value (never leak TypeError) and must

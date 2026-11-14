@@ -135,6 +135,60 @@ def test_unsupported_schema_version_rejected(tmp_path: Path) -> None:
         load_manifest(_write_dataset(tmp_path, raw))
 
 
+@pytest.mark.parametrize("bad", [True, 1.0, "1", None])
+def test_schema_version_wrong_type_rejected(tmp_path: Path, bad: object) -> None:
+    # ``True == 1.0 == MANIFEST_SCHEMA_VERSION`` in Python — the type must be
+    # checked before the value, and a float version must not validate and
+    # then land in the dataclass as a different (0) value.
+    raw = _valid_raw()
+    raw["schema_version"] = bad
+    with pytest.raises(ManifestError, match="schema_version"):
+        load_manifest(_write_dataset(tmp_path, raw))
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan"), 1e309])
+def test_non_finite_ui_scale_rejected(tmp_path: Path, bad: float) -> None:
+    raw = _valid_raw()
+    raw["capture"]["ui_scale"] = bad
+    with pytest.raises(ManifestError, match="ui_scale"):
+        load_manifest(_write_dataset(tmp_path, raw))
+
+
+def test_finite_ui_scale_accepted(tmp_path: Path) -> None:
+    raw = _valid_raw()
+    raw["capture"]["ui_scale"] = 1.25
+    manifest = load_manifest(_write_dataset(tmp_path, raw))
+    assert manifest.capture.ui_scale == 1.25
+
+
+def test_missing_top_level_key_still_reports_other_errors(tmp_path: Path) -> None:
+    # The loader promises *all* problems at once: a missing required key must
+    # not stop validation of the fields that are present.
+    raw = _valid_raw()
+    del raw["samples"]
+    raw["dataset"] = 42
+    raw["capture"]["width"] = -5
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ManifestError, match="missing top-level keys") as excinfo:
+        load_manifest(manifest_path)
+    joined = " | ".join(excinfo.value.errors)
+    assert "dataset" in joined
+    assert "capture.width" in joined
+
+
+def test_invalid_detections_still_validates_state(tmp_path: Path) -> None:
+    # A sample with broken detections must not suppress validation of its
+    # optional state expectation.
+    raw = _valid_raw()
+    del raw["samples"][1]["detections"]
+    raw["samples"][1]["state"]["state"] = 5
+    with pytest.raises(ManifestError, match="detections") as excinfo:
+        load_manifest(_write_dataset(tmp_path, raw))
+    joined = " | ".join(excinfo.value.errors)
+    assert "state.state" in joined
+
+
 def test_duplicate_sample_ids_rejected(tmp_path: Path) -> None:
     raw = _valid_raw()
     raw["samples"][1]["id"] = raw["samples"][0]["id"]

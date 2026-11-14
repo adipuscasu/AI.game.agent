@@ -287,13 +287,35 @@ class Observation:
         data (dataset labels, replay logs), so unknown or missing keys are
         shape drift and raise ``ValueError`` rather than being absorbed.
         ``detector_errors`` and ``schema_version`` default to the contract
-        defaults, matching their optionality on the dataclass.
+        defaults, matching their optionality on the dataclass. When supplied,
+        ``schema_version`` must be the current integer version — an unknown
+        version means the payload was authored against a different shape and
+        must not be interpreted as the current one.
         """
         if not isinstance(d, dict):
             raise ValueError(f"observation must be an object, got {type(d).__name__}")
         d = dict(d)
-        detector_errors = d.pop("detector_errors", ())
-        d.pop("schema_version", None)
+        schema_version = d.pop("schema_version", SCHEMA_VERSION)
+        if (
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version != SCHEMA_VERSION
+        ):
+            raise ValueError(
+                f"observation schema_version {schema_version!r} not supported "
+                f"(expected {SCHEMA_VERSION})"
+            )
+        detector_errors = d.pop("detector_errors", [])
+        if not isinstance(detector_errors, list):
+            raise ValueError(
+                "observation detector_errors must be a list of strings, "
+                f"got {type(detector_errors).__name__}"
+            )
+        for entry in detector_errors:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    f"observation detector_errors entries must be strings, got {entry!r}"
+                )
         _require_keys(d, _TOP_LEVEL_KEYS - {"schema_version", "detector_errors"}, "observation")
 
         try:
@@ -347,5 +369,5 @@ class Observation:
                     confidence=_from_float_field(e, "confidence", "object"),
                 ),
             ),
-            detector_errors=tuple(str(e) for e in detector_errors),
+            detector_errors=tuple(detector_errors),
         )
