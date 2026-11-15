@@ -176,7 +176,7 @@ ever required) are a *proposed* API change, not made in this step
 ```jsonc
 {
   "schema": "evaluation-report",
-  "evaluator_version": 1,
+  "evaluator_version": 2,
   "manifest_schema_version": 1,
   "dataset": "...", "dataset_version": "...",
   "scoring": {"iou_threshold": 0.5},

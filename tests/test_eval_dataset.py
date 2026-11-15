@@ -423,36 +423,45 @@ def test_stateful_adapter_follows_interleaved_manifest_order() -> None:
 
 
 def test_two_distinct_ui_zone_classes_survive_into_report() -> None:
-    # F2 regression: two distinct ui-zone classes are scored and reported
-    # independently — one matched, one missed — each under its own injective
-    # class key in both the object and the serialized JSON.
+    # F2 regression: the *actual* old-encoding collision pair —
+    # ("health:bar", "brightness") and ("health", "bar:brightness") both
+    # flattened to "health:bar:brightness" under the colon-joined encoding —
+    # is scored and reported independently: one matched, one missed, each
+    # under its own injective class key in both the object and the
+    # serialized JSON.
     from ai_game_agent.evaluation.scoring import class_key_string
 
-    def _zone(zone: str, value: float = 0.5) -> UiZoneHit:
-        return UiZoneHit(zone=zone, check="bar", bbox=BBox(0, 0, 10, 10), value=value)
+    key_a = ("health:bar", "brightness")
+    key_b = ("health", "bar:brightness")
+    # Guard: under the retired colon-join these two identities collided, so
+    # this pair exercises the part-boundary fix — not just any two keys.
+    assert ":".join(key_a) == ":".join(key_b)
 
-    label = _obs(ui_zones=[_zone("hp"), _zone("mp")])
-    prediction = _obs(ui_zones=[_zone("hp")])  # "hp" matched, "mp" missed
+    def _zone(zone: str, check: str, value: float = 0.5) -> UiZoneHit:
+        return UiZoneHit(zone=zone, check=check, bbox=BBox(0, 0, 10, 10), value=value)
+
+    label = _obs(ui_zones=[_zone(*key_a), _zone(*key_b)])
+    prediction = _obs(ui_zones=[_zone(*key_a)])  # class A matched, class B missed
     m = _manifest([_sample("a", label)])
     report = evaluate_dataset(m, {"a": prediction})
     assert report.samples[0].status == "scored"
 
-    hp_key = class_key_string("ui_zones", ("hp", "bar"))
-    mp_key = class_key_string("ui_zones", ("mp", "bar"))
-    assert hp_key != mp_key
+    a_key = class_key_string("ui_zones", key_a)
+    b_key = class_key_string("ui_zones", key_b)
+    assert a_key != b_key
 
     classes = report.splits["calibration"].categories["ui_zones"].classes
-    assert set(classes) == {hp_key, mp_key}
-    assert classes[hp_key].tp == 1 and classes[hp_key].fp == 0 and classes[hp_key].fn == 0
-    assert classes[mp_key].tp == 0 and classes[mp_key].fp == 0 and classes[mp_key].fn == 1
+    assert set(classes) == {a_key, b_key}
+    assert classes[a_key].tp == 1 and classes[a_key].fp == 0 and classes[a_key].fn == 0
+    assert classes[b_key].tp == 0 and classes[b_key].fp == 0 and classes[b_key].fn == 1
 
     # The serialized form keeps both classes under distinct keys, with the
     # per-class partition intact.
     data = json.loads(report.to_json())
     json_classes = data["splits"]["calibration"]["categories"]["ui_zones"]["classes"]
-    assert set(json_classes) == {hp_key, mp_key}
-    assert json_classes[hp_key]["tp"] == 1 and json_classes[hp_key]["fn"] == 0
-    assert json_classes[mp_key]["tp"] == 0 and json_classes[mp_key]["fn"] == 1
+    assert set(json_classes) == {a_key, b_key}
+    assert json_classes[a_key]["tp"] == 1 and json_classes[a_key]["fn"] == 0
+    assert json_classes[b_key]["tp"] == 0 and json_classes[b_key]["fn"] == 1
 
 
 def test_sample_report_value_error_belongs_to_the_matched_zone() -> None:
