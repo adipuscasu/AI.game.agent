@@ -8,6 +8,7 @@ state-evaluation gating, stateful-adapter manifest order, and non-mutation.
 from __future__ import annotations
 
 import datetime
+import json
 
 import pytest
 
@@ -378,6 +379,80 @@ def test_stateful_adapter_is_shared_across_splits_in_manifest_order() -> None:
     # *which* call each split received, i.e. the shared-history ordering.
     assert report.samples[0].state.state == "incorrect"
     assert report.samples[1].state.state == "incorrect"
+
+
+def test_stateful_adapter_follows_interleaved_manifest_order() -> None:
+    # Pinned semantics: the feed is manifest order, NOT calibration-first —
+    # the validator does not require calibration to precede held-out, so a
+    # held-out sample may consume the machine's earliest calls. The shared
+    # history therefore crosses both sections.
+
+    class _CountingMachine:
+        """Records each call's position and emits a state named after it."""
+
+        def __init__(self) -> None:
+            self.order: list[tuple[str, int]] = []
+
+        def evaluate(self, observation) -> StateEvaluation:
+            self.order.append((observation.source, len(self.order) + 1))
+            return StateEvaluation(signals={"target": True}, state=f"S{len(self.order)}")
+
+    m = _manifest(
+        [
+            _sample("b", _obs(), state=_expectation(), split="held_out"),  # held-out first
+            _sample("a", _obs(), state=_expectation(), split="calibration"),
+            _sample("c", _obs(), state=_expectation(), split="held_out"),
+        ]
+    )
+    adapter = _CountingMachine()
+    report = evaluate_dataset(
+        m,
+        {"a": _obs(source="a"), "b": _obs(source="b"), "c": _obs(source="c")},
+        state_evaluator=adapter,
+    )
+    # Manifest order, not calibration-first: b, a, c.
+    assert adapter.order == [("b", 1), ("a", 2), ("c", 3)]
+    by_id = {s.id: s for s in report.samples}
+    assert by_id["b"].state is not None and by_id["b"].state.actual_state == "S1"
+    assert by_id["a"].state is not None and by_id["a"].state.actual_state == "S2"
+    assert by_id["c"].state is not None and by_id["c"].state.actual_state == "S3"
+    # One shared adapter, so the sections mix history: held-out holds calls
+    # 1 and 3, calibration call 2.
+    assert report.splits["held_out"].state.aggregate.samples_evaluated == 2
+    assert report.splits["calibration"].state.aggregate.samples_evaluated == 1
+
+
+def test_two_distinct_ui_zone_classes_survive_into_report() -> None:
+    # F2 regression: two distinct ui-zone classes are scored and reported
+    # independently — one matched, one missed — each under its own injective
+    # class key in both the object and the serialized JSON.
+    from ai_game_agent.evaluation.scoring import class_key_string
+
+    def _zone(zone: str, value: float = 0.5) -> UiZoneHit:
+        return UiZoneHit(zone=zone, check="bar", bbox=BBox(0, 0, 10, 10), value=value)
+
+    label = _obs(ui_zones=[_zone("hp"), _zone("mp")])
+    prediction = _obs(ui_zones=[_zone("hp")])  # "hp" matched, "mp" missed
+    m = _manifest([_sample("a", label)])
+    report = evaluate_dataset(m, {"a": prediction})
+    assert report.samples[0].status == "scored"
+
+    hp_key = class_key_string("ui_zones", ("hp", "bar"))
+    mp_key = class_key_string("ui_zones", ("mp", "bar"))
+    assert hp_key != mp_key
+
+    classes = report.splits["calibration"].categories["ui_zones"].classes
+    assert set(classes) == {hp_key, mp_key}
+    assert classes[hp_key].tp == 1 and classes[hp_key].fp == 0 and classes[hp_key].fn == 0
+    assert classes[mp_key].tp == 0 and classes[mp_key].fp == 0 and classes[mp_key].fn == 1
+
+    # The serialized form keeps both classes under distinct keys, with the
+    # per-class partition intact.
+    data = json.loads(report.to_json())
+    json_classes = data["splits"]["calibration"]["categories"]["ui_zones"]["classes"]
+    assert set(json_classes) == {hp_key, mp_key}
+    assert json_classes[hp_key]["tp"] == 1 and json_classes[hp_key]["fn"] == 0
+    assert json_classes[mp_key]["tp"] == 0 and json_classes[mp_key]["fn"] == 1
 
 
 def test_sample_report_value_error_belongs_to_the_matched_zone() -> None:

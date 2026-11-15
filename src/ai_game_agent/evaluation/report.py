@@ -382,6 +382,11 @@ class SplitReport:
             raise ValueError(
                 f"categories must cover exactly {list(CATEGORIES)}, got {list(self.categories)}"
             )
+        for key, value in self.categories.items():
+            if not isinstance(value, CategoryMetrics):
+                raise ValueError(
+                    f"categories[{key!r}] must be a CategoryMetrics, got {type(value).__name__}"
+                )
         if not isinstance(self.state, StateSection):
             raise ValueError(f"state must be a StateSection, got {type(self.state).__name__}")
         _freeze_mapping(self, "categories")

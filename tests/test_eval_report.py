@@ -318,6 +318,26 @@ def test_split_report_does_not_alias_caller_categories() -> None:
         sr.categories["bogus"] = None
 
 
+def test_split_report_rejects_non_category_metrics_values() -> None:
+    # F3 regression: freezing `categories` is not enough — every value must
+    # be validated, or a bad mapping constructs fine and fails later in
+    # to_dict()/to_json().
+    categories = {c: CategoryMetrics(category=c, overall=_zero(), classes={}) for c in CATEGORIES}
+    categories[CATEGORIES[0]] = _zero()  # a Metrics, not a CategoryMetrics
+    with pytest.raises(ValueError, match="must be a CategoryMetrics"):
+        SplitReport(
+            split="calibration", overall=_zero(), categories=categories, state=_state_section()
+        )
+    # The same check must not reject a correct mapping (including one whose
+    # values were constructed elsewhere).
+    good = {
+        c: CategoryMetrics(category=c, overall=_zero(), classes={"k": _metrics(1, 0, 0)})
+        for c in CATEGORIES
+    }
+    sr = SplitReport(split="calibration", overall=_zero(), categories=good, state=_state_section())
+    assert sr.categories[CATEGORIES[0]] is good[CATEGORIES[0]]
+
+
 def test_evaluation_report_does_not_alias_caller_splits() -> None:
     splits = {split: _split_report(split) for split in SPLITS}
     rep = EvaluationReport(
