@@ -20,6 +20,7 @@ import math
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from ai_game_agent.evaluation.manifest import SPLITS
@@ -41,7 +42,9 @@ __all__ = [
 ]
 
 #: Bumped whenever the report *shape* changes in a way readers must handle.
-EVALUATOR_VERSION = 1
+#: v2: per-class key encoding changed from `:`-join to the injective
+#: canonical-JSON form (v1 keys are not valid v2 keys).
+EVALUATOR_VERSION = 2
 
 REPORT_SCHEMA = "evaluation-report"
 
@@ -77,6 +80,19 @@ def _nonempty_str(name: str, value: Any) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a non-empty string, got {value!r}")
     return value
+
+
+def _freeze_mapping(instance: Any, field: str) -> None:
+    """Detach a mapping field from the dict its caller passed in and expose
+    an immutable view, so the report stays a value object after
+    construction.
+
+    ``object.__setattr__`` is the only way to set a field on a frozen
+    dataclass; used here solely for constructor-time normalization (the
+    standard role of ``__post_init__``), after which the field is
+    read-only — the frozen check still blocks any later assignment.
+    """
+    object.__setattr__(instance, field, MappingProxyType(dict(getattr(instance, field))))
 
 
 @dataclass(frozen=True)
@@ -287,6 +303,7 @@ class CategoryMetrics:
             _nonempty_str("classes key", key)
             if not isinstance(value, Metrics):
                 raise ValueError(f"classes[{key!r}] must be a Metrics, got {type(value).__name__}")
+        _freeze_mapping(self, "classes")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -367,6 +384,7 @@ class SplitReport:
             )
         if not isinstance(self.state, StateSection):
             raise ValueError(f"state must be a StateSection, got {type(self.state).__name__}")
+        _freeze_mapping(self, "categories")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -414,6 +432,7 @@ class EvaluationReport:
                 )
             if value.split != key:
                 raise ValueError(f"splits[{key!r}].split must be {key!r}, got {value.split!r}")
+        _freeze_mapping(self, "splits")
         if not isinstance(self.samples, tuple):
             raise ValueError(f"samples must be a tuple, got {type(self.samples).__name__}")
         for sample in self.samples:

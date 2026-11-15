@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import datetime
 
+import pytest
+
 from ai_game_agent.evaluation.dataset import evaluate_dataset
 from ai_game_agent.evaluation.manifest import (
     CaptureMetadata,
@@ -19,7 +21,7 @@ from ai_game_agent.evaluation.manifest import (
 )
 from ai_game_agent.evaluation.report import EvaluationReport
 from ai_game_agent.evaluation.state_eval import StateEvaluation
-from ai_game_agent.perception.observation import BBox, Observation, TemplateHit
+from ai_game_agent.perception.observation import BBox, Observation, TemplateHit, UiZoneHit
 
 _DT = datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
 
@@ -334,6 +336,65 @@ def test_stateful_adapter_receives_samples_in_manifest_order() -> None:
     adapter = _RecordingMachine(outputs)
     evaluate_dataset(m, {"a": obs_a, "b": obs_b}, state_evaluator=adapter)
     assert adapter.feed_order == ["first", "second"]
+
+
+def test_stateful_adapter_is_shared_across_splits_in_manifest_order() -> None:
+    # Pinned semantics (workplan §6): ONE adapter instance spans both splits,
+    # fed in manifest order with no reset between them. A machine whose
+    # output depends on its own history therefore sees the calibration
+    # samples before the held-out ones — the held_out verdict is evaluated
+    # with the machine's post-calibration state, not a fresh one.
+
+    class _CountingMachine:
+        """Emits state ``"S1"`` on its first call, ``"S2"`` afterwards."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, observation) -> StateEvaluation:
+            self.calls += 1
+            return StateEvaluation(
+                signals={"target": True}, state="S1" if self.calls == 1 else "S2"
+            )
+
+    m = _manifest(
+        [
+            _sample("a", _obs(), state=_expectation(), split="calibration"),
+            _sample("b", _obs(), state=_expectation(), split="held_out"),
+        ]
+    )
+    adapter = _CountingMachine()
+    report = evaluate_dataset(
+        m, {"a": _obs(source="a"), "b": _obs(source="b")}, state_evaluator=adapter
+    )
+    assert adapter.calls == 2  # one shared instance, no reset between splits
+    # The calibration sample consumed the first call; the held-out sample
+    # saw the machine's history, so it got the second output.
+    assert report.samples[0].state is not None
+    assert report.samples[1].state is not None
+    assert report.samples[0].state.actual_state == "S1"
+    assert report.samples[1].state.actual_state == "S2"
+    # Both disagree with the expected state (COMBAT) — what the test pins is
+    # *which* call each split received, i.e. the shared-history ordering.
+    assert report.samples[0].state.state == "incorrect"
+    assert report.samples[1].state.state == "incorrect"
+
+
+def test_sample_report_value_error_belongs_to_the_matched_zone() -> None:
+    # F1 regression at the report layer: the value_error on each match must
+    # be the error of *that* matched zone pair. Two zones whose key order
+    # ("a" < "z") is the reverse of their expected-index order (z first).
+    def _zone(zone: str, value: float) -> UiZoneHit:
+        return UiZoneHit(zone=zone, check="bar", bbox=BBox(0, 0, 10, 10), value=value)
+
+    label = _obs(ui_zones=[_zone("z", 0.5), _zone("a", 0.2)])
+    prediction = _obs(ui_zones=[_zone("z", 0.9), _zone("a", 0.1)])
+    m = _manifest([_sample("a", label)])
+    report = evaluate_dataset(m, {"a": prediction})
+    row = report.samples[0]
+    assert row.status == "scored"
+    zones = next(c for c in row.categories if c.category == "ui_zones")
+    assert [m.value_error for m in zones.matches] == [pytest.approx(0.4), pytest.approx(0.1)]
 
 
 # ---- Determinism and non-mutation ---------------------------------------------

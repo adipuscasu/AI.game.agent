@@ -8,6 +8,7 @@ metrics as ``None``, ui-zone value errors, and explicit text normalization.
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 
 import pytest
@@ -16,6 +17,7 @@ from ai_game_agent.evaluation.scoring import (
     ScoringConfig,
     assign_matches,
     bbox_iou,
+    class_key_string,
     compute_metrics,
     merge_metrics,
     normalize_text,
@@ -204,6 +206,22 @@ def test_normalize_text_empty() -> None:
     assert normalize_text("   ") == ""
 
 
+def test_class_key_string_is_injective_across_part_boundaries() -> None:
+    # F2 regression: a part containing the old join separator must not
+    # collide with a different part split — the encoding is injective.
+    a = class_key_string("ui_zones", ("health:bar", "brightness"))
+    b = class_key_string("ui_zones", ("health", "bar:brightness"))
+    assert a != b
+
+
+def test_class_key_string_round_trips_part_boundaries() -> None:
+    # The encoding keeps part boundaries unambiguous: decoding the string
+    # recovers the exact parts.
+    parts = ("zone:a", "b:c")
+    encoded = class_key_string("ui_zones", parts)
+    assert json.loads(encoded) == list(parts)
+
+
 # ---- Per-category scoring ----------------------------------------------------
 
 
@@ -255,6 +273,19 @@ def test_score_ui_zones_value_error_is_absolute() -> None:
     predicted = (_zone("health_bar", "brightness", 0.9),)
     score = score_ui_zones(expected, predicted, ScoringConfig())
     assert score.value_errors == (pytest.approx(0.7),)
+
+
+def test_score_ui_zones_value_errors_align_with_matches_across_classes() -> None:
+    # value_errors must stay aligned with `matches` (sorted by expected
+    # index) even when the internal class-iteration order differs from the
+    # expected-index order: zone "a" sorts before "z" by key, but expected
+    # index 0 is "z". One misaligned entry per pair makes this detectable.
+    expected = (_zone("z", "bar", 0.5), _zone("a", "bar", 0.2))
+    predicted = (_zone("z", "bar", 0.9), _zone("a", "bar", 0.1))
+    score = score_ui_zones(expected, predicted, ScoringConfig())
+    assert [(m.expected_index, m.predicted_index) for m in score.matches] == [(0, 0), (1, 1)]
+    # match (0,0) is the "z" pair: |0.5 - 0.9| = 0.4; match (1,1) is "a": 0.1.
+    assert score.value_errors == (pytest.approx(0.4), pytest.approx(0.1))
 
 
 def test_score_text_regions_match_on_normalized_text() -> None:

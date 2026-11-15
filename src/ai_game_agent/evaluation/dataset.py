@@ -18,8 +18,11 @@ The contract (workplan §4–§7):
 * State evaluation: only ``scored`` samples with a state expectation are fed
   to the injected :class:`StateEvaluator`, in manifest order, with no reset
   between samples (adapters may be stateful — callers supply a fresh one per
-  run). No adapter ⇒ state sections are explicitly ``performed=False``,
-  never a silent zero section.
+  run). One adapter spans **both** splits — calibration first, then
+  held-out — so a stateful machine evaluates held-out samples with its
+  post-calibration history (intended semantics; held-out state results are
+  therefore not independent of calibration's). No adapter ⇒ state sections
+  are explicitly ``performed=False``, never a silent zero section.
 * Foreign prediction ids are rejected up front, all of them named.
 * The manifest and its observations are never mutated; sample order in the
   report is manifest order; identical inputs produce identical reports.

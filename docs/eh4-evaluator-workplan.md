@@ -32,16 +32,18 @@ Public entry point:
 
 ```python
 from ai_game_agent.evaluation import (
-    EVALUATOR_VERSION, ScoringConfig, evaluate_dataset,
+    EVALUATOR_VERSION,
+    ScoringConfig,
+    evaluate_dataset,
 )
 
 report = evaluate_dataset(
-    manifest,                 # validated DatasetManifest
-    predictions,              # Mapping[str, Observation], keyed by sample id
-    config=ScoringConfig(),   # iou_threshold default 0.5 (keyword-only)
-    state_evaluator=None,     # optional StateEvaluator adapter
+    manifest,  # validated DatasetManifest
+    predictions,  # Mapping[str, Observation], keyed by sample id
+    config=ScoringConfig(),  # iou_threshold default 0.5 (keyword-only)
+    state_evaluator=None,  # optional StateEvaluator adapter
 )
-report.to_json()              # byte-identical for identical inputs
+report.to_json()  # byte-identical for identical inputs
 ```
 
 ## 2. Matching semantics (scoring.py)
@@ -118,9 +120,10 @@ Injectable protocol — no WoW imports in generic code:
 
 ```python
 class StateEvaluation:
-    signals: Mapping[str, bool | None]   # missing key == unknown
-    state: str | None                    # None == adapter could not determine
+    signals: Mapping[str, bool | None]  # missing key == unknown
+    state: str | None  # None == adapter could not determine
     reason: str | None
+
 
 class StateEvaluator(Protocol):
     def evaluate(self, observation: Observation) -> StateEvaluation: ...
@@ -146,6 +149,13 @@ Samples without a state expectation remain valid observation-only samples
 explicitly `not_performed` in the report — never a silent success.**
 Adapters may be stateful: the evaluator feeds them in manifest order and does
 not reset them; the caller supplies a fresh adapter per run (documented).
+**One adapter spans both splits** — calibration samples first, then held-out,
+with no reset between them — so a stateful machine evaluates the held-out
+samples with its post-calibration history. That is the intended semantics
+for an evolving state machine; it does mean the held-out state section is
+not independent of calibration's. Per-split adapters (if independence is
+ever required) are a *proposed* API change, not made in this step
+(regression test: `test_stateful_adapter_is_shared_across_splits_in_manifest_order`).
 
 ## 7. Dataset API (dataset.py)
 
@@ -278,3 +288,44 @@ across two runs).
 
 **Not yet:** commit/push (requires explicit authorization per §1). Final
 §14 report delivered in-session 2026-11-15 with this evidence.
+
+**PR #15 hardening (2026-11-15, post-review fixes — uncommitted):**
+
+- **F1** value errors were aligned to the class-iteration order, not to the
+  match order — `_sample_category` pairs `value_errors[i]` with the
+  *sorted* match `i`, so errors could attach to the wrong zone when a
+  class's key order differs from its expected-index order. Fixed:
+  `scoring._score_class_partitioned` now keys value errors by the global
+  `(expected_index, predicted_index)` pair and derives the tuple from the
+  sorted match list. Regression tests:
+  `test_score_ui_zones_value_errors_align_with_matches_across_classes`,
+  `test_sample_report_value_error_belongs_to_the_matched_zone`.
+- **F2** `class_key_string` joined parts with `:`, so
+  `("health:bar", "brightness")` collided with
+  `("health", "bar:brightness")` — one report class bucket each. Fixed:
+  the encoding is now the canonical-JSON list of the stringified parts
+  (injective; part boundaries survive decoding). `EVALUATOR_VERSION`
+  bumped 1 → 2 — v1 keys are not valid v2 keys, so readers must handle it.
+  Regression tests: `test_class_key_string_is_injective_across_part_boundaries`,
+  `test_class_key_string_round_trips_part_boundaries`,
+  `test_evaluator_version_pinned_after_class_key_encoding_change`.
+- **F3** the frozen report dataclasses still held the caller's *mutable*
+  dicts (`CategoryMetrics.classes`, `SplitReport.categories`,
+  `EvaluationReport.splits`): a later mutation of the passed-in dict
+  changed what the report held and serialized. Fixed: each mapping field is
+  defensively copied in `__post_init__` and exposed as a
+  `MappingProxyType` view (constructor-time normalization via
+  `object.__setattr__` — the only way to set a field on a frozen
+  dataclass). Regression tests: `test_category_metrics_does_not_alias_caller_dict`,
+  `test_category_metrics_classes_view_rejects_mutation`,
+  `test_split_report_does_not_alias_caller_categories`,
+  `test_evaluation_report_does_not_alias_caller_splits`.
+- **Stateful split semantics (pinned):** one adapter instance spans both
+  splits, fed in manifest order with no reset — a stateful machine
+  evaluates held-out samples with its post-calibration history (intended;
+  held-out state results are not independent). Documented in §6,
+  `dataset.py`, `state_eval.py`. Regression test:
+  `test_stateful_adapter_is_shared_across_splits_in_manifest_order`.
+
+**Not yet:** commit/push of the hardening (requires explicit authorization
+per §1).

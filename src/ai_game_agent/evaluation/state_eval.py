@@ -86,6 +86,15 @@ class StateEvaluator(Protocol):
     Adapters may be stateful: the dataset evaluator feeds them in manifest
     order and does not reset them between samples — callers supply a fresh
     adapter per run.
+
+    **Splits share one adapter.** The same instance is fed across both
+    splits (calibration samples first, then held-out, in manifest order) and
+    is never reset between them, so a machine with internal history evaluates
+    the held-out samples *with its post-calibration state*. That is the
+    intended semantics for an evolving state machine; it does mean the
+    held-out state section is not independent of the calibration one. If
+    per-split independence is required, the API will need per-split adapters
+    (a future change, not made here).
     """
 
     def evaluate(self, observation: Observation) -> StateEvaluation: ...

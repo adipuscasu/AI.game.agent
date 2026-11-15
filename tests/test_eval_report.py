@@ -281,6 +281,62 @@ def test_evaluation_report_rejects_nonpositive_schema_version() -> None:
             )
 
 
+# ---- Mapping fields: decoupled from the caller's dict (F3) ------------------
+#
+# The report is a value object: once constructed, later mutation of the dict
+# the caller passed in must not change what the report holds or serializes,
+# and the exposed views must reject writes.
+
+
+def test_category_metrics_does_not_alias_caller_dict() -> None:
+    classes = {"a": _metrics(1, 0, 0)}
+    cm = CategoryMetrics(category="templates", overall=_zero(), classes=classes)
+    classes.clear()  # external mutation after construction
+    classes["x"] = _metrics(9, 9, 9)
+    assert set(cm.classes) == {"a"}
+    assert cm.classes["a"] == _metrics(1, 0, 0)
+    assert cm.to_dict()["classes"]["a"]["tp"] == 1
+
+
+def test_category_metrics_classes_view_rejects_mutation() -> None:
+    cm = CategoryMetrics(category="templates", overall=_zero(), classes={"a": _zero()})
+    with pytest.raises(TypeError):
+        cm.classes["b"] = _zero()
+    with pytest.raises(TypeError):
+        del cm.classes["a"]
+
+
+def test_split_report_does_not_alias_caller_categories() -> None:
+    categories = {c: CategoryMetrics(category=c, overall=_zero(), classes={}) for c in CATEGORIES}
+    sr = SplitReport(
+        split="calibration", overall=_zero(), categories=categories, state=_state_section()
+    )
+    categories.clear()  # external mutation after construction
+    categories["bogus"] = None
+    assert set(sr.categories) == set(CATEGORIES)
+    with pytest.raises(TypeError):
+        sr.categories["bogus"] = None
+
+
+def test_evaluation_report_does_not_alias_caller_splits() -> None:
+    splits = {split: _split_report(split) for split in SPLITS}
+    rep = EvaluationReport(
+        dataset="ds",
+        dataset_version="1.0",
+        manifest_schema_version=1,
+        iou_threshold=0.5,
+        counts=Counts(0, 0, 0, 0, 0),
+        splits=splits,
+        samples=(),
+    )
+    splits["calibration"] = _split_report("held_out")  # swap after construction
+    splits["held_out"] = None
+    assert set(rep.splits) == set(SPLITS)
+    assert rep.splits["calibration"].split == "calibration"
+    with pytest.raises(TypeError):
+        rep.splits["calibration"] = None
+
+
 # ---- to_dict / to_json shape -------------------------------------------------
 
 
@@ -301,6 +357,13 @@ def test_to_dict_has_fixed_key_order() -> None:
     assert d["schema"] == REPORT_SCHEMA
     assert d["evaluator_version"] == EVALUATOR_VERSION
     assert d["scoring"] == {"iou_threshold": 0.5}
+
+
+def test_evaluator_version_pinned_after_class_key_encoding_change() -> None:
+    # F2: the per-class key encoding changed from `:`-join to an injective
+    # canonical form — a report-shape change readers must handle, so the
+    # version is pinned here (v1 keys are not valid v2 keys).
+    assert EVALUATOR_VERSION == 2
 
 
 def test_to_dict_emits_both_splits() -> None:

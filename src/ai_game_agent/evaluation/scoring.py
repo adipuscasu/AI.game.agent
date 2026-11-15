@@ -21,6 +21,7 @@ Stdlib only; the module imports the perception *contract* types (the frozen
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -194,11 +195,16 @@ def class_key(category: str, hit: Any) -> tuple:
 
 def class_key_string(category: str, key: tuple) -> str:
     """The report's per-class map key: one deterministic string for a
-    class-identity tuple (each part stringified, joined with ``:``)."""
+    class-identity tuple.
+
+    The encoding is **injective** — canonical JSON of the stringified parts —
+    so part boundaries survive unambiguously: a part that itself contains the
+    old ``:`` separator cannot collide with a different part split
+    (``("a:b", "c")`` ≠ ``("a", "b:c")``)."""
     parts = tuple(str(part) for part in key)
     if not parts:
         raise ValueError("class key must not be empty")
-    return ":".join(parts)
+    return json.dumps(list(parts), ensure_ascii=True)
 
 
 def category_hits(category: str, observation: Observation) -> tuple:
@@ -341,7 +347,10 @@ def _score_class_partitioned(
     all_matches: list[Match] = []
     fps: list[int] = []
     fns: list[int] = []
-    verrors: list[float] = []
+    # Value errors keyed by the *global* (expected, predicted) pair — the
+    # final tuple is derived from the sorted match list, so it stays aligned
+    # with `matches` regardless of the class iteration order here.
+    verrors_by_match: dict[tuple[int, int], float] = {}
     for class_key in sorted(set(exp_by_key) | set(pred_by_key), key=repr):
         exp_idx = exp_by_key.get(class_key, [])
         pred_idx = pred_by_key.get(class_key, [])
@@ -366,20 +375,21 @@ def _score_class_partitioned(
         fps.extend(pred_idx[i] for i in score.false_positives)
         fns.extend(exp_idx[i] for i in score.false_negatives)
         if value_errors:
-            verrors.extend(
-                abs(
-                    expected[exp_idx[m.expected_index]].value
-                    - predicted[pred_idx[m.predicted_index]].value
-                )
-                for m in score.matches
-            )
+            for m in score.matches:
+                pair = (exp_idx[m.expected_index], pred_idx[m.predicted_index])
+                verrors_by_match[pair] = abs(expected[pair[0]].value - predicted[pair[1]].value)
 
     all_matches.sort(key=lambda m: (m.expected_index, m.predicted_index))
+    value_errors_out: tuple[float, ...] | None = None
+    if value_errors:
+        value_errors_out = tuple(
+            verrors_by_match[(m.expected_index, m.predicted_index)] for m in all_matches
+        )
     return CategoryScore(
         matches=tuple(all_matches),
         false_positives=tuple(sorted(fps)),
         false_negatives=tuple(sorted(fns)),
-        value_errors=tuple(verrors) if value_errors else None,
+        value_errors=value_errors_out,
     )
 
 
